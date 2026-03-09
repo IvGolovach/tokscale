@@ -123,20 +123,11 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
                     // Calculate delta tokens
                     // Note: OpenAI's input_tokens INCLUDES cached tokens (they are a subset).
                     // We subtract cached from input to avoid double-counting when aggregating.
-                    let (input, output, cached) = if let Some(last) = &info.last_token_usage {
-                        let total_input = last.input_tokens.unwrap_or(0);
-                        let cached = last
-                            .cached_input_tokens
-                            .or(last.cache_read_input_tokens)
-                            .unwrap_or(0);
-                        (
-                            total_input.saturating_sub(cached),
-                            last.output_tokens.unwrap_or(0),
-                            cached,
-                        )
-                    } else if let (Some(total), Some(prev)) =
-                        (&info.total_token_usage, &previous_totals)
-                    {
+                    //
+                    // Strategy: Prefer total_token_usage deltas to avoid double-counting
+                    // duplicate rows. Only use last_token_usage as fallback when totals
+                    // are missing or appear to have reset/rolled back.
+                    let (input, output, cached) = if let Some(total) = &info.total_token_usage {
                         let curr_input = total.input_tokens.unwrap_or(0);
                         let curr_output = total.output_tokens.unwrap_or(0);
                         let curr_cached = total
@@ -144,15 +135,31 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
                             .or(total.cache_read_input_tokens)
                             .unwrap_or(0);
 
-                        let delta_input = (curr_input - prev.0).max(0);
-                        let delta_cached = (curr_cached - prev.2).max(0);
-                        (
-                            (delta_input - delta_cached).max(0),
-                            (curr_output - prev.1).max(0),
-                            delta_cached,
-                        )
+                        if let Some(prev) = previous_totals {
+                            if curr_input >= prev.0
+                                && curr_output >= prev.1
+                                && curr_cached >= prev.2
+                            {
+                                // Monotonic advance: compute delta from totals
+                                let delta_input = curr_input - prev.0;
+                                let delta_output = curr_output - prev.1;
+                                let delta_cached = curr_cached - prev.2;
+                                (
+                                    (delta_input - delta_cached).max(0),
+                                    delta_output.max(0),
+                                    delta_cached.max(0),
+                                )
+                            } else {
+                                // Rollback or reset: fall back to last_token_usage if available
+                                compute_from_last_usage(&info.last_token_usage)
+                            }
+                        } else {
+                            // First token_count with totals: treat as absolute
+                            ((curr_input - curr_cached).max(0), curr_output, curr_cached)
+                        }
                     } else {
-                        continue;
+                        // No totals available: use last_token_usage
+                        compute_from_last_usage(&info.last_token_usage)
                     };
 
                     // Update previous totals
@@ -236,6 +243,23 @@ fn extract_model(payload: &CodexPayload) -> Option<String> {
         .or(payload.info.as_ref().and_then(|i| i.model.clone()))
         .or(payload.info.as_ref().and_then(|i| i.model_name.clone()))
         .filter(|m| !m.is_empty())
+}
+
+/// Compute token counts from last_token_usage (fallback when totals unavailable)
+fn compute_from_last_usage(last: &Option<CodexTokenUsage>) -> (i64, i64, i64) {
+    let Some(usage) = last else {
+        return (0, 0, 0);
+    };
+    let total_input = usage.input_tokens.unwrap_or(0);
+    let cached = usage
+        .cached_input_tokens
+        .or(usage.cache_read_input_tokens)
+        .unwrap_or(0);
+    (
+        (total_input - cached).max(0),
+        usage.output_tokens.unwrap_or(0).max(0),
+        cached.max(0),
+    )
 }
 
 struct CodexHeadlessUsage {
@@ -401,5 +425,86 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].agent.as_deref(), Some("headless"));
+    }
+
+    #[test]
+    fn test_duplicate_token_count_rows_skipped() {
+        // Regression test: duplicate rows with unchanged total_token_usage should be skipped
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#;
+        // Duplicate row with same totals
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#;
+        let content = format!("{}\n{}\n{}", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        // Should only have 1 message (duplicate row adds 0, so it's skipped)
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 80); // 100 - 20 cached
+        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.cache_read, 20);
+    }
+
+    #[test]
+    fn test_duplicate_totals_ignore_changed_last_usage() {
+        // Regression test from real Codex sessions: totals can repeat while
+        // last_token_usage changes. Unchanged totals should still emit no usage.
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50},"last_token_usage":{"input_tokens":120,"cached_input_tokens":100,"output_tokens":8}}}}"#;
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1000,"cached_input_tokens":900,"output_tokens":50},"last_token_usage":{"input_tokens":0,"cached_input_tokens":0,"output_tokens":0}}}}"#;
+        let content = format!("{}\n{}\n{}", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 50);
+        assert_eq!(messages[0].tokens.cache_read, 900);
+    }
+
+    #[test]
+    fn test_total_token_usage_delta_calculation() {
+        // Test that we properly compute deltas from total_token_usage
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+        // First token_count: 100 input (20 cached), 30 output
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#;
+        // Second token_count: 150 input (30 cached), 50 output (delta: 50 input, 10 cached, 20 output)
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":30,"output_tokens":50}}}}"#;
+        let content = format!("{}\n{}\n{}", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        // First: 100 - 20 = 80 input, 30 output, 20 cached
+        assert_eq!(messages[0].tokens.input, 80);
+        assert_eq!(messages[0].tokens.output, 30);
+        assert_eq!(messages[0].tokens.cache_read, 20);
+        // Second: delta (150-30) - (100-20) = 40 input, 20 output, 10 cached
+        assert_eq!(messages[1].tokens.input, 40);
+        assert_eq!(messages[1].tokens.output, 20);
+        assert_eq!(messages[1].tokens.cache_read, 10);
+    }
+
+    #[test]
+    fn test_rollback_fallback_to_last_usage() {
+        // When totals roll back (decrease), we should fall back to last_token_usage
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+        // First: 100 input, 30 output
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#;
+        // Rollback: totals decrease, but last_token_usage has valid delta
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"cached_input_tokens":10,"output_tokens":15},"last_token_usage":{"input_tokens":25,"cached_input_tokens":5,"output_tokens":10}}}}"#;
+        let content = format!("{}\n{}\n{}", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 2);
+        // Second message should use last_token_usage fallback: 25 - 5 = 20 input, 10 output, 5 cached
+        assert_eq!(messages[1].tokens.input, 20);
+        assert_eq!(messages[1].tokens.output, 10);
+        assert_eq!(messages[1].tokens.cache_read, 5);
     }
 }
