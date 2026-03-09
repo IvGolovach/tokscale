@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { db, deviceCodes } from "@/lib/db";
 import { generateDeviceCode, generateUserCode } from "@/lib/auth/utils";
+import { buildDeviceVerificationUrl } from "@/lib/auth/device";
 
 const DEVICE_CODE_EXPIRY_SECONDS = 900; // 15 minutes
 const POLL_INTERVAL_SECONDS = 5;
@@ -25,10 +26,13 @@ export async function POST(request: Request) {
 
     const baseUrl = process.env.NEXT_PUBLIC_URL || "http://localhost:3000";
 
+    const verificationUrl = `${baseUrl}/device`;
+
     return NextResponse.json({
       deviceCode,
       userCode,
-      verificationUrl: `${baseUrl}/device`,
+      verificationUrl,
+      verificationUrlComplete: buildDeviceVerificationUrl(baseUrl, userCode),
       expiresIn: DEVICE_CODE_EXPIRY_SECONDS,
       interval: POLL_INTERVAL_SECONDS,
     });

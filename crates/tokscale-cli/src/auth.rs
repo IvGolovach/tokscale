@@ -42,6 +42,8 @@ struct DeviceCodeResponse {
     user_code: String,
     #[serde(rename = "verificationUrl")]
     verification_url: String,
+    #[serde(rename = "verificationUrlComplete")]
+    verification_url_complete: Option<String>,
     #[serde(rename = "expiresIn")]
     #[allow(dead_code)]
     expires_in: u64,
@@ -67,6 +69,14 @@ struct UserInfo {
 #[derive(Debug, Deserialize)]
 struct TokenValidationResponse {
     user: UserInfo,
+}
+
+impl DeviceCodeResponse {
+    fn preferred_verification_url(&self) -> &str {
+        self.verification_url_complete
+            .as_deref()
+            .unwrap_or(&self.verification_url)
+    }
 }
 
 fn get_credentials_path() -> Result<PathBuf> {
@@ -256,13 +266,14 @@ pub async fn login() -> Result<()> {
 
     println!();
     println!("{}", "  Open this URL in your browser:".white());
+    let verification_url = device_data.preferred_verification_url();
     let url_display = if std::io::stdout().is_terminal() {
         format!(
             "\x1b]8;;{}\x1b\\{}\x1b]8;;\x1b\\",
-            device_data.verification_url, device_data.verification_url
+            verification_url, verification_url
         )
     } else {
-        device_data.verification_url.clone()
+        verification_url.to_string()
     };
     println!("{}", format!("  {}\n", url_display).cyan());
     println!("{}", "  Enter this code:".white());
@@ -271,7 +282,7 @@ pub async fn login() -> Result<()> {
         format!("  {}", device_data.user_code).green().bold()
     );
 
-    if !open_browser(&device_data.verification_url) {
+    if !open_browser(verification_url) {
         println!(
             "{}",
             "  Browser auto-open unavailable in this environment. Continue with the URL above.\n"
@@ -526,6 +537,41 @@ mod tests {
                 },
             }
         }
+    }
+
+    #[test]
+    fn preferred_verification_url_uses_complete_url_when_present() {
+        let response: DeviceCodeResponse = serde_json::from_value(serde_json::json!({
+            "deviceCode": "device-code",
+            "userCode": "ABCD-EFGH",
+            "verificationUrl": "https://tokscale.ai/device",
+            "verificationUrlComplete": "https://tokscale.ai/device?code=ABCD-EFGH",
+            "expiresIn": 900,
+            "interval": 5
+        }))
+        .expect("device response should deserialize");
+
+        assert_eq!(
+            response.preferred_verification_url(),
+            "https://tokscale.ai/device?code=ABCD-EFGH"
+        );
+    }
+
+    #[test]
+    fn preferred_verification_url_falls_back_to_plain_url() {
+        let response: DeviceCodeResponse = serde_json::from_value(serde_json::json!({
+            "deviceCode": "device-code",
+            "userCode": "ABCD-EFGH",
+            "verificationUrl": "https://tokscale.ai/device",
+            "expiresIn": 900,
+            "interval": 5
+        }))
+        .expect("device response should deserialize");
+
+        assert_eq!(
+            response.preferred_verification_url(),
+            "https://tokscale.ai/device"
+        );
     }
 
     #[test]
