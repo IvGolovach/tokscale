@@ -81,7 +81,7 @@ struct Cli {
     #[arg(long, help = "Show only Mux usage")]
     mux: bool,
 
-    #[arg(long, help = "Show only Synthetic usage")]
+    #[arg(long, help = "Show only Synthetic Gateway usage")]
     synthetic: bool,
 
     #[arg(long, help = "Show only today's usage")]
@@ -153,7 +153,7 @@ enum Commands {
         kilocode: bool,
         #[arg(long, help = "Show only Mux usage")]
         mux: bool,
-        #[arg(long, help = "Show only Synthetic usage")]
+        #[arg(long, help = "Show only Synthetic Gateway usage")]
         synthetic: bool,
         #[arg(long, help = "Show only today's usage")]
         today: bool,
@@ -213,7 +213,7 @@ enum Commands {
         kilocode: bool,
         #[arg(long, help = "Show only Mux usage")]
         mux: bool,
-        #[arg(long, help = "Show only Synthetic usage")]
+        #[arg(long, help = "Show only Synthetic Gateway usage")]
         synthetic: bool,
         #[arg(long, help = "Show only today's usage")]
         today: bool,
@@ -285,7 +285,7 @@ enum Commands {
         kilocode: bool,
         #[arg(long, help = "Show only Mux usage")]
         mux: bool,
-        #[arg(long, help = "Show only Synthetic usage")]
+        #[arg(long, help = "Show only Synthetic Gateway usage")]
         synthetic: bool,
         #[arg(long, help = "Show only today's usage")]
         today: bool,
@@ -334,7 +334,7 @@ enum Commands {
         kilocode: bool,
         #[arg(long, help = "Show only Mux usage")]
         mux: bool,
-        #[arg(long, help = "Show only Synthetic usage")]
+        #[arg(long, help = "Show only Synthetic Gateway usage")]
         synthetic: bool,
         #[arg(long, help = "Show only today's usage")]
         today: bool,
@@ -379,7 +379,7 @@ enum Commands {
         kilocode: bool,
         #[arg(long, help = "Show only Mux usage")]
         mux: bool,
-        #[arg(long, help = "Show only Synthetic usage")]
+        #[arg(long, help = "Show only Synthetic Gateway usage")]
         synthetic: bool,
         #[arg(long, help = "Submit only today's usage")]
         today: bool,
@@ -446,7 +446,7 @@ enum Commands {
         kilocode: bool,
         #[arg(long, help = "Show only Mux usage")]
         mux: bool,
-        #[arg(long, help = "Show only Synthetic usage")]
+        #[arg(long, help = "Show only Synthetic Gateway usage")]
         synthetic: bool,
         #[arg(
             long,

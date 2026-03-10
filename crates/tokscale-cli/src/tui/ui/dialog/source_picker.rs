@@ -264,7 +264,7 @@ impl DialogContent for ClientPickerDialog {
                         enabled.insert(client);
                         *self.needs_reload.borrow_mut() = true;
                     }
-                } else if c == 'x' {
+                } else if c == source_hotkey(SourceOption::Synthetic) {
                     let is_enabled = *self.include_synthetic.borrow();
                     if is_enabled && enabled_source_count > 1 {
                         *self.include_synthetic.borrow_mut() = false;
@@ -287,13 +287,58 @@ impl DialogContent for ClientPickerDialog {
 fn source_display_name(source: SourceOption) -> &'static str {
     match source {
         SourceOption::Client(client) => client_ui::display_name(client),
-        SourceOption::Synthetic => "Synthetic",
+        SourceOption::Synthetic => "Synthetic Gateway",
     }
 }
 
 fn source_hotkey(source: SourceOption) -> char {
     match source {
         SourceOption::Client(client) => client_ui::hotkey(client),
-        SourceOption::Synthetic => 'x',
+        SourceOption::Synthetic => 's',
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{source_display_name, source_hotkey, SourceOption};
+    use crate::tui::ui::dialog::DialogContent;
+    use crossterm::event::KeyCode;
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    use std::rc::Rc;
+    use tokscale_core::ClientId;
+
+    #[test]
+    fn synthetic_source_uses_gateway_label() {
+        assert_eq!(
+            source_display_name(SourceOption::Synthetic),
+            "Synthetic Gateway"
+        );
+    }
+
+    #[test]
+    fn synthetic_source_uses_distinct_hotkey() {
+        assert_eq!(source_hotkey(SourceOption::Synthetic), 's');
+    }
+
+    #[test]
+    fn synthetic_source_hotkey_toggles_gateway_filter() {
+        let enabled = Rc::new(RefCell::new(HashSet::from([ClientId::OpenCode])));
+        let include_synthetic = Rc::new(RefCell::new(false));
+        let needs_reload = Rc::new(RefCell::new(false));
+        let mut dialog = super::ClientPickerDialog::new(
+            enabled,
+            include_synthetic.clone(),
+            needs_reload.clone(),
+        );
+
+        assert!(!*include_synthetic.borrow());
+        assert!(!*needs_reload.borrow());
+
+        let result = dialog.handle_key(KeyCode::Char('s'));
+
+        assert!(matches!(result, crate::tui::ui::dialog::DialogResult::None));
+        assert!(*include_synthetic.borrow());
+        assert!(*needs_reload.borrow());
     }
 }
