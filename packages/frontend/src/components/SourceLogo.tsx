@@ -2,6 +2,8 @@
 
 import styled from "styled-components";
 
+import { SOURCE_DISPLAY_NAMES } from "@/lib/constants";
+
 /* eslint-disable @next/next/no-img-element */
 
 interface SourceLogoProps {
@@ -23,6 +25,7 @@ const StyledImg = styled.img<{ $height: number }>`
 
 export function SourceLogo({ sourceId, height = 14, className = "" }: SourceLogoProps) {
   const normalizedId = sourceId.toLowerCase();
+  const displayName = SOURCE_DISPLAY_NAMES[normalizedId] || sourceId;
 
   const getLogoSrc = (id: string) => {
     switch (id) {
@@ -64,13 +67,13 @@ export function SourceLogo({ sourceId, height = 14, className = "" }: SourceLogo
   const src = getLogoSrc(normalizedId);
 
   if (!src) {
-    return <span className={className}>{sourceId}</span>;
+    return <span className={className}>{displayName}</span>;
   }
 
   return (
     <StyledImg
       src={src}
-      alt={sourceId}
+      alt={displayName}
       $height={height}
       className={className}
     />

@@ -612,7 +612,7 @@ async fn generate_wrapped_image(data: &WrappedData, options: &RenderOptions) -> 
             COLOR_TEXT_SECONDARY,
             PADDING,
             y_pos,
-            "Top Clients",
+            "Top Sources",
         );
         y_pos += 48 * SCALE;
 
@@ -1361,7 +1361,7 @@ fn client_display_name(client: &str) -> Option<&'static str> {
         "roocode" => Some("Roo Code"),
         "kilocode" => Some("Kilo"),
         "mux" => Some("Mux"),
-        "synthetic" => Some("Synthetic"),
+        "synthetic" => Some("Synthetic Gateway"),
         _ => None,
     }
 }
@@ -1382,7 +1382,7 @@ fn client_logo_url(client_name: &str) -> Option<&'static str> {
         "Roo Code" => Some("https://tokscale.ai/assets/logos/roocode.png"),
         "Kilo" => Some("https://tokscale.ai/assets/logos/kilocode.png"),
         "Mux" => Some("https://tokscale.ai/assets/logos/mux.png"),
-        "Synthetic" => Some("https://tokscale.ai/assets/logos/synthetic.png"),
+        "Synthetic Gateway" => Some("https://tokscale.ai/assets/logos/synthetic.png"),
         _ => None,
     }
 }
@@ -2184,6 +2184,11 @@ mod tests {
     }
 
     #[test]
+    fn test_client_display_name_synthetic_gateway() {
+        assert_eq!(client_display_name("synthetic"), Some("Synthetic Gateway"));
+    }
+
+    #[test]
     fn test_client_display_name_unknown() {
         assert_eq!(client_display_name("unknown"), None);
         assert_eq!(client_display_name(""), None);
@@ -2261,6 +2266,14 @@ mod tests {
         assert_eq!(
             client_logo_url("Pi"),
             Some("https://tokscale.ai/assets/logos/pi.png")
+        );
+    }
+
+    #[test]
+    fn test_client_logo_url_synthetic_gateway() {
+        assert_eq!(
+            client_logo_url("Synthetic Gateway"),
+            Some("https://tokscale.ai/assets/logos/synthetic.png")
         );
     }
 

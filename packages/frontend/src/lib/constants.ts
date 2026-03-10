@@ -39,7 +39,7 @@ export const SOURCE_DISPLAY_NAMES: Record<string, string> = {
   roocode: "Roo Code",
   kilocode: "Kilo",
   mux: "Mux",
-  synthetic: "Synthetic",
+  synthetic: "Synthetic Gateway",
 };
 
 // Client logos from GitHub CDN (public repo)

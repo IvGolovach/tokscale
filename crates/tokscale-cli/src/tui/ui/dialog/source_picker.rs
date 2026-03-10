@@ -137,7 +137,7 @@ impl DialogContent for ClientPickerDialog {
 
     fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let block = Block::default()
-            .title(" Clients ")
+            .title(" Sources ")
             .borders(Borders::ALL)
             .border_style(Style::default().fg(theme.accent));
         let inner = block.inner(area);

@@ -2,6 +2,7 @@
 
 import styled from "styled-components";
 import type { TokenContributionData, GraphColorPalette } from "@/lib/types";
+import { SOURCE_DISPLAY_NAMES } from "@/lib/constants";
 import {
   formatCurrency,
   formatTokenCount,
@@ -164,13 +165,13 @@ export function StatsPanel({ data, palette }: StatsPanelProps) {
       </Grid>
 
       <SourcesContainer>
-        <SourcesLabel>Clients:</SourcesLabel>
+        <SourcesLabel>Sources:</SourcesLabel>
         {summary.clients.map((client) => (
           <SourceBadge
             key={client}
             $backgroundColor={`${palette.grade3}20`}
           >
-            {client}
+            {SOURCE_DISPLAY_NAMES[client] || client}
           </SourceBadge>
         ))}
       </SourcesContainer>

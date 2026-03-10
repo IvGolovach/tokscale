@@ -349,7 +349,7 @@ export function GraphControls({
 
       <FiltersWrapper>
         {availableClients.length > 1 && (
-          <SourceFilterGroup role="group" aria-label="Client filters">
+          <SourceFilterGroup role="group" aria-label="Source filters">
             <FilterLabel id="client-filter-label" style={{ color: "var(--color-fg-muted)" }}>Filter:</FilterLabel>
             {availableClients.map((client) => {
               const isSelected = clientFilter.length === 0 || clientFilter.includes(client);
@@ -379,7 +379,7 @@ export function GraphControls({
             {clientFilter.length > 0 && clientFilter.length < availableClients.length && (
               <ActionButton
                 onClick={() => onClientFilterChange([...availableClients])}
-                aria-label="Show all clients"
+                aria-label="Show all sources"
                 style={{ color: "var(--color-fg-muted)" }}
               >
                 Show all
@@ -388,7 +388,7 @@ export function GraphControls({
             {clientFilter.length === availableClients.length && (
               <ActionButton
                 onClick={() => onClientFilterChange([])}
-                aria-label="Clear all client filters"
+                aria-label="Clear source filters"
                 style={{ color: "var(--color-fg-muted)" }}
               >
                 Clear

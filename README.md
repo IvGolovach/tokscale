@@ -132,7 +132,7 @@ In the age of AI-assisted development, **tokens are the new energy**. They power
   - GitHub-style contribution graph with 9 color themes
   - Real-time filtering and sorting
   - Zero flicker rendering
-- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Cursor IDE, Gemini CLI, Amp, Droid, OpenClaw, Pi, Kimi CLI, Qwen CLI, Roo Code, Kilo, Mux, and Synthetic
+- **Multi-platform support** - Track usage across OpenCode, Claude Code, Codex CLI, Cursor IDE, Gemini CLI, Amp, Droid, OpenClaw, Pi, Kimi CLI, Qwen CLI, Roo Code, Kilo, Mux, and Synthetic Gateway traffic
 - **Real-time pricing** - Fetches current pricing from LiteLLM with 1-hour disk cache; automatic OpenRouter fallback and Cursor model pricing for newly released models
 - **Detailed breakdowns** - Input, output, cache read/write, and reasoning token tracking
 - **Native Rust core** - All parsing and aggregation done in Rust for 10x faster processing
@@ -657,7 +657,7 @@ The generated image includes:
 
 - **Total Tokens** - Your total token consumption for the year
 - **Top Models** - Your 3 most-used AI models ranked by cost
-- **Top Clients** - Your 3 most-used platforms (OpenCode, Claude Code, Cursor, etc.)
+- **Top Sources** - Your 3 most-used platforms (OpenCode, Claude Code, Cursor, etc.)
 - **Messages** - Total number of AI interactions
 - **Active Days** - Days with at least one AI interaction
 - **Cost** - Estimated total cost based on LiteLLM pricing
