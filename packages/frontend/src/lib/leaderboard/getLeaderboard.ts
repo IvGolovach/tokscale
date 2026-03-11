@@ -1,7 +1,10 @@
 import { unstable_cache } from "next/cache";
 import { db, users, submissions, dailyBreakdown } from "@/lib/db";
-import { eq, desc, sql, and, gte, lte } from "drizzle-orm";
-import { buildSubmissionFreshness } from "@/lib/submissionFreshness";
+import { eq, desc, sql, and, gte, lte, inArray } from "drizzle-orm";
+import {
+  buildSubmissionFreshness,
+  getSubmissionTrustPolicy,
+} from "@/lib/submissionFreshness";
 import type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
 
 export type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
@@ -16,6 +19,7 @@ interface LeaderboardPeriodRow {
   updatedAt: string;
   cliVersion: string | null;
   schemaVersion: number;
+  trustGeneration: number;
 }
 
 interface PeriodDateRange {
@@ -33,6 +37,7 @@ interface PeriodLeaderboardDbRow {
   updatedAt: Date | string;
   cliVersion: string | null;
   schemaVersion: number | null;
+  trustGeneration: number | null;
 }
 
 interface AllTimeLeaderboardDbRow {
@@ -43,9 +48,14 @@ interface AllTimeLeaderboardDbRow {
   totalTokens: number | string | null;
   totalCost: number | string | null;
   submissionCount: number | string | null;
-  lastSubmission: string;
+}
+
+interface SubmissionMetadataRow {
+  userId: string;
+  updatedAt: Date | string;
   cliVersion: string | null;
   schemaVersion: number | null;
+  trustGeneration: number | null;
 }
 
 function toUtcDateString(date: Date): string {
@@ -122,6 +132,7 @@ function aggregatePeriodRows(
           updatedAt: row.updatedAt,
           cliVersion: row.cliVersion,
           schemaVersion: row.schemaVersion,
+          trustGeneration: row.trustGeneration,
         });
       }
       continue;
@@ -140,6 +151,7 @@ function aggregatePeriodRows(
         updatedAt: row.updatedAt,
         cliVersion: row.cliVersion,
         schemaVersion: row.schemaVersion,
+        trustGeneration: row.trustGeneration,
       }),
     });
   }
@@ -165,6 +177,7 @@ function buildPeriodLeaderboardData(
       ...user,
       rank: offset + index + 1,
     })),
+    submissionTrustPolicy: getSubmissionTrustPolicy(),
     pagination: {
       page,
       limit,
@@ -223,6 +236,7 @@ async function fetchPeriodLeaderboardRows(
       updatedAt: submissions.updatedAt,
       cliVersion: submissions.cliVersion,
       schemaVersion: submissions.schemaVersion,
+      trustGeneration: submissions.trustGeneration,
     })
     .from(dailyBreakdown)
     .innerJoin(submissions, eq(dailyBreakdown.submissionId, submissions.id))
@@ -246,6 +260,7 @@ async function fetchPeriodLeaderboardRows(
       : new Date(row.updatedAt).toISOString(),
     cliVersion: row.cliVersion,
     schemaVersion: Number(row.schemaVersion) || 0,
+    trustGeneration: Number(row.trustGeneration) || 0,
   }));
 }
 
@@ -276,9 +291,6 @@ async function fetchLeaderboardData(
       totalTokens: sql<number>`SUM(${submissions.totalTokens})`.as("total_tokens"),
       totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(12,4)))`.as("total_cost"),
       submissionCount: sql<number>`COALESCE(SUM(${submissions.submitCount}), 0)`.as("submission_count"),
-      lastSubmission: sql<string>`MAX(${submissions.updatedAt})`.as("last_submission"),
-      cliVersion: sql<string | null>`MAX(${submissions.cliVersion})`.as("cli_version"),
-      schemaVersion: sql<number>`MAX(${submissions.schemaVersion})`.as("schema_version"),
     })
     .from(submissions)
     .innerJoin(users, eq(submissions.userId, users.id))
@@ -301,24 +313,32 @@ async function fetchLeaderboardData(
 
   const totalUsers = Number(globalStats[0]?.uniqueUsers) || 0;
   const totalPages = Math.ceil(totalUsers / limit);
+  const userIds = (results as AllTimeLeaderboardDbRow[]).map((row) => row.userId);
+  const latestMetadataByUserId = await fetchLatestSubmissionMetadataByUserIds(userIds);
 
   return {
-    users: (results as AllTimeLeaderboardDbRow[]).map((row, index) => ({
-      rank: offset + index + 1,
-      userId: row.userId,
-      username: row.username,
-      displayName: row.displayName,
-      avatarUrl: row.avatarUrl,
-      totalTokens: Number(row.totalTokens) || 0,
-      totalCost: Number(row.totalCost) || 0,
-      submissionCount: Number(row.submissionCount) || 0,
-      lastSubmission: row.lastSubmission,
-      submissionFreshness: buildSubmissionFreshness({
-        updatedAt: row.lastSubmission,
-        cliVersion: row.cliVersion,
-        schemaVersion: row.schemaVersion,
-      }),
-    })),
+    users: (results as AllTimeLeaderboardDbRow[]).map((row, index) => {
+      const latestMetadata = latestMetadataByUserId.get(row.userId);
+
+      return {
+        rank: offset + index + 1,
+        userId: row.userId,
+        username: row.username,
+        displayName: row.displayName,
+        avatarUrl: row.avatarUrl,
+        totalTokens: Number(row.totalTokens) || 0,
+        totalCost: Number(row.totalCost) || 0,
+        submissionCount: Number(row.submissionCount) || 0,
+        lastSubmission: latestMetadata?.updatedAt ?? "",
+        submissionFreshness: buildSubmissionFreshness({
+          updatedAt: latestMetadata?.updatedAt,
+          cliVersion: latestMetadata?.cliVersion,
+          schemaVersion: latestMetadata?.schemaVersion,
+          trustGeneration: latestMetadata?.trustGeneration,
+        }),
+      };
+    }),
+    submissionTrustPolicy: getSubmissionTrustPolicy(),
     pagination: {
       page,
       limit,
@@ -385,9 +405,6 @@ async function fetchUserRank(
       totalTokens: sql<number>`SUM(${submissions.totalTokens})`.as("total_tokens"),
       totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(12,4)))`.as("total_cost"),
       submissionCount: sql<number>`COALESCE(SUM(${submissions.submitCount}), 0)`.as("submission_count"),
-      lastSubmission: sql<string>`MAX(${submissions.updatedAt})`.as("last_submission"),
-      cliVersion: sql<string | null>`MAX(${submissions.cliVersion})`.as("cli_version"),
-      schemaVersion: sql<number>`MAX(${submissions.schemaVersion})`.as("schema_version"),
     })
     .from(submissions)
     .where(eq(submissions.userId, user.id));
@@ -397,6 +414,20 @@ async function fetchUserRank(
   }
 
   const userStats = userStatsResult[0];
+  const latestSubmissionResult = await db
+    .select({
+      userId: submissions.userId,
+      updatedAt: submissions.updatedAt,
+      cliVersion: submissions.cliVersion,
+      schemaVersion: submissions.schemaVersion,
+      trustGeneration: submissions.trustGeneration,
+    })
+    .from(submissions)
+    .where(eq(submissions.userId, user.id))
+    .orderBy(desc(submissions.updatedAt))
+    .limit(1);
+
+  const latestSubmission = latestSubmissionResult[0];
   const userTotalTokens = Number(userStats.totalTokens);
   const userTotalCost = userStats.totalCost != null ? Number(userStats.totalCost) : 0;
 
@@ -432,13 +463,65 @@ async function fetchUserRank(
     totalTokens: userTotalTokens,
     totalCost: userTotalCost,
     submissionCount: Number(userStats.submissionCount) || 0,
-    lastSubmission: userStats.lastSubmission,
+    lastSubmission: latestSubmission?.updatedAt instanceof Date
+      ? latestSubmission.updatedAt.toISOString()
+      : latestSubmission?.updatedAt ?? "",
     submissionFreshness: buildSubmissionFreshness({
-      updatedAt: userStats.lastSubmission,
-      cliVersion: userStats.cliVersion,
-      schemaVersion: userStats.schemaVersion,
+      updatedAt: latestSubmission?.updatedAt,
+      cliVersion: latestSubmission?.cliVersion,
+      schemaVersion: latestSubmission?.schemaVersion,
+      trustGeneration: latestSubmission?.trustGeneration,
     }),
   };
+}
+
+async function fetchLatestSubmissionMetadataByUserIds(
+  userIds: string[]
+): Promise<Map<string, {
+  updatedAt: string;
+  cliVersion: string | null;
+  schemaVersion: number | null;
+  trustGeneration: number | null;
+}>> {
+  if (userIds.length === 0) {
+    return new Map();
+  }
+
+  const rows: SubmissionMetadataRow[] = await db
+    .select({
+      userId: submissions.userId,
+      updatedAt: submissions.updatedAt,
+      cliVersion: submissions.cliVersion,
+      schemaVersion: submissions.schemaVersion,
+      trustGeneration: submissions.trustGeneration,
+    })
+    .from(submissions)
+    .where(inArray(submissions.userId, userIds))
+    .orderBy(desc(submissions.updatedAt));
+
+  const latestByUserId = new Map<string, {
+    updatedAt: string;
+    cliVersion: string | null;
+    schemaVersion: number | null;
+    trustGeneration: number | null;
+  }>();
+
+  for (const row of rows) {
+    if (latestByUserId.has(row.userId)) {
+      continue;
+    }
+
+    latestByUserId.set(row.userId, {
+      updatedAt: row.updatedAt instanceof Date
+        ? row.updatedAt.toISOString()
+        : new Date(row.updatedAt).toISOString(),
+      cliVersion: row.cliVersion,
+      schemaVersion: row.schemaVersion,
+      trustGeneration: row.trustGeneration,
+    });
+  }
+
+  return latestByUserId;
 }
 
 export function getUserRank(

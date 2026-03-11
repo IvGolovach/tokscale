@@ -37,10 +37,18 @@ describe("GET /api/leaderboard", () => {
             lastUpdated: "2026-01-10T10:00:00.000Z",
             cliVersion: "1.4.2",
             schemaVersion: 1,
+            trustGeneration: 0,
+            currentTrustGeneration: 1,
             isStale: true,
+            isOutdated: true,
           },
         },
       ],
+      submissionTrustPolicy: {
+        rankingMode: "include-all",
+        labelsAffectRanking: false,
+        refreshCommand: "bunx tokscale submit",
+      },
       pagination: {
         page: 1,
         limit: 10,
@@ -70,7 +78,15 @@ describe("GET /api/leaderboard", () => {
       lastUpdated: "2026-01-10T10:00:00.000Z",
       cliVersion: "1.4.2",
       schemaVersion: 1,
+      trustGeneration: 0,
+      currentTrustGeneration: 1,
       isStale: true,
+      isOutdated: true,
+    });
+    expect(body.submissionTrustPolicy).toEqual({
+      rankingMode: "include-all",
+      labelsAffectRanking: false,
+      refreshCommand: "bunx tokscale submit",
     });
   });
 });

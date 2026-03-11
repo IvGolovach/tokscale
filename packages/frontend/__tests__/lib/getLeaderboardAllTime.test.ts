@@ -1,7 +1,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockState = vi.hoisted(() => {
-  const periodRows: Array<Record<string, unknown>> = [];
+  const awaitedResults: unknown[] = [];
   const fromCalls: unknown[] = [];
 
   const tables = {
@@ -35,6 +35,7 @@ const mockState = vi.hoisted(() => {
   const and = vi.fn(() => "and");
   const gte = vi.fn(() => "gte");
   const lte = vi.fn(() => "lte");
+  const inArray = vi.fn(() => "inArray");
   const sql = Object.assign(
     () => ({
       as: () => ({}),
@@ -52,11 +53,15 @@ const mockState = vi.hoisted(() => {
           return builder;
         }),
         innerJoin: vi.fn(() => builder),
-        where: vi.fn(async () => [...periodRows]),
+        where: vi.fn(() => builder),
         groupBy: vi.fn(() => builder),
         orderBy: vi.fn(() => builder),
         limit: vi.fn(() => builder),
         offset: vi.fn(() => builder),
+        having: vi.fn(() => builder),
+        as: vi.fn(() => builder),
+        then: (resolve: (value: unknown) => unknown) =>
+          resolve(awaitedResults.shift() ?? []),
       };
 
       return builder;
@@ -72,9 +77,10 @@ const mockState = vi.hoisted(() => {
     and,
     gte,
     lte,
+    inArray,
     sql,
     reset() {
-      periodRows.length = 0;
+      awaitedResults.length = 0;
       fromCalls.length = 0;
       db.select.mockClear();
       eq.mockClear();
@@ -82,11 +88,11 @@ const mockState = vi.hoisted(() => {
       and.mockClear();
       gte.mockClear();
       lte.mockClear();
+      inArray.mockClear();
       sql.raw.mockClear();
     },
-    setPeriodRows(rows: Array<Record<string, unknown>>) {
-      periodRows.length = 0;
-      periodRows.push(...rows);
+    pushAwaitedResult(value: unknown) {
+      awaitedResults.push(value);
     },
   };
 });
@@ -112,6 +118,7 @@ vi.mock("drizzle-orm", () => ({
   and: mockState.and,
   gte: mockState.gte,
   lte: mockState.lte,
+  inArray: mockState.inArray,
   sql: mockState.sql,
 }));
 
@@ -134,92 +141,97 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
-describe("period leaderboard data", () => {
-  const rows = [
-    {
-      userId: "user-alice",
-      username: "alice",
-      displayName: "Alice",
-      avatarUrl: null,
-      tokens: 100,
-      cost: 1.25,
-      updatedAt: "2026-03-07T11:00:00.000Z",
-      cliVersion: "1.5.0",
-      schemaVersion: 1,
-      trustGeneration: 1,
-    },
-    {
-      userId: "user-alice",
-      username: "alice",
-      displayName: "Alice",
-      avatarUrl: null,
-      tokens: 150,
-      cost: 1.75,
-      updatedAt: "2026-03-07T11:00:00.000Z",
-      cliVersion: "1.5.0",
-      schemaVersion: 1,
-      trustGeneration: 1,
-    },
-    {
-      userId: "user-bob",
-      username: "bob",
-      displayName: "Bob",
-      avatarUrl: null,
-      tokens: 1000,
-      cost: 9.5,
-      updatedAt: "2026-01-15T09:00:00.000Z",
-      cliVersion: "1.3.0",
-      schemaVersion: 0,
-      trustGeneration: 0,
-    },
-  ];
-
-  it("builds the week leaderboard from daily rows", async () => {
+describe("all-time leaderboard data", () => {
+  it("uses the latest submission metadata for all-time leaderboard rows", async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-07T18:45:00Z"));
-    mockState.setPeriodRows(rows);
+    vi.setSystemTime(new Date("2026-03-11T18:45:00Z"));
 
-    const leaderboard = await getLeaderboardData("week", 1, 50, "tokens");
-
-    expect(mockState.fromCalls[0]).toBe(mockState.tables.dailyBreakdown);
-    expect(mockState.gte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-01"
-    );
-    expect(mockState.lte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-07"
-    );
-    expect(leaderboard.users).toHaveLength(2);
-    expect(leaderboard.users[0]).toMatchObject({
-      rank: 1,
-      username: "bob",
-      totalTokens: 1000,
-      totalCost: 9.5,
-      submissionFreshness: {
-        lastUpdated: "2026-01-15T09:00:00.000Z",
-        cliVersion: "1.3.0",
+    mockState.pushAwaitedResult([
+      {
+        rank: 1,
+        userId: "user-alice",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        totalTokens: 3000,
+        totalCost: 30,
+        submissionCount: 3,
+      },
+      {
+        rank: 2,
+        userId: "user-bob",
+        username: "bob",
+        displayName: "Bob",
+        avatarUrl: null,
+        totalTokens: 1000,
+        totalCost: 10,
+        submissionCount: 1,
+      },
+    ]);
+    mockState.pushAwaitedResult([
+      {
+        totalTokens: 4000,
+        totalCost: 40,
+        totalSubmissions: 4,
+        uniqueUsers: 2,
+      },
+    ]);
+    mockState.pushAwaitedResult([
+      {
+        userId: "user-alice",
+        updatedAt: "2026-03-10T12:00:00.000Z",
+        cliVersion: "2.0.10",
+        schemaVersion: 1,
+        trustGeneration: 1,
+      },
+      {
+        userId: "user-alice",
+        updatedAt: "2026-01-10T12:00:00.000Z",
+        cliVersion: "9.9.9",
+        schemaVersion: 7,
+        trustGeneration: 7,
+      },
+      {
+        userId: "user-bob",
+        updatedAt: "2026-01-05T09:00:00.000Z",
+        cliVersion: "1.4.2",
         schemaVersion: 0,
         trustGeneration: 0,
-        currentTrustGeneration: 1,
-        isStale: true,
-        isOutdated: true,
       },
-    });
-    expect(leaderboard.users[1]).toMatchObject({
-      rank: 2,
+    ]);
+
+    const leaderboard = await getLeaderboardData("all", 1, 50, "tokens");
+
+    expect(mockState.inArray).toHaveBeenCalledWith(
+      mockState.tables.submissions.userId,
+      ["user-alice", "user-bob"]
+    );
+    expect(leaderboard.users[0]).toMatchObject({
+      rank: 1,
       username: "alice",
-      totalTokens: 250,
-      totalCost: 3,
-      submissionCount: null,
+      lastSubmission: "2026-03-10T12:00:00.000Z",
       submissionFreshness: {
-        lastUpdated: "2026-03-07T11:00:00.000Z",
-        cliVersion: "1.5.0",
+        lastUpdated: "2026-03-10T12:00:00.000Z",
+        cliVersion: "2.0.10",
         schemaVersion: 1,
         trustGeneration: 1,
         currentTrustGeneration: 1,
         isStale: false,
         isOutdated: false,
+      },
+    });
+    expect(leaderboard.users[1]).toMatchObject({
+      rank: 2,
+      username: "bob",
+      lastSubmission: "2026-01-05T09:00:00.000Z",
+      submissionFreshness: {
+        lastUpdated: "2026-01-05T09:00:00.000Z",
+        cliVersion: "1.4.2",
+        schemaVersion: 0,
+        trustGeneration: 0,
+        currentTrustGeneration: 1,
+        isStale: true,
+        isOutdated: true,
       },
     });
     expect(leaderboard.submissionTrustPolicy).toEqual({
@@ -228,54 +240,59 @@ describe("period leaderboard data", () => {
       refreshCommand: "bunx tokscale submit",
     });
     expect(leaderboard.stats).toMatchObject({
-      totalTokens: 1250,
-      totalCost: 12.5,
-      totalSubmissions: null,
+      totalTokens: 4000,
+      totalCost: 40,
+      totalSubmissions: 4,
       uniqueUsers: 2,
     });
   });
 
-  it("uses the current month for the month leaderboard range", async () => {
+  it("uses the latest submission metadata when building all-time user rank", async () => {
     vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-07T18:45:00Z"));
-    mockState.setPeriodRows(rows);
+    vi.setSystemTime(new Date("2026-03-11T18:45:00Z"));
 
-    const leaderboard = await getLeaderboardData("month", 1, 50, "tokens");
+    mockState.pushAwaitedResult([
+      {
+        id: "user-alice",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+      },
+    ]);
+    mockState.pushAwaitedResult([
+      {
+        totalTokens: 3000,
+        totalCost: 30,
+        submissionCount: 3,
+      },
+    ]);
+    mockState.pushAwaitedResult([
+      {
+        userId: "user-alice",
+        updatedAt: "2026-03-10T12:00:00.000Z",
+        cliVersion: "2.0.10",
+        schemaVersion: 1,
+        trustGeneration: 1,
+      },
+    ]);
+    mockState.pushAwaitedResult([
+      {
+        count: 1,
+      },
+    ]);
 
-    expect(mockState.fromCalls[0]).toBe(mockState.tables.dailyBreakdown);
-    expect(mockState.gte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-01"
-    );
-    expect(mockState.lte).toHaveBeenCalledWith(
-      mockState.tables.dailyBreakdown.date,
-      "2026-03-07"
-    );
-    expect(leaderboard.users[1]).toMatchObject({
-      username: "alice",
-      totalTokens: 250,
-      totalCost: 3,
-    });
-  });
+    const rank = await getUserRank("alice", "all", "tokens");
 
-  it("uses the same daily totals when computing week rank", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-03-07T18:45:00Z"));
-    mockState.setPeriodRows(rows);
-
-    const rank = await getUserRank("alice", "week", "tokens");
-
-    expect(mockState.fromCalls[0]).toBe(mockState.tables.dailyBreakdown);
     expect(rank).toMatchObject({
       rank: 2,
       username: "alice",
-      totalTokens: 250,
-      totalCost: 3,
-      submissionCount: null,
-      lastSubmission: "2026-03-07T11:00:00.000Z",
+      totalTokens: 3000,
+      totalCost: 30,
+      submissionCount: 3,
+      lastSubmission: "2026-03-10T12:00:00.000Z",
       submissionFreshness: {
-        lastUpdated: "2026-03-07T11:00:00.000Z",
-        cliVersion: "1.5.0",
+        lastUpdated: "2026-03-10T12:00:00.000Z",
+        cliVersion: "2.0.10",
         schemaVersion: 1,
         trustGeneration: 1,
         currentTrustGeneration: 1,

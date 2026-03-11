@@ -29,6 +29,7 @@ const mockState = vi.hoisted(() => {
       updatedAt: "submissions.updatedAt",
       cliVersion: "submissions.cliVersion",
       schemaVersion: "submissions.schemaVersion",
+      trustGeneration: "submissions.trustGeneration",
     },
     dailyBreakdown: {
       submissionId: "dailyBreakdown.submissionId",
@@ -175,6 +176,7 @@ describe("GET /api/users/[username]", () => {
         updatedAt: new Date("2026-01-10T10:00:00.000Z"),
         cliVersion: "1.4.2",
         schemaVersion: 1,
+        trustGeneration: 0,
       },
     ]);
     mockState.pushSelectResult([]);
@@ -191,7 +193,15 @@ describe("GET /api/users/[username]", () => {
       lastUpdated: "2026-01-10T10:00:00.000Z",
       cliVersion: "1.4.2",
       schemaVersion: 1,
+      trustGeneration: 0,
+      currentTrustGeneration: 1,
       isStale: true,
+      isOutdated: true,
+    });
+    expect(body.submissionTrustPolicy).toEqual({
+      rankingMode: "include-all",
+      labelsAffectRanking: false,
+      refreshCommand: "bunx tokscale submit",
     });
     expect(body.updatedAt).toBe("2026-01-10T10:00:00.000Z");
     expect(body.clients).toEqual(["cursor"]);
@@ -234,6 +244,11 @@ describe("GET /api/users/[username]", () => {
 
     expect(response.status).toBe(200);
     expect(body.submissionFreshness).toBeNull();
+    expect(body.submissionTrustPolicy).toEqual({
+      rankingMode: "include-all",
+      labelsAffectRanking: false,
+      refreshCommand: "bunx tokscale submit",
+    });
     expect(body.updatedAt).toBeNull();
     expect(body.clients).toEqual([]);
     expect(body.models).toEqual([]);

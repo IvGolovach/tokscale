@@ -17,6 +17,7 @@ import {
   mergeTimestampMs,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
+import { CURRENT_SUBMISSION_TRUST_GENERATION } from "@/lib/submissionFreshness";
 
 function normalizeSubmissionData(data: unknown): void {
   if (!data || typeof data !== "object") return;
@@ -176,6 +177,7 @@ export async function POST(request: Request) {
             status: "verified",
             cliVersion: data.meta.version,
             submissionHash: generateSubmissionHash(hashData),
+            trustGeneration: CURRENT_SUBMISSION_TRUST_GENERATION,
           })
           .returning({ id: submissions.id });
 
@@ -454,6 +456,7 @@ export async function POST(request: Request) {
           submissionHash: generateSubmissionHash(hashData),
           submitCount: sql`COALESCE(submit_count, 0) + 1`,
           schemaVersion: sql`GREATEST(COALESCE(${submissions.schemaVersion}, 0), ${data.contributions.some((c) => c.timestampMs != null) ? 1 : 0})`,
+          trustGeneration: CURRENT_SUBMISSION_TRUST_GENERATION,
           updatedAt: new Date(),
         })
         .where(eq(submissions.id, submissionId));

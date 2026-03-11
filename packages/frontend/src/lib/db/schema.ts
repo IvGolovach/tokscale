@@ -172,6 +172,8 @@ export const submissions = pgTable(
     submitCount: integer("submit_count").notNull().default(1),
     /** 0=legacy (no timestamps), 1=timestamp-aware CLI */
     schemaVersion: integer("schema_version").notNull().default(0),
+    /** Correctness generation for parser and pricing trust decisions. */
+    trustGeneration: integer("trust_generation").notNull().default(0),
 
     createdAt: timestamp("created_at", { withTimezone: true })
       .notNull()

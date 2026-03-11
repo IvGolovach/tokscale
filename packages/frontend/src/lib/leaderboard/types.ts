@@ -1,4 +1,7 @@
-import type { SubmissionFreshness } from "@/lib/submissionFreshness";
+import type {
+  SubmissionFreshness,
+  SubmissionTrustPolicy,
+} from "@/lib/submissionFreshness";
 
 export type Period = "all" | "month" | "week";
 export type SortBy = "tokens" | "cost";
@@ -18,6 +21,7 @@ export interface LeaderboardUser {
 
 export interface LeaderboardData {
   users: LeaderboardUser[];
+  submissionTrustPolicy: SubmissionTrustPolicy;
   pagination: {
     page: number;
     limit: number;

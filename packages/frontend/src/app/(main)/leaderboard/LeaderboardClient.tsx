@@ -6,7 +6,10 @@ import styled from "styled-components";
 import { CopyIcon, CheckIcon } from "@/components/ui/Icons";
 import { TabBar } from "@/components/TabBar";
 import { LeaderboardSkeleton } from "@/components/Skeleton";
-import { SubmissionFreshnessBadge } from "@/components/profile/SubmissionFreshness";
+import {
+  SubmissionFreshnessBadge,
+  SubmissionTrustPolicyNotice,
+} from "@/components/profile/SubmissionFreshness";
 import type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
 import { formatCurrency, formatNumber } from "@/lib/utils";
 import { useSettings } from "@/lib/useSettings";
@@ -982,6 +985,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
       <Section>
         <Title>Leaderboard</Title>
         <Description>See who&apos;s using the most tokens</Description>
+        <SubmissionTrustPolicyNotice policy={data.submissionTrustPolicy} />
 
         <StatsGrid>
           <StatCard>

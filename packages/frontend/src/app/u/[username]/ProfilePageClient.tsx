@@ -18,7 +18,10 @@ import {
   type ProfileTab,
   type ModelUsage,
 } from "@/components/profile";
-import type { SubmissionFreshness } from "@/lib/submissionFreshness";
+import type {
+  SubmissionFreshness,
+  SubmissionTrustPolicy,
+} from "@/lib/submissionFreshness";
 import type { TokenContributionData, DailyContribution, ClientType } from "@/lib/types";
 
 interface ProfileData {
@@ -46,6 +49,7 @@ interface ProfileData {
   };
   updatedAt: string | null;
   submissionFreshness: SubmissionFreshness | null;
+  submissionTrustPolicy: SubmissionTrustPolicy;
   clients: string[];
   models: string[];
   modelUsage?: ModelUsage[];
@@ -142,7 +146,10 @@ export default function ProfilePageClient({ initialData }: ProfilePageClientProp
     <PageContainer style={{ backgroundColor: "#10121C" }}>
       <Navigation />
 
-      <SubmissionFreshnessBanner freshness={data.submissionFreshness} />
+      <SubmissionFreshnessBanner
+        freshness={data.submissionFreshness}
+        policy={data.submissionTrustPolicy}
+      />
 
       <MainContent>
         <ContentWrapper>
