@@ -183,7 +183,7 @@ fn get_device_name() -> String {
 
 #[cfg(any(test, target_os = "windows"))]
 fn windows_start_arg(url: &str) -> String {
-    format!("\"{}\"", url.replace('"', "%22"))
+    format!("\"{}\"", url.replace('%', "%%").replace('"', "%22"))
 }
 
 #[cfg(target_os = "linux")]
@@ -584,6 +584,14 @@ mod tests {
         assert_eq!(
             windows_start_arg("https://tokscale.ai/device?code=ABCD-EFGH&foo=bar"),
             "\"https://tokscale.ai/device?code=ABCD-EFGH&foo=bar\""
+        );
+    }
+
+    #[test]
+    fn windows_start_arg_escapes_percent_for_cmd() {
+        assert_eq!(
+            windows_start_arg("https://tokscale.ai/device?code=AB%25CD-EFGH"),
+            "\"https://tokscale.ai/device?code=AB%%25CD-EFGH\""
         );
     }
 
