@@ -181,6 +181,11 @@ fn get_device_name() -> String {
     format!("CLI on {}", hostname)
 }
 
+#[cfg(any(test, target_os = "windows"))]
+fn windows_start_arg(url: &str) -> String {
+    format!("\"{}\"", url.replace('"', "%22"))
+}
+
 #[cfg(target_os = "linux")]
 fn has_non_empty_env_var(name: &str) -> bool {
     std::env::var_os(name).is_some_and(|value| !value.is_empty())
@@ -209,7 +214,7 @@ fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "windows")]
     {
         return std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+            .args(["/C", "start", "", &windows_start_arg(url)])
             .spawn()
             .is_ok();
     }
@@ -571,6 +576,14 @@ mod tests {
         assert_eq!(
             response.preferred_verification_url(),
             "https://tokscale.ai/device"
+        );
+    }
+
+    #[test]
+    fn windows_start_arg_quotes_prefilled_urls() {
+        assert_eq!(
+            windows_start_arg("https://tokscale.ai/device?code=ABCD-EFGH&foo=bar"),
+            "\"https://tokscale.ai/device?code=ABCD-EFGH&foo=bar\""
         );
     }
 
