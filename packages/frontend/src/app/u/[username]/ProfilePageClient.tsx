@@ -4,7 +4,6 @@ import { useState, useMemo } from "react";
 import styled from "styled-components";
 import { Navigation } from "@/components/layout/Navigation";
 import { Footer } from "@/components/layout/Footer";
-import { SubmissionFreshnessBanner } from "@/components/profile/SubmissionFreshness";
 import {
   ProfileHeader,
   ProfileTabBar,
@@ -18,7 +17,6 @@ import {
   type ProfileTab,
   type ModelUsage,
 } from "@/components/profile";
-import type { SubmissionFreshness } from "@/lib/submissionFreshness";
 import type { TokenContributionData, DailyContribution, ClientType } from "@/lib/types";
 
 interface ProfileData {
@@ -45,7 +43,6 @@ interface ProfileData {
     end: string | null;
   };
   updatedAt: string | null;
-  submissionFreshness: SubmissionFreshness | null;
   clients: string[];
   models: string[];
   modelUsage?: ModelUsage[];
@@ -54,9 +51,10 @@ interface ProfileData {
 
 interface ProfilePageClientProps {
   initialData: ProfileData;
+  username: string;
 }
 
-export default function ProfilePageClient({ initialData }: ProfilePageClientProps) {
+export default function ProfilePageClient({ initialData, username }: ProfilePageClientProps) {
   const [activeTab, setActiveTab] = useState<ProfileTab>("activity");
   const data = initialData;
 
@@ -138,18 +136,32 @@ export default function ProfilePageClient({ initialData }: ProfilePageClientProp
     submissionCount: data.stats.submissionCount,
   }), [data]);
 
+const EARLY_ADOPTERS = ["code-yeongyu", "gtg7784", "qodot"];
+  const showResubmitBanner = EARLY_ADOPTERS.includes(data.user.username) && data.stats.submissionCount === 1;
+
   return (
     <PageContainer style={{ backgroundColor: "#10121C" }}>
       <Navigation />
 
-      <SubmissionFreshnessBanner freshness={data.submissionFreshness} />
+      {showResubmitBanner && (
+        <BannerWrapper>
+          <BannerContent>
+            <BannerText>
+              <BannerBold>Update available:</BannerBold>{" "}
+              If you&apos;re <BannerBold>@{data.user.username}</BannerBold>, please re-submit your data with{" "}
+              <BannerCode>bunx tokscale submit</BannerCode>{" "}
+              to see detailed model breakdowns per day.
+            </BannerText>
+          </BannerContent>
+        </BannerWrapper>
+      )}
 
       <MainContent>
         <ContentWrapper>
           <ProfileHeader
             user={user}
             stats={stats}
-            lastUpdated={data.submissionFreshness?.lastUpdated || data.updatedAt || undefined}
+            lastUpdated={data.updatedAt || undefined}
           />
 
           <ProfileTabBar activeTab={activeTab} onTabChange={setActiveTab} />
@@ -183,6 +195,46 @@ const PageContainer = styled.div`
   flex-direction: column;
 
   padding-top: 64px;
+`;
+
+const BannerWrapper = styled.div`
+  background-color: rgba(245, 158, 11, 0.1);
+  border-bottom: 1px solid rgba(245, 158, 11, 0.2);
+`;
+
+const BannerContent = styled.div`
+  max-width: 800px;
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: 16px;
+  padding-right: 16px;
+  padding-top: 12px;
+  padding-bottom: 12px;
+
+  @media (min-width: 640px) {
+    padding-left: 24px;
+    padding-right: 24px;
+  }
+`;
+
+const BannerText = styled.p`
+  font-size: 14px;
+  color: #fde68a;
+`;
+
+const BannerBold = styled.span`
+  font-weight: 600;
+`;
+
+const BannerCode = styled.code`
+  padding-left: 6px;
+  padding-right: 6px;
+  padding-top: 2px;
+  padding-bottom: 2px;
+  border-radius: 4px;
+  background-color: rgba(245, 158, 11, 0.2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 12px;
 `;
 
 const MainContent = styled.main`

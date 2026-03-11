@@ -6,8 +6,6 @@ import styled from "styled-components";
 import { CopyIcon, CheckIcon } from "@/components/ui/Icons";
 import { TabBar } from "@/components/TabBar";
 import { LeaderboardSkeleton } from "@/components/Skeleton";
-import { SubmissionFreshnessBadge } from "@/components/profile/SubmissionFreshness";
-import type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
 import { formatCurrency, formatNumber } from "@/lib/utils";
 import { useSettings } from "@/lib/useSettings";
 import { Switch } from "@/components/Switch";
@@ -302,13 +300,6 @@ const UserInfo = styled.div`
   min-width: 0;
 `;
 
-const UserMetaRow = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-`;
-
 const UserDisplayName = styled.p`
   font-weight: 500;
   font-size: 14px;
@@ -574,13 +565,6 @@ const CurrentUserDetails = styled.div`
   flex: 1;
 `;
 
-const CurrentUserMetaRow = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-`;
-
 const CurrentUserName = styled.p`
   font-weight: 600;
   font-size: 16px;
@@ -738,10 +722,44 @@ const PaginationPages = styled.div`
   }
 `;
 
+export type Period = "all" | "month" | "week";
+
+export interface LeaderboardUser {
+  rank: number;
+  userId: string;
+  username: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+  totalTokens: number;
+  totalCost: number;
+  submissionCount: number | null;
+  lastSubmission: string;
+}
+
+export interface LeaderboardData {
+  users: LeaderboardUser[];
+  pagination: {
+    page: number;
+    limit: number;
+    totalUsers: number;
+    totalPages: number;
+    hasNext: boolean;
+    hasPrev: boolean;
+  };
+  stats: {
+    totalTokens: number;
+    totalCost: number;
+    totalSubmissions: number | null;
+    uniqueUsers: number;
+  };
+  period: Period;
+  sortBy?: 'tokens' | 'cost';
+}
+
 interface LeaderboardClientProps {
   initialData: LeaderboardData;
   currentUser: { id: string; username: string; displayName: string | null; avatarUrl: string | null } | null;
-  initialSortBy: SortBy;
+  initialSortBy: 'tokens' | 'cost';
   initialUserRank: LeaderboardUser | null;
 }
 
@@ -798,12 +816,9 @@ const LeaderboardRow = memo(function LeaderboardRow({
             <UserDisplayName>
               {user.displayName || user.username}
             </UserDisplayName>
-            <UserMetaRow>
-              <Username>
-                @{user.username}
-              </Username>
-              <SubmissionFreshnessBadge freshness={user.submissionFreshness} />
-            </UserMetaRow>
+            <Username>
+              @{user.username}
+            </Username>
           </UserInfo>
         </UserContainer>
       </TableCell>
@@ -856,6 +871,8 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
 
   useEffect(() => {
     if (!currentUser) {
+      setCurrentUserRank(null);
+      setCurrentUserRankError(false);
       return;
     }
 
@@ -865,6 +882,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
     }
 
     const abortController = new AbortController();
+    setCurrentUserRankError(false);
 
     fetch(`/api/leaderboard/user/${currentUser.username}?period=${period}&sortBy=${effectiveSortBy}`, {
       signal: abortController.signal,
@@ -887,7 +905,9 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
     return () => abortController.abort();
   }, [currentUser, period, effectiveSortBy]);
 
-  const fetchData = (targetPeriod: Period, targetPage: number, targetSortBy: SortBy, signal?: AbortSignal) => {
+  const fetchData = (targetPeriod: Period, targetPage: number, targetSortBy: 'tokens' | 'cost', signal?: AbortSignal) => {
+    setIsLoading(true);
+    setError(null);
     fetch(`/api/leaderboard?period=${targetPeriod}&page=${targetPage}&limit=50&sortBy=${targetSortBy}`, { signal })
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -897,14 +917,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
         if (!isValidLeaderboardData(result)) {
           throw new Error("Invalid response format");
         }
-
-        if (result.pagination.totalPages > 0 && targetPage > result.pagination.totalPages) {
-          setPage(result.pagination.totalPages);
-          return;
-        }
-
         setData(result);
-        setError(null);
         setIsLoading(false);
       })
       .catch((err) => {
@@ -939,6 +952,12 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
     return () => abortController.abort();
   }, [period, page, effectiveSortBy]);
 
+  useEffect(() => {
+    if (data.pagination.totalPages > 0 && page > data.pagination.totalPages) {
+      setPage(data.pagination.totalPages);
+    }
+  }, [data.pagination.totalPages, page]);
+
   const sortedUsers = data.users || [];
   const showSubmissionCount = period === "all";
 
@@ -951,31 +970,6 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
   const handleRowClick = useCallback((username: string) => {
     router.push(`/u/${username}`);
   }, [router]);
-
-  const handleTabChange = (tab: Period) => {
-    setIsLoading(true);
-    setError(null);
-    setPeriod(tab);
-    setPage(1);
-  };
-
-  const handleSortChange = (checked: boolean) => {
-    setIsLoading(true);
-    setError(null);
-    setLeaderboardSort(checked ? "cost" : "tokens");
-  };
-
-  const handlePageChange = (nextPage: number) => {
-    setIsLoading(true);
-    setError(null);
-    setPage(nextPage);
-  };
-
-  const handleRetry = () => {
-    setIsLoading(true);
-    setError(null);
-    fetchData(period, page, effectiveSortBy);
-  };
 
   return (
     <>
@@ -1028,12 +1022,9 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
               <CurrentUserName>
                 {currentUser.displayName || currentUser.username}
               </CurrentUserName>
-              <CurrentUserMetaRow>
-                <CurrentUserUsername>
-                  @{currentUser.username}
-                </CurrentUserUsername>
-                <SubmissionFreshnessBadge freshness={currentUserRank.submissionFreshness} />
-              </CurrentUserMetaRow>
+              <CurrentUserUsername>
+                @{currentUser.username}
+              </CurrentUserUsername>
             </CurrentUserDetails>
           </CurrentUserInfo>
           <CurrentUserStats>
@@ -1069,7 +1060,10 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
             { id: "week" as Period, label: "This Week" },
           ]}
           activeTab={period}
-          onTabChange={handleTabChange}
+          onTabChange={(tab) => {
+            setPeriod(tab);
+            setPage(1);
+          }}
         />
       </TabSection>
 
@@ -1077,7 +1071,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
         <SortLabel>Sort by:</SortLabel>
         <Switch
           checked={effectiveSortBy === 'cost'}
-          onChange={handleSortChange}
+          onChange={(checked) => setLeaderboardSort(checked ? 'cost' : 'tokens')}
           leftLabel="Tokens"
           rightLabel="Cost"
         />
@@ -1090,7 +1084,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
           <EmptyState>
             <EmptyMessage>Failed to load leaderboard</EmptyMessage>
             <EmptyHint>{error}</EmptyHint>
-            <RetryButton onClick={handleRetry}>
+            <RetryButton onClick={() => fetchData(period, page, effectiveSortBy)}>
               Retry
             </RetryButton>
           </EmptyState>
@@ -1144,7 +1138,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
                   <PaginationNav>
                     <PageButton
                       disabled={data.pagination.page <= 1}
-                      onClick={() => handlePageChange(data.pagination.page - 1)}
+                      onClick={() => setPage(data.pagination.page - 1)}
                       aria-label="Previous page"
                     >
                       ←
@@ -1169,7 +1163,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
                             pages.push(<PageEllipsis key={`e${p}`}>…</PageEllipsis>);
                           }
                           pages.push(
-                            <PageButton key={p} $active={p === current} onClick={() => handlePageChange(p)}>
+                            <PageButton key={p} $active={p === current} onClick={() => setPage(p)}>
                               {p}
                             </PageButton>
                           );
@@ -1180,7 +1174,7 @@ export default function LeaderboardClient({ initialData, currentUser, initialSor
                     </PaginationPages>
                     <PageButton
                       disabled={data.pagination.page >= data.pagination.totalPages}
-                      onClick={() => handlePageChange(data.pagination.page + 1)}
+                      onClick={() => setPage(data.pagination.page + 1)}
                       aria-label="Next page"
                     >
                       →

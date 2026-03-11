@@ -58,5 +58,5 @@ export default async function ProfilePage({ params }: { params: Promise<{ userna
     notFound();
   }
   
-  return <ProfilePageClient initialData={data} />;
+  return <ProfilePageClient initialData={data} username={username} />;
 }
