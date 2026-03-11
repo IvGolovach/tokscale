@@ -193,7 +193,8 @@ fn test_version_flag() {
     cmd.arg("--version")
         .assert()
         .success()
-        .stdout(predicate::str::contains("tokscale"));
+        .stdout(predicate::str::contains("tokscale"))
+        .stdout(predicate::str::contains(env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
@@ -713,6 +714,11 @@ fn test_graph_json_has_meta() {
     );
     assert!(meta.get("version").is_some(), "Missing meta.version");
     assert!(meta.get("dateRange").is_some(), "Missing meta.dateRange");
+    assert_eq!(
+        meta["version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "meta.version should match the compiled CLI version"
+    );
 }
 
 #[test]
