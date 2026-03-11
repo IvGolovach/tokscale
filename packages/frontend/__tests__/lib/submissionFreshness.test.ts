@@ -31,6 +31,16 @@ describe("submission freshness", () => {
     expect(isSubmissionStale("2026-03-04T12:00:00.000Z")).toBe(false);
   });
 
+  it("clamps fractional positive freshness windows to at least one day", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-11T12:00:00.000Z"));
+    vi.stubEnv("SUBMISSION_FRESHNESS_DAYS", "0.5");
+
+    expect(getSubmissionFreshnessWindowDays()).toBe(1);
+    expect(isSubmissionStale("2026-03-10T11:59:59.000Z")).toBe(true);
+    expect(isSubmissionStale("2026-03-10T12:00:00.000Z")).toBe(false);
+  });
+
   it("builds the submission freshness payload from latest submission metadata", () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-11T12:00:00.000Z"));
