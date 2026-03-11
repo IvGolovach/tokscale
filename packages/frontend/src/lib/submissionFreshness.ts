@@ -24,7 +24,7 @@ export function getSubmissionFreshnessWindowDays(): number {
     return DEFAULT_SUBMISSION_FRESHNESS_DAYS;
   }
 
-  return Math.floor(parsed);
+  return Math.max(1, Math.floor(parsed));
 }
 
 export function isSubmissionStale(
