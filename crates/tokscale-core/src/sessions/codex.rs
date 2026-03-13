@@ -158,6 +158,7 @@ pub(crate) struct CodexParseState {
 pub(crate) struct ParsedCodexFile {
     pub messages: Vec<UnifiedMessage>,
     pub fallback_timestamp_indices: Vec<usize>,
+    pub consumed_offset: u64,
     pub state: CodexParseState,
 }
 
@@ -169,20 +170,26 @@ fn session_id_from_path(path: &Path) -> String {
 }
 
 fn parse_codex_reader<R: BufRead>(
-    reader: R,
+    mut reader: R,
     session_id: &str,
     fallback_timestamp: i64,
+    start_offset: u64,
     mut state: CodexParseState,
 ) -> ParsedCodexFile {
     let mut messages = Vec::with_capacity(64);
     let mut fallback_timestamp_indices = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
+    let mut line = String::with_capacity(4096);
+    let mut consumed_offset = start_offset;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => continue,
+    loop {
+        line.clear();
+        let bytes_read = match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(bytes_read) => bytes_read,
+            Err(_) => break,
         };
+        consumed_offset += bytes_read as u64;
 
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -356,6 +363,7 @@ fn parse_codex_reader<R: BufRead>(
     ParsedCodexFile {
         messages,
         fallback_timestamp_indices,
+        consumed_offset,
         state,
     }
 }
@@ -374,6 +382,7 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
         reader,
         &session_id,
         fallback_timestamp,
+        0,
         CodexParseState::default(),
     )
     .messages
@@ -390,6 +399,7 @@ pub(crate) fn parse_codex_file_incremental(
             return ParsedCodexFile {
                 messages: Vec::new(),
                 fallback_timestamp_indices: Vec::new(),
+                consumed_offset: start_offset,
                 state,
             }
         }
@@ -399,6 +409,7 @@ pub(crate) fn parse_codex_file_incremental(
         return ParsedCodexFile {
             messages: Vec::new(),
             fallback_timestamp_indices: Vec::new(),
+            consumed_offset: start_offset,
             state,
         };
     }
@@ -406,7 +417,7 @@ pub(crate) fn parse_codex_file_incremental(
     let session_id = session_id_from_path(path);
     let fallback_timestamp = file_modified_timestamp_ms(path);
     let reader = BufReader::new(file);
-    parse_codex_reader(reader, &session_id, fallback_timestamp, state)
+    parse_codex_reader(reader, &session_id, fallback_timestamp, start_offset, state)
 }
 
 fn extract_model(payload: &CodexPayload) -> Option<String> {
@@ -609,6 +620,7 @@ mod tests {
         let initial_size = file.as_file().metadata().unwrap().len();
         let initial = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
         assert_eq!(initial.messages.len(), 1);
+        assert_eq!(initial.consumed_offset, initial_size);
 
         let appended = concat!(
             r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5},"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}}}}"#,
@@ -626,6 +638,10 @@ mod tests {
             parse_codex_file_incremental(file.path(), initial_size, initial.state.clone());
         let mut combined = initial.messages.clone();
         combined.extend(incremental.messages);
+        assert_eq!(
+            incremental.consumed_offset,
+            file.as_file().metadata().unwrap().len()
+        );
 
         let full = parse_codex_file(file.path());
         assert_eq!(combined, full);

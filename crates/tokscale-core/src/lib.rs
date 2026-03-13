@@ -331,6 +331,22 @@ fn parse_all_messages_with_pricing(
         messages
     }
 
+    fn parse_uncached_messages<F>(
+        path: &Path,
+        pricing: Option<&pricing::PricingService>,
+        parse: F,
+    ) -> CachedParseOutcome
+    where
+        F: Fn(&Path) -> Vec<UnifiedMessage>,
+    {
+        let mut messages = parse(path);
+        apply_pricing_to_messages(&mut messages, pricing);
+        CachedParseOutcome {
+            messages,
+            cache_entry: None,
+        }
+    }
+
     fn finalize_codex_messages(
         mut messages: Vec<UnifiedMessage>,
         pricing: Option<&pricing::PricingService>,
@@ -350,6 +366,31 @@ fn parse_all_messages_with_pricing(
         messages
     }
 
+    fn build_codex_cache_entry(
+        path: &Path,
+        raw_messages: Vec<UnifiedMessage>,
+        consumed_offset: u64,
+        state: sessions::codex::CodexParseState,
+        fallback_timestamp_indices: Vec<usize>,
+    ) -> Option<message_cache::CachedSourceEntry> {
+        let fingerprint = message_cache::SourceFingerprint::from_path(path)?;
+        if fingerprint.size != consumed_offset {
+            return None;
+        }
+
+        Some(message_cache::CachedSourceEntry::new(
+            path,
+            fingerprint,
+            raw_messages,
+            message_cache::build_codex_incremental_cache(
+                path,
+                consumed_offset,
+                state,
+                fallback_timestamp_indices,
+            ),
+        ))
+    }
+
     fn load_or_parse_source<F>(
         path: &Path,
         source_cache: &HashMap<String, message_cache::CachedSourceEntry>,
@@ -360,10 +401,7 @@ fn parse_all_messages_with_pricing(
         F: Fn(&Path) -> Vec<UnifiedMessage>,
     {
         let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
-            return CachedParseOutcome {
-                messages: Vec::new(),
-                cache_entry: None,
-            };
+            return parse_uncached_messages(path, pricing, parse);
         };
 
         let cache_key = path.to_string_lossy().to_string();
@@ -395,8 +433,15 @@ fn parse_all_messages_with_pricing(
         headless_roots: &[PathBuf],
     ) -> CachedParseOutcome {
         let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
+            let parsed = sessions::codex::parse_codex_file_incremental(path, 0, Default::default());
             return CachedParseOutcome {
-                messages: Vec::new(),
+                messages: finalize_codex_messages(
+                    parsed.messages,
+                    pricing,
+                    is_headless_path(path, headless_roots),
+                    &parsed.fallback_timestamp_indices,
+                    sessions::utils::file_modified_timestamp_ms(path),
+                ),
                 cache_entry: None,
             };
         };
@@ -423,16 +468,12 @@ fn parse_all_messages_with_pricing(
             }
 
             if let Some(codex_incremental) = cached.codex_incremental.as_ref() {
-                if fingerprint.size > cached.fingerprint.size
-                    && message_cache::codex_prefix_matches(
-                        path,
-                        &cached.fingerprint,
-                        codex_incremental.ends_with_newline,
-                    )
+                if fingerprint.size > codex_incremental.consumed_offset
+                    && message_cache::codex_prefix_matches(path, codex_incremental)
                 {
                     let parsed = sessions::codex::parse_codex_file_incremental(
                         path,
-                        cached.fingerprint.size,
+                        codex_incremental.consumed_offset,
                         codex_incremental.state.clone(),
                     );
 
@@ -455,21 +496,17 @@ fn parse_all_messages_with_pricing(
                         fallback_timestamp,
                     );
 
-                    let cache_entry = message_cache::CachedSourceEntry::new(
+                    let cache_entry = build_codex_cache_entry(
                         path,
-                        fingerprint.clone(),
                         raw_messages,
-                        message_cache::build_codex_incremental_cache(
-                            path,
-                            &fingerprint,
-                            parsed.state,
-                            fallback_timestamp_indices,
-                        ),
+                        parsed.consumed_offset,
+                        parsed.state,
+                        fallback_timestamp_indices,
                     );
 
                     return CachedParseOutcome {
                         messages,
-                        cache_entry: Some(cache_entry),
+                        cache_entry,
                     };
                 }
             }
@@ -488,21 +525,17 @@ fn parse_all_messages_with_pricing(
             fallback_timestamp,
         );
 
-        let cache_entry = message_cache::CachedSourceEntry::new(
+        let cache_entry = build_codex_cache_entry(
             path,
-            fingerprint.clone(),
             parsed.messages,
-            message_cache::build_codex_incremental_cache(
-                path,
-                &fingerprint,
-                parsed.state,
-                parsed.fallback_timestamp_indices,
-            ),
+            parsed.consumed_offset,
+            parsed.state,
+            parsed.fallback_timestamp_indices,
         );
 
         CachedParseOutcome {
             messages,
-            cache_entry: Some(cache_entry),
+            cache_entry,
         }
     }
 

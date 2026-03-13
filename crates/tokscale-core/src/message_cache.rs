@@ -1,6 +1,8 @@
 use crate::sessions::codex::CodexParseState;
 use crate::UnifiedMessage;
+use bincode::Options;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -9,18 +11,52 @@ use std::time::UNIX_EPOCH;
 
 const CACHE_SCHEMA_VERSION: u32 = 3;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
+const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const FINGERPRINT_SAMPLE_BYTES: usize = 4096;
 const FINGERPRINT_SAMPLE_POINTS: usize = 5;
+const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 fn cache_dir() -> Option<PathBuf> {
-    dirs::cache_dir().map(|path| path.join("tokscale"))
+    dirs::cache_dir()
+        .or_else(fallback_cache_base_dir)
+        .map(|path| path.join("tokscale"))
 }
 
 fn cache_path() -> Option<PathBuf> {
     Some(cache_dir()?.join(CACHE_FILENAME))
 }
 
+fn fallback_cache_base_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .or_else(user_scoped_temp_dir)
+}
+
+#[cfg(unix)]
+fn user_scoped_temp_dir() -> Option<PathBuf> {
+    let uid = unsafe { libc::geteuid() };
+    Some(std::env::temp_dir().join(format!("tokscale-uid-{uid}")))
+}
+
+#[cfg(not(unix))]
+fn user_scoped_temp_dir() -> Option<PathBuf> {
+    std::env::var_os("USERNAME")
+        .or_else(|| std::env::var_os("USER"))
+        .map(|user| {
+            let mut path = std::env::temp_dir();
+            path.push(format!("tokscale-user-{}", user.to_string_lossy()));
+            path
+        })
+}
+
 fn ensure_cache_dir(dir: &Path) -> std::io::Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(dir) {
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(std::io::Error::other(
+                "cache directory is not a real directory",
+            ));
+        }
+    }
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
@@ -68,8 +104,10 @@ impl SourceFingerprint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CodexIncrementalCache {
     pub state: CodexParseState,
+    pub consumed_offset: u64,
     pub ends_with_newline: bool,
     pub fallback_timestamp_indices: Vec<usize>,
+    pub prefix_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,9 +155,19 @@ impl SourceMessageCache {
             Ok(file) => file,
             Err(_) => return Self::default(),
         };
+        let metadata = match file.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => return Self::default(),
+        };
+        if metadata.len() > MAX_CACHE_FILE_BYTES {
+            return Self::default();
+        }
 
         let reader = BufReader::new(file);
-        let store: CachedSourceStore = match bincode::deserialize_from(reader) {
+        let store: CachedSourceStore = match bincode::options()
+            .with_limit(MAX_CACHE_FILE_BYTES)
+            .deserialize_from(reader)
+        {
             Ok(store) => store,
             Err(_) => return Self::default(),
         };
@@ -187,7 +235,10 @@ impl SourceMessageCache {
         let write_result = (|| -> std::io::Result<()> {
             let file = File::create(&tmp_path)?;
             let mut writer = BufWriter::new(file);
-            bincode::serialize_into(&mut writer, &store).map_err(std::io::Error::other)?;
+            bincode::options()
+                .with_limit(MAX_CACHE_FILE_BYTES)
+                .serialize_into(&mut writer, &store)
+                .map_err(std::io::Error::other)?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
             if fs::rename(&tmp_path, &final_path).is_err() {
@@ -272,29 +323,37 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hash
 }
 
-pub(crate) fn sample_hashes_match(path: &Path, expected: &[FileSampleHash]) -> bool {
-    let mut file = match File::open(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    expected.iter().all(|sample| {
-        let Some(actual) = read_sample_hash(&mut file, sample.offset, sample.len as usize) else {
-            return false;
-        };
-        actual == *sample
-    })
+fn hash_prefix(path: &Path, len: u64) -> Option<[u8; 32]> {
+    let mut file = File::open(path).ok()?;
+    let mut hasher = Sha256::new();
+    let mut remaining = len;
+    let mut buffer = [0_u8; HASH_BUFFER_BYTES];
+
+    while remaining > 0 {
+        let bytes_to_read = remaining.min(HASH_BUFFER_BYTES as u64) as usize;
+        let read = file.read(&mut buffer[..bytes_to_read]).ok()?;
+        if read == 0 {
+            return None;
+        }
+        hasher.update(&buffer[..read]);
+        remaining -= read as u64;
+    }
+
+    Some(hasher.finalize().into())
 }
 
 pub(crate) fn build_codex_incremental_cache(
     path: &Path,
-    fingerprint: &SourceFingerprint,
+    consumed_offset: u64,
     state: CodexParseState,
     fallback_timestamp_indices: Vec<usize>,
 ) -> Option<CodexIncrementalCache> {
     Some(CodexIncrementalCache {
         state,
-        ends_with_newline: fingerprint.size == 0 || file_ends_with_newline(path, fingerprint.size),
+        consumed_offset,
+        ends_with_newline: consumed_offset == 0 || file_ends_with_newline(path, consumed_offset),
         fallback_timestamp_indices,
+        prefix_hash: hash_prefix(path, consumed_offset)?,
     })
 }
 
@@ -315,16 +374,15 @@ fn file_ends_with_newline(path: &Path, size: u64) -> bool {
     file.read_exact(&mut byte).is_ok() && byte[0] == b'\n'
 }
 
-pub(crate) fn codex_prefix_matches(
-    path: &Path,
-    previous_fingerprint: &SourceFingerprint,
-    ends_with_newline: bool,
-) -> bool {
-    if previous_fingerprint.size > 0 && !ends_with_newline {
+pub(crate) fn codex_prefix_matches(path: &Path, cached: &CodexIncrementalCache) -> bool {
+    if cached.consumed_offset > 0 && !cached.ends_with_newline {
         return false;
     }
 
-    sample_hashes_match(path, &previous_fingerprint.sample_hashes)
+    match hash_prefix(path, cached.consumed_offset) {
+        Some(prefix_hash) => prefix_hash == cached.prefix_hash,
+        None => false,
+    }
 }
 
 #[cfg(test)]
@@ -347,7 +405,7 @@ mod tests {
         let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
         let incremental_cache = build_codex_incremental_cache(
             file.path(),
-            &fingerprint,
+            fingerprint.size,
             CodexParseState::default(),
             Vec::new(),
         )
@@ -358,11 +416,7 @@ mod tests {
         reopened.write_all(b"line-3\n").unwrap();
         reopened.flush().unwrap();
 
-        assert!(codex_prefix_matches(
-            file.path(),
-            &fingerprint,
-            incremental_cache.ends_with_newline,
-        ));
+        assert!(codex_prefix_matches(file.path(), &incremental_cache,));
     }
 
     #[test]
@@ -380,10 +434,39 @@ mod tests {
     fn test_codex_prefix_matches_rejects_middle_rewrite_with_same_tail() {
         let file = write_temp_file(b"aaaa\nbbbb\ncccc\n");
         let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
+        let incremental_cache = build_codex_incremental_cache(
+            file.path(),
+            fingerprint.size,
+            CodexParseState::default(),
+            Vec::new(),
+        )
+        .unwrap();
 
         std::fs::write(file.path(), b"aaaa\nzzzz\ncccc\nmore\n").unwrap();
 
-        assert!(!codex_prefix_matches(file.path(), &fingerprint, true));
+        assert!(!codex_prefix_matches(file.path(), &incremental_cache));
+    }
+
+    #[test]
+    fn test_codex_prefix_matches_rejects_large_unsampled_rewrite() {
+        let mut original = vec![b'a'; 128 * 1024];
+        original.extend_from_slice(b"\n");
+        let file = write_temp_file(&original);
+        let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
+        let incremental_cache = build_codex_incremental_cache(
+            file.path(),
+            fingerprint.size,
+            CodexParseState::default(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let mut rewritten = original.clone();
+        rewritten[73 * 1024] = b'z';
+        rewritten.extend_from_slice(b"appended\n");
+        std::fs::write(file.path(), rewritten).unwrap();
+
+        assert!(!codex_prefix_matches(file.path(), &incremental_cache));
     }
 
     #[test]
@@ -445,5 +528,69 @@ mod tests {
         cache.prune_missing_files();
 
         assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_load_ignores_oversized_cache_file() {
+        let temp_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let test_result = (|| {
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let file = File::create(&cache_file).unwrap();
+            file.set_len(MAX_CACHE_FILE_BYTES + 1).unwrap();
+
+            let loaded = SourceMessageCache::load();
+            assert!(loaded.entries.is_empty());
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_source_message_cache_round_trip_with_runtime_dir_fallback() {
+        let runtime_dir = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        let original_xdg_cache_home = std::env::var("XDG_CACHE_HOME").ok();
+        let original_xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
+
+        std::env::remove_var("HOME");
+        std::env::remove_var("XDG_CACHE_HOME");
+        std::env::set_var("XDG_RUNTIME_DIR", runtime_dir.path());
+
+        let test_result = (|| {
+            let file = write_temp_file(b"{}\n");
+            let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
+            let entry = CachedSourceEntry::new(file.path(), fingerprint, Vec::new(), None);
+
+            let mut cache = SourceMessageCache::default();
+            cache.insert(entry);
+            cache.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            assert_eq!(loaded.entries.len(), 1);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_xdg_cache_home {
+            Some(path) => std::env::set_var("XDG_CACHE_HOME", path),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match original_xdg_runtime_dir {
+            Some(path) => std::env::set_var("XDG_RUNTIME_DIR", path),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        test_result
     }
 }
