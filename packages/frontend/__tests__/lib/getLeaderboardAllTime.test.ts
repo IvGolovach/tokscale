@@ -179,10 +179,12 @@ describe("all-time leaderboard freshness queries", () => {
 
     expect(sqlTexts.some((text) =>
       text.includes("SELECT s2.cli_version FROM submissions s2")
+        && text.includes("WHERE s2.user_id = users.id")
         && text.includes("ORDER BY s2.updated_at DESC LIMIT 1")
     )).toBe(true);
     expect(sqlTexts.some((text) =>
       text.includes("SELECT s2.schema_version FROM submissions s2")
+        && text.includes("WHERE s2.user_id = users.id")
         && text.includes("ORDER BY s2.updated_at DESC LIMIT 1")
     )).toBe(true);
     expect(sqlTexts.some((text) =>
