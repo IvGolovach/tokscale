@@ -81,6 +81,7 @@ struct CachedSourceStore {
     entries: Vec<CachedSourceEntry>,
 }
 
+#[derive(Default)]
 pub(crate) struct SourceMessageCache {
     pub entries: HashMap<String, CachedSourceEntry>,
     dirty: bool,
@@ -163,15 +164,6 @@ impl SourceMessageCache {
 
         if write_result.is_err() {
             let _ = fs::remove_file(&tmp_path);
-        }
-    }
-}
-
-impl Default for SourceMessageCache {
-    fn default() -> Self {
-        Self {
-            entries: HashMap::new(),
-            dirty: false,
         }
     }
 }
