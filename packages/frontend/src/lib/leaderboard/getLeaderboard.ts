@@ -277,8 +277,16 @@ async function fetchLeaderboardData(
       totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(12,4)))`.as("total_cost"),
       submissionCount: sql<number>`COALESCE(SUM(${submissions.submitCount}), 0)`.as("submission_count"),
       lastSubmission: sql<string>`MAX(${submissions.updatedAt})`.as("last_submission"),
-      cliVersion: sql<string | null>`MAX(${submissions.cliVersion})`.as("cli_version"),
-      schemaVersion: sql<number>`MAX(${submissions.schemaVersion})`.as("schema_version"),
+      cliVersion: sql<string | null>`(
+        SELECT s2.cli_version FROM submissions s2
+        WHERE s2.user_id = ${users.id}
+        ORDER BY s2.updated_at DESC LIMIT 1
+      )`.as("cli_version"),
+      schemaVersion: sql<number>`COALESCE((
+        SELECT s2.schema_version FROM submissions s2
+        WHERE s2.user_id = ${users.id}
+        ORDER BY s2.updated_at DESC LIMIT 1
+      ), 0)`.as("schema_version"),
     })
     .from(submissions)
     .innerJoin(users, eq(submissions.userId, users.id))
@@ -386,8 +394,16 @@ async function fetchUserRank(
       totalCost: sql<number>`SUM(CAST(${submissions.totalCost} AS DECIMAL(12,4)))`.as("total_cost"),
       submissionCount: sql<number>`COALESCE(SUM(${submissions.submitCount}), 0)`.as("submission_count"),
       lastSubmission: sql<string>`MAX(${submissions.updatedAt})`.as("last_submission"),
-      cliVersion: sql<string | null>`MAX(${submissions.cliVersion})`.as("cli_version"),
-      schemaVersion: sql<number>`MAX(${submissions.schemaVersion})`.as("schema_version"),
+      cliVersion: sql<string | null>`(
+        SELECT s2.cli_version FROM submissions s2
+        WHERE s2.user_id = ${submissions.userId}
+        ORDER BY s2.updated_at DESC LIMIT 1
+      )`.as("cli_version"),
+      schemaVersion: sql<number>`COALESCE((
+        SELECT s2.schema_version FROM submissions s2
+        WHERE s2.user_id = ${submissions.userId}
+        ORDER BY s2.updated_at DESC LIMIT 1
+      ), 0)`.as("schema_version"),
     })
     .from(submissions)
     .where(eq(submissions.userId, user.id));
