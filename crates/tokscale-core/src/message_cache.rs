@@ -7,39 +7,60 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_SCHEMA_VERSION: u32 = 3;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
-const CODEX_TAIL_SAMPLE_BYTES: usize = 8192;
+const FINGERPRINT_SAMPLE_BYTES: usize = 4096;
+const FINGERPRINT_SAMPLE_POINTS: usize = 5;
 
-fn cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join("tokscale")
+fn cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir().map(|path| path.join("tokscale"))
 }
 
-fn cache_path() -> PathBuf {
-    cache_dir().join(CACHE_FILENAME)
+fn cache_path() -> Option<PathBuf> {
+    Some(cache_dir()?.join(CACHE_FILENAME))
+}
+
+fn ensure_cache_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct FileSampleHash {
+    pub offset: u64,
+    pub len: u64,
+    pub hash: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SourceFingerprint {
     pub size: u64,
-    pub modified_ms: u64,
+    pub modified_ns: u64,
+    pub sample_hashes: Vec<FileSampleHash>,
 }
 
 impl SourceFingerprint {
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
         let metadata = path.metadata().ok()?;
-        let modified_ms = metadata
+        let size = metadata.len();
+        let modified_ns = metadata
             .modified()
             .ok()?
             .duration_since(UNIX_EPOCH)
             .ok()?
-            .as_millis() as u64;
+            .as_nanos() as u64;
+        let sample_hashes = compute_sample_hashes(path, size)?;
 
         Some(Self {
-            size: metadata.len(),
-            modified_ms,
+            size,
+            modified_ns,
+            sample_hashes,
         })
     }
 }
@@ -47,8 +68,8 @@ impl SourceFingerprint {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CodexIncrementalCache {
     pub state: CodexParseState,
-    pub tail_sample: Vec<u8>,
     pub ends_with_newline: bool,
+    pub fallback_timestamp_indices: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,7 +110,9 @@ pub(crate) struct SourceMessageCache {
 
 impl SourceMessageCache {
     pub(crate) fn load() -> Self {
-        let path = cache_path();
+        let Some(path) = cache_path() else {
+            return Self::default();
+        };
         let file = match File::open(path) {
             Ok(file) => file,
             Err(_) => return Self::default(),
@@ -122,13 +145,23 @@ impl SourceMessageCache {
         self.dirty = true;
     }
 
+    pub(crate) fn prune_missing_files(&mut self) {
+        let original_len = self.entries.len();
+        self.entries.retain(|path, _| Path::new(path).exists());
+        if self.entries.len() != original_len {
+            self.dirty = true;
+        }
+    }
+
     pub(crate) fn save_if_dirty(&self) {
         if !self.dirty {
             return;
         }
 
-        let dir = cache_dir();
-        if fs::create_dir_all(&dir).is_err() {
+        let Some(dir) = cache_dir() else {
+            return;
+        };
+        if ensure_cache_dir(&dir).is_err() {
             return;
         }
 
@@ -137,7 +170,9 @@ impl SourceMessageCache {
             entries: self.entries.values().cloned().collect(),
         };
 
-        let final_path = cache_path();
+        let Some(final_path) = cache_path() else {
+            return;
+        };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -168,49 +203,128 @@ impl SourceMessageCache {
     }
 }
 
-fn read_tail_sample(path: &Path, end_offset: u64) -> Option<Vec<u8>> {
-    if end_offset == 0 {
+fn read_sample_hash(file: &mut File, offset: u64, len: usize) -> Option<FileSampleHash> {
+    if len == 0 {
+        return Some(FileSampleHash {
+            offset,
+            len: 0,
+            hash: 0,
+        });
+    }
+
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buffer = vec![0_u8; len];
+    file.read_exact(&mut buffer).ok()?;
+
+    Some(FileSampleHash {
+        offset,
+        len: len as u64,
+        hash: hash_bytes(&buffer),
+    })
+}
+
+fn compute_sample_hashes(path: &Path, size: u64) -> Option<Vec<FileSampleHash>> {
+    if size == 0 {
         return Some(Vec::new());
     }
 
-    let bytes_to_read = end_offset.min(CODEX_TAIL_SAMPLE_BYTES as u64) as usize;
-    let start_offset = end_offset.saturating_sub(bytes_to_read as u64);
-
     let mut file = File::open(path).ok()?;
-    file.seek(SeekFrom::Start(start_offset)).ok()?;
+    let offsets = sample_offsets(size);
+    offsets
+        .into_iter()
+        .map(|(offset, len)| read_sample_hash(&mut file, offset, len))
+        .collect()
+}
 
-    let mut buffer = vec![0_u8; bytes_to_read];
-    file.read_exact(&mut buffer).ok()?;
-    Some(buffer)
+fn sample_offsets(size: u64) -> Vec<(u64, usize)> {
+    let sample_len = size.min(FINGERPRINT_SAMPLE_BYTES as u64) as usize;
+    if sample_len == 0 {
+        return Vec::new();
+    }
+
+    let max_offset = size.saturating_sub(sample_len as u64);
+    let mut offsets = if max_offset == 0 {
+        vec![0]
+    } else {
+        vec![
+            0,
+            max_offset / 4,
+            max_offset / 2,
+            max_offset.saturating_mul(3) / 4,
+            max_offset,
+        ]
+    };
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets.truncate(FINGERPRINT_SAMPLE_POINTS);
+    offsets
+        .into_iter()
+        .map(|offset| (offset, sample_len))
+        .collect()
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+pub(crate) fn sample_hashes_match(path: &Path, expected: &[FileSampleHash]) -> bool {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    expected.iter().all(|sample| {
+        let Some(actual) = read_sample_hash(&mut file, sample.offset, sample.len as usize) else {
+            return false;
+        };
+        actual == *sample
+    })
 }
 
 pub(crate) fn build_codex_incremental_cache(
     path: &Path,
     fingerprint: &SourceFingerprint,
     state: CodexParseState,
+    fallback_timestamp_indices: Vec<usize>,
 ) -> Option<CodexIncrementalCache> {
-    let tail_sample = read_tail_sample(path, fingerprint.size)?;
     Some(CodexIncrementalCache {
         state,
-        ends_with_newline: fingerprint.size == 0 || tail_sample.last().copied() == Some(b'\n'),
-        tail_sample,
+        ends_with_newline: fingerprint.size == 0 || file_ends_with_newline(path, fingerprint.size),
+        fallback_timestamp_indices,
     })
 }
 
-pub(crate) fn codex_tail_matches(
-    path: &Path,
-    previous_size: u64,
-    ends_with_newline: bool,
-    expected_tail_sample: &[u8],
-) -> bool {
-    if previous_size > 0 && !ends_with_newline {
+fn file_ends_with_newline(path: &Path, size: u64) -> bool {
+    if size == 0 {
+        return true;
+    }
+
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    if file.seek(SeekFrom::Start(size.saturating_sub(1))).is_err() {
         return false;
     }
 
-    match read_tail_sample(path, previous_size) {
-        Some(actual) => actual == expected_tail_sample,
-        None => false,
+    let mut byte = [0_u8; 1];
+    file.read_exact(&mut byte).is_ok() && byte[0] == b'\n'
+}
+
+pub(crate) fn codex_prefix_matches(
+    path: &Path,
+    previous_fingerprint: &SourceFingerprint,
+    ends_with_newline: bool,
+) -> bool {
+    if previous_fingerprint.size > 0 && !ends_with_newline {
+        return false;
     }
+
+    sample_hashes_match(path, &previous_fingerprint.sample_hashes)
 }
 
 #[cfg(test)]
@@ -228,24 +342,48 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_tail_matches_appended_file() {
+    fn test_codex_prefix_matches_appended_file() {
         let file = write_temp_file(b"line-1\nline-2\n");
         let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
-        let incremental_cache =
-            build_codex_incremental_cache(file.path(), &fingerprint, CodexParseState::default())
-                .unwrap();
+        let incremental_cache = build_codex_incremental_cache(
+            file.path(),
+            &fingerprint,
+            CodexParseState::default(),
+            Vec::new(),
+        )
+        .unwrap();
 
         let mut reopened = file.reopen().unwrap();
         reopened.seek(SeekFrom::End(0)).unwrap();
         reopened.write_all(b"line-3\n").unwrap();
         reopened.flush().unwrap();
 
-        assert!(codex_tail_matches(
+        assert!(codex_prefix_matches(
             file.path(),
-            fingerprint.size,
+            &fingerprint,
             incremental_cache.ends_with_newline,
-            &incremental_cache.tail_sample,
         ));
+    }
+
+    #[test]
+    fn test_source_fingerprint_changes_for_same_size_rewrite() {
+        let file = write_temp_file(b"aaaa\nbbbb\ncccc\n");
+        let before = SourceFingerprint::from_path(file.path()).unwrap();
+
+        std::fs::write(file.path(), b"aaaa\nzzzz\ncccc\n").unwrap();
+
+        let after = SourceFingerprint::from_path(file.path()).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn test_codex_prefix_matches_rejects_middle_rewrite_with_same_tail() {
+        let file = write_temp_file(b"aaaa\nbbbb\ncccc\n");
+        let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
+
+        std::fs::write(file.path(), b"aaaa\nzzzz\ncccc\nmore\n").unwrap();
+
+        assert!(!codex_prefix_matches(file.path(), &fingerprint, true));
     }
 
     #[test]
@@ -292,5 +430,20 @@ mod tests {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn test_prune_missing_files_removes_deleted_entries() {
+        let file = write_temp_file(b"{}\n");
+        let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
+        let path = file.path().to_path_buf();
+
+        let mut cache = SourceMessageCache::default();
+        cache.insert(CachedSourceEntry::new(&path, fingerprint, Vec::new(), None));
+
+        std::fs::remove_file(&path).unwrap();
+        cache.prune_missing_files();
+
+        assert!(cache.entries.is_empty());
     }
 }

@@ -317,6 +317,7 @@ fn parse_all_messages_with_pricing(
         pricing: Option<&pricing::PricingService>,
     ) {
         for message in messages {
+            message.refresh_derived_fields();
             apply_pricing_if_available(message, pricing);
         }
     }
@@ -334,7 +335,14 @@ fn parse_all_messages_with_pricing(
         mut messages: Vec<UnifiedMessage>,
         pricing: Option<&pricing::PricingService>,
         is_headless: bool,
+        fallback_timestamp_indices: &[usize],
+        fallback_timestamp: i64,
     ) -> Vec<UnifiedMessage> {
+        for index in fallback_timestamp_indices {
+            if let Some(message) = messages.get_mut(*index) {
+                message.set_timestamp(fallback_timestamp);
+            }
+        }
         apply_pricing_to_messages(&mut messages, pricing);
         for message in &mut messages {
             apply_headless_agent(message, is_headless);
@@ -395,6 +403,7 @@ fn parse_all_messages_with_pricing(
 
         let cache_key = path.to_string_lossy().to_string();
         let is_headless = is_headless_path(path, headless_roots);
+        let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
 
         if let Some(cached) = source_cache.get(&cache_key) {
             if cached.fingerprint == fingerprint {
@@ -403,6 +412,11 @@ fn parse_all_messages_with_pricing(
                         cached.messages.clone(),
                         pricing,
                         is_headless,
+                        cached
+                            .codex_incremental
+                            .as_ref()
+                            .map_or(&[], |cache| cache.fallback_timestamp_indices.as_slice()),
+                        fallback_timestamp,
                     ),
                     cache_entry: None,
                 };
@@ -410,11 +424,10 @@ fn parse_all_messages_with_pricing(
 
             if let Some(codex_incremental) = cached.codex_incremental.as_ref() {
                 if fingerprint.size > cached.fingerprint.size
-                    && message_cache::codex_tail_matches(
+                    && message_cache::codex_prefix_matches(
                         path,
-                        cached.fingerprint.size,
+                        &cached.fingerprint,
                         codex_incremental.ends_with_newline,
-                        &codex_incremental.tail_sample,
                     )
                 {
                     let parsed = sessions::codex::parse_codex_file_incremental(
@@ -424,9 +437,23 @@ fn parse_all_messages_with_pricing(
                     );
 
                     let mut raw_messages = cached.messages.clone();
+                    let mut fallback_timestamp_indices =
+                        codex_incremental.fallback_timestamp_indices.clone();
+                    let existing_len = raw_messages.len();
+                    fallback_timestamp_indices.extend(
+                        parsed
+                            .fallback_timestamp_indices
+                            .iter()
+                            .map(|index| existing_len + index),
+                    );
                     raw_messages.extend(parsed.messages.clone());
-                    let messages =
-                        finalize_codex_messages(raw_messages.clone(), pricing, is_headless);
+                    let messages = finalize_codex_messages(
+                        raw_messages.clone(),
+                        pricing,
+                        is_headless,
+                        &fallback_timestamp_indices,
+                        fallback_timestamp,
+                    );
 
                     let cache_entry = message_cache::CachedSourceEntry::new(
                         path,
@@ -436,6 +463,7 @@ fn parse_all_messages_with_pricing(
                             path,
                             &fingerprint,
                             parsed.state,
+                            fallback_timestamp_indices,
                         ),
                     );
 
@@ -452,13 +480,24 @@ fn parse_all_messages_with_pricing(
             0,
             sessions::codex::CodexParseState::default(),
         );
-        let messages = finalize_codex_messages(parsed.messages.clone(), pricing, is_headless);
+        let messages = finalize_codex_messages(
+            parsed.messages.clone(),
+            pricing,
+            is_headless,
+            &parsed.fallback_timestamp_indices,
+            fallback_timestamp,
+        );
 
         let cache_entry = message_cache::CachedSourceEntry::new(
             path,
             fingerprint.clone(),
             parsed.messages,
-            message_cache::build_codex_incremental_cache(path, &fingerprint, parsed.state),
+            message_cache::build_codex_incremental_cache(
+                path,
+                &fingerprint,
+                parsed.state,
+                parsed.fallback_timestamp_indices,
+            ),
         );
 
         CachedParseOutcome {
@@ -470,6 +509,7 @@ fn parse_all_messages_with_pricing(
     let scan_result = scanner::scan_all_clients(home_dir, clients);
     let headless_roots = scanner::headless_roots(home_dir);
     let mut source_cache = message_cache::SourceMessageCache::load();
+    source_cache.prune_missing_files();
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
@@ -529,16 +569,12 @@ fn parse_all_messages_with_pricing(
             })
         })
         .collect();
-    let claude_messages_raw: Vec<(String, UnifiedMessage)> = claude_outcomes
-        .iter()
-        .flat_map(|outcome| {
-            outcome.messages.iter().cloned().map(|msg| {
-                let dedup_key = msg.dedup_key.clone().unwrap_or_default();
-                (dedup_key, msg)
-            })
-        })
-        .collect();
+    let mut claude_messages_raw: Vec<(String, UnifiedMessage)> = Vec::new();
     for outcome in claude_outcomes {
+        claude_messages_raw.extend(outcome.messages.into_iter().map(|msg| {
+            let dedup_key = msg.dedup_key.clone().unwrap_or_default();
+            (dedup_key, msg)
+        }));
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -1457,11 +1493,13 @@ pub fn parsed_to_unified(msg: &ParsedMessage, cost: f64) -> UnifiedMessage {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_pricing_if_available, normalize_model_for_grouping, parse_all_messages_with_pricing,
-        parse_local_clients, pricing, retain_for_requested_clients, ClientId, GroupBy,
-        LocalParseOptions, TokenBreakdown, UnifiedMessage,
+        apply_pricing_if_available, message_cache, normalize_model_for_grouping,
+        parse_all_messages_with_pricing, parse_local_clients, pricing,
+        retain_for_requested_clients, ClientId, GroupBy, LocalParseOptions, TokenBreakdown,
+        UnifiedMessage,
     };
     use std::collections::{HashMap, HashSet};
+    use std::io::Write;
     use std::str::FromStr;
 
     #[test]
@@ -1645,6 +1683,158 @@ mod tests {
         assert_eq!(messages[0].client, "cursor");
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_source_cache_refreshes_stale_date_on_cache_hit() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let test_result = (|| {
+            let message_dir = source_home
+                .path()
+                .join(".local/share/opencode/storage/message/project-1");
+            std::fs::create_dir_all(&message_dir).unwrap();
+            let path = message_dir.join("msg_001.json");
+            std::fs::write(
+                &path,
+                r#"{"id":"msg-1","sessionID":"session-1","role":"assistant","modelID":"accounts/fireworks/models/deepseek-v3-0324","providerID":"fireworks","cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011200000}}"#,
+            )
+            .unwrap();
+
+            let fingerprint = message_cache::SourceFingerprint::from_path(&path).unwrap();
+            let mut stale_message = UnifiedMessage::new(
+                "opencode",
+                "accounts/fireworks/models/deepseek-v3-0324",
+                "fireworks",
+                "session-1",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input: 10,
+                    output: 5,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            );
+            stale_message.date = "1900-01-01".to_string();
+
+            let mut cache = message_cache::SourceMessageCache::default();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                &path,
+                fingerprint,
+                vec![stale_message],
+                None,
+            ));
+            cache.save_if_dirty();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 1);
+            assert_ne!(messages[0].date, "1900-01-01");
+            assert_eq!(
+                messages[0].date,
+                UnifiedMessage::new(
+                    "opencode",
+                    "accounts/fireworks/models/deepseek-v3-0324",
+                    "fireworks",
+                    "session-1",
+                    1_733_011_200_000,
+                    TokenBreakdown {
+                        input: 10,
+                        output: 5,
+                        cache_read: 0,
+                        cache_write: 0,
+                        reasoning: 0,
+                    },
+                    0.0,
+                )
+                .date
+            );
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_source_cache_keeps_untimestamped_rows_in_sync_after_append() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let fresh_cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let test_result = (|| {
+            let codex_dir = source_home.path().join(".codex/sessions");
+            std::fs::create_dir_all(&codex_dir).unwrap();
+            let path = codex_dir.join("session.jsonl");
+            std::fs::write(
+                &path,
+                concat!(
+                    r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
+
+            let first_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["codex".to_string()],
+                None,
+            );
+            assert_eq!(first_messages.len(), 1);
+
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(
+                concat!(
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5},"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}}}}"#,
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            file.flush().unwrap();
+
+            let warm_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["codex".to_string()],
+                None,
+            );
+
+            std::env::set_var("HOME", fresh_cache_home.path());
+            let fresh_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["codex".to_string()],
+                None,
+            );
+
+            assert_eq!(warm_messages, fresh_messages);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
     }
 
     #[test]

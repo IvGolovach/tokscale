@@ -157,6 +157,7 @@ pub(crate) struct CodexParseState {
 #[derive(Debug, Clone)]
 pub(crate) struct ParsedCodexFile {
     pub messages: Vec<UnifiedMessage>,
+    pub fallback_timestamp_indices: Vec<usize>,
     pub state: CodexParseState,
 }
 
@@ -174,6 +175,7 @@ fn parse_codex_reader<R: BufRead>(
     mut state: CodexParseState,
 ) -> ParsedCodexFile {
     let mut messages = Vec::with_capacity(64);
+    let mut fallback_timestamp_indices = Vec::new();
     let mut buffer = Vec::with_capacity(4096);
 
     for line in reader.lines() {
@@ -294,11 +296,11 @@ fn parse_codex_reader<R: BufRead>(
 
                     state.previous_totals = next_totals;
 
-                    let timestamp = entry
+                    let parsed_timestamp = entry
                         .timestamp
                         .and_then(|ts| chrono::DateTime::parse_from_rfc3339(&ts).ok())
-                        .map(|dt| dt.timestamp_millis())
-                        .unwrap_or(fallback_timestamp);
+                        .map(|dt| dt.timestamp_millis());
+                    let timestamp = parsed_timestamp.unwrap_or(fallback_timestamp);
 
                     let agent = if state.session_is_headless {
                         Some("headless".to_string())
@@ -318,6 +320,9 @@ fn parse_codex_reader<R: BufRead>(
                         0.0,
                         agent,
                     ));
+                    if parsed_timestamp.is_none() {
+                        fallback_timestamp_indices.push(messages.len() - 1);
+                    }
                     handled = true;
                 }
             }
@@ -332,7 +337,7 @@ fn parse_codex_reader<R: BufRead>(
             continue;
         }
 
-        if let Some(msg) = parse_codex_headless_line(
+        if let Some((msg, used_fallback_timestamp)) = parse_codex_headless_line(
             trimmed,
             session_id,
             &mut state.current_model,
@@ -342,10 +347,17 @@ fn parse_codex_reader<R: BufRead>(
             state.session_is_headless,
         ) {
             messages.push(msg);
+            if used_fallback_timestamp {
+                fallback_timestamp_indices.push(messages.len() - 1);
+            }
         }
     }
 
-    ParsedCodexFile { messages, state }
+    ParsedCodexFile {
+        messages,
+        fallback_timestamp_indices,
+        state,
+    }
 }
 
 /// Parse a Codex JSONL file with stateful tracking
@@ -377,6 +389,7 @@ pub(crate) fn parse_codex_file_incremental(
         Err(_) => {
             return ParsedCodexFile {
                 messages: Vec::new(),
+                fallback_timestamp_indices: Vec::new(),
                 state,
             }
         }
@@ -385,6 +398,7 @@ pub(crate) fn parse_codex_file_incremental(
     if file.seek(SeekFrom::Start(start_offset)).is_err() {
         return ParsedCodexFile {
             messages: Vec::new(),
+            fallback_timestamp_indices: Vec::new(),
             state,
         };
     }
@@ -431,7 +445,7 @@ fn parse_codex_headless_line(
     session_provider: Option<&str>,
     session_agent: &Option<String>,
     session_is_headless: bool,
-) -> Option<UnifiedMessage> {
+) -> Option<(UnifiedMessage, bool)> {
     let mut bytes = line.as_bytes().to_vec();
     let value: Value = simd_json::from_slice(&mut bytes).ok()?;
 
@@ -457,21 +471,24 @@ fn parse_codex_headless_line(
         session_agent.clone()
     };
 
-    Some(UnifiedMessage::new_with_agent(
-        "codex",
-        model,
-        provider,
-        session_id.to_string(),
-        timestamp,
-        TokenBreakdown {
-            input: usage.input.max(0),
-            output: usage.output.max(0),
-            cache_read: usage.cached.max(0),
-            cache_write: 0,
-            reasoning: 0,
-        },
-        0.0,
-        agent,
+    Some((
+        UnifiedMessage::new_with_agent(
+            "codex",
+            model,
+            provider,
+            session_id.to_string(),
+            timestamp,
+            TokenBreakdown {
+                input: usage.input.max(0),
+                output: usage.output.max(0),
+                cache_read: usage.cached.max(0),
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+            agent,
+        ),
+        usage.timestamp_ms.is_none(),
     ))
 }
 
