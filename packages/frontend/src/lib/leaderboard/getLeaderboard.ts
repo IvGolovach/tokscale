@@ -396,12 +396,12 @@ async function fetchUserRank(
       lastSubmission: sql<string>`MAX(${submissions.updatedAt})`.as("last_submission"),
       cliVersion: sql<string | null>`(
         SELECT s2.cli_version FROM submissions s2
-        WHERE s2.user_id = ${submissions.userId}
+        WHERE s2.user_id = ${user.id}
         ORDER BY s2.updated_at DESC LIMIT 1
       )`.as("cli_version"),
       schemaVersion: sql<number>`COALESCE((
         SELECT s2.schema_version FROM submissions s2
-        WHERE s2.user_id = ${submissions.userId}
+        WHERE s2.user_id = ${user.id}
         ORDER BY s2.updated_at DESC LIMIT 1
       ), 0)`.as("schema_version"),
     })
