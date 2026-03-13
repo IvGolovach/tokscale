@@ -2,6 +2,7 @@
 
 mod aggregator;
 pub mod clients;
+mod message_cache;
 mod parser;
 pub mod pricing;
 pub mod scanner;
@@ -97,7 +98,7 @@ impl std::str::FromStr for GroupBy {
     }
 }
 
-#[derive(Debug, Clone, Default, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TokenBreakdown {
     pub input: i64,
     pub output: i64,
@@ -305,8 +306,170 @@ fn parse_all_messages_with_pricing(
     clients: &[String],
     pricing: Option<&pricing::PricingService>,
 ) -> Vec<UnifiedMessage> {
+    #[derive(Debug)]
+    struct CachedParseOutcome {
+        messages: Vec<UnifiedMessage>,
+        cache_entry: Option<message_cache::CachedSourceEntry>,
+    }
+
+    fn apply_pricing_to_messages(
+        messages: &mut [UnifiedMessage],
+        pricing: Option<&pricing::PricingService>,
+    ) {
+        for message in messages {
+            apply_pricing_if_available(message, pricing);
+        }
+    }
+
+    fn cached_messages(
+        cached: &message_cache::CachedSourceEntry,
+        pricing: Option<&pricing::PricingService>,
+    ) -> Vec<UnifiedMessage> {
+        let mut messages = cached.messages.clone();
+        apply_pricing_to_messages(&mut messages, pricing);
+        messages
+    }
+
+    fn finalize_codex_messages(
+        mut messages: Vec<UnifiedMessage>,
+        pricing: Option<&pricing::PricingService>,
+        is_headless: bool,
+    ) -> Vec<UnifiedMessage> {
+        apply_pricing_to_messages(&mut messages, pricing);
+        for message in &mut messages {
+            apply_headless_agent(message, is_headless);
+        }
+        messages
+    }
+
+    fn load_or_parse_source<F>(
+        path: &Path,
+        source_cache: &HashMap<String, message_cache::CachedSourceEntry>,
+        pricing: Option<&pricing::PricingService>,
+        parse: F,
+    ) -> CachedParseOutcome
+    where
+        F: Fn(&Path) -> Vec<UnifiedMessage>,
+    {
+        let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
+            return CachedParseOutcome {
+                messages: Vec::new(),
+                cache_entry: None,
+            };
+        };
+
+        let cache_key = path.to_string_lossy().to_string();
+        if let Some(cached) = source_cache.get(&cache_key) {
+            if cached.fingerprint == fingerprint {
+                return CachedParseOutcome {
+                    messages: cached_messages(cached, pricing),
+                    cache_entry: None,
+                };
+            }
+        }
+
+        let messages = parse(path);
+        let cache_entry =
+            message_cache::CachedSourceEntry::new(path, fingerprint, messages.clone(), None);
+        let mut messages = messages;
+        apply_pricing_to_messages(&mut messages, pricing);
+
+        CachedParseOutcome {
+            messages,
+            cache_entry: Some(cache_entry),
+        }
+    }
+
+    fn load_or_parse_codex_source(
+        path: &Path,
+        source_cache: &HashMap<String, message_cache::CachedSourceEntry>,
+        pricing: Option<&pricing::PricingService>,
+        headless_roots: &[PathBuf],
+    ) -> CachedParseOutcome {
+        let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
+            return CachedParseOutcome {
+                messages: Vec::new(),
+                cache_entry: None,
+            };
+        };
+
+        let cache_key = path.to_string_lossy().to_string();
+        let is_headless = is_headless_path(path, headless_roots);
+
+        if let Some(cached) = source_cache.get(&cache_key) {
+            if cached.fingerprint == fingerprint {
+                return CachedParseOutcome {
+                    messages: finalize_codex_messages(
+                        cached.messages.clone(),
+                        pricing,
+                        is_headless,
+                    ),
+                    cache_entry: None,
+                };
+            }
+
+            if let Some(codex_incremental) = cached.codex_incremental.as_ref() {
+                if fingerprint.size > cached.fingerprint.size
+                    && message_cache::codex_tail_matches(
+                        path,
+                        cached.fingerprint.size,
+                        codex_incremental.ends_with_newline,
+                        &codex_incremental.tail_sample,
+                    )
+                {
+                    let parsed = sessions::codex::parse_codex_file_incremental(
+                        path,
+                        cached.fingerprint.size,
+                        codex_incremental.state.clone(),
+                    );
+
+                    let mut raw_messages = cached.messages.clone();
+                    raw_messages.extend(parsed.messages.clone());
+                    let messages =
+                        finalize_codex_messages(raw_messages.clone(), pricing, is_headless);
+
+                    let cache_entry = message_cache::CachedSourceEntry::new(
+                        path,
+                        fingerprint.clone(),
+                        raw_messages,
+                        message_cache::build_codex_incremental_cache(
+                            path,
+                            &fingerprint,
+                            parsed.state,
+                        ),
+                    );
+
+                    return CachedParseOutcome {
+                        messages,
+                        cache_entry: Some(cache_entry),
+                    };
+                }
+            }
+        }
+
+        let parsed = sessions::codex::parse_codex_file_incremental(
+            path,
+            0,
+            sessions::codex::CodexParseState::default(),
+        );
+        let messages = finalize_codex_messages(parsed.messages.clone(), pricing, is_headless);
+
+        let cache_entry = message_cache::CachedSourceEntry::new(
+            path,
+            fingerprint.clone(),
+            parsed.messages,
+            message_cache::build_codex_incremental_cache(path, &fingerprint, parsed.state),
+        );
+
+        CachedParseOutcome {
+            messages,
+            cache_entry: Some(cache_entry),
+        }
+    }
+
     let scan_result = scanner::scan_all_clients(home_dir, clients);
     let headless_roots = scanner::headless_roots(home_dir);
+    let mut source_cache = message_cache::SourceMessageCache::load();
     let mut all_messages: Vec<UnifiedMessage> = Vec::new();
     let include_all = clients.is_empty();
     let include_synthetic = include_all || clients.iter().any(|c| c == "synthetic");
@@ -315,49 +478,71 @@ fn parse_all_messages_with_pricing(
     let mut opencode_seen: HashSet<String> = HashSet::new();
 
     if let Some(db_path) = &scan_result.opencode_db {
-        let sqlite_messages: Vec<UnifiedMessage> =
-            sessions::opencode::parse_opencode_sqlite(db_path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    if let Some(ref key) = msg.dedup_key {
-                        opencode_seen.insert(key.clone());
-                    }
-                    msg
-                })
-                .collect();
-        all_messages.extend(sqlite_messages);
+        let outcome = load_or_parse_source(db_path, &source_cache.entries, pricing, |path| {
+            sessions::opencode::parse_opencode_sqlite(path)
+        });
+        for message in &outcome.messages {
+            if let Some(ref key) = message.dedup_key {
+                opencode_seen.insert(key.clone());
+            }
+        }
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
     }
 
-    let opencode_messages: Vec<UnifiedMessage> = scan_result
+    let opencode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
         .filter_map(|path| {
-            let mut msg = sessions::opencode::parse_opencode_file(path)?;
-            apply_pricing_if_available(&mut msg, pricing);
-            Some(msg)
+            Some(load_or_parse_source(
+                path,
+                &source_cache.entries,
+                pricing,
+                |path| {
+                    sessions::opencode::parse_opencode_file(path)
+                        .into_iter()
+                        .collect()
+                },
+            ))
         })
         .collect();
-    all_messages.extend(opencode_messages.into_iter().filter(|msg| {
-        msg.dedup_key
-            .as_ref()
-            .is_none_or(|key| opencode_seen.insert(key.clone()))
-    }));
+    for outcome in opencode_outcomes {
+        all_messages.extend(outcome.messages.into_iter().filter(|message| {
+            message
+                .dedup_key
+                .as_ref()
+                .is_none_or(|key| opencode_seen.insert(key.clone()))
+        }));
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let claude_messages_raw: Vec<(String, UnifiedMessage)> = scan_result
+    let claude_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Claude)
         .par_iter()
-        .flat_map(|path| {
-            sessions::claudecode::parse_claude_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    let dedup_key = msg.dedup_key.clone().unwrap_or_default();
-                    apply_pricing_if_available(&mut msg, pricing);
-                    (dedup_key, msg)
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::claudecode::parse_claude_file(path)
+            })
         })
         .collect();
+    let claude_messages_raw: Vec<(String, UnifiedMessage)> = claude_outcomes
+        .iter()
+        .flat_map(|outcome| {
+            outcome.messages.iter().cloned().map(|msg| {
+                let dedup_key = msg.dedup_key.clone().unwrap_or_default();
+                (dedup_key, msg)
+            })
+        })
+        .collect();
+    for outcome in claude_outcomes {
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
     let mut seen_keys: HashSet<String> = HashSet::new();
     let claude_messages: Vec<UnifiedMessage> = claude_messages_raw
@@ -367,200 +552,206 @@ fn parse_all_messages_with_pricing(
         .collect();
     all_messages.extend(claude_messages);
 
-    let codex_messages: Vec<UnifiedMessage> = scan_result
+    let codex_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Codex)
         .par_iter()
-        .flat_map(|path| {
-            let is_headless = is_headless_path(path, &headless_roots);
-            sessions::codex::parse_codex_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_headless_agent(&mut msg, is_headless);
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_codex_source(path, &source_cache.entries, pricing, &headless_roots)
         })
         .collect();
-    all_messages.extend(codex_messages);
+    for outcome in codex_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let gemini_messages: Vec<UnifiedMessage> = scan_result
+    let gemini_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Gemini)
         .par_iter()
-        .flat_map(|path| {
-            sessions::gemini::parse_gemini_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::gemini::parse_gemini_file(path)
+            })
         })
         .collect();
-    all_messages.extend(gemini_messages);
+    for outcome in gemini_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let cursor_messages: Vec<UnifiedMessage> = scan_result
+    let cursor_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Cursor)
         .par_iter()
-        .flat_map(|path| {
-            sessions::cursor::parse_cursor_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::cursor::parse_cursor_file(path)
+            })
         })
         .collect();
-    all_messages.extend(cursor_messages);
+    for outcome in cursor_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let amp_messages: Vec<UnifiedMessage> = scan_result
+    let amp_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Amp)
         .par_iter()
-        .flat_map(|path| {
-            sessions::amp::parse_amp_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::amp::parse_amp_file(path)
+            })
         })
         .collect();
-    all_messages.extend(amp_messages);
+    for outcome in amp_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let droid_messages: Vec<UnifiedMessage> = scan_result
+    let droid_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Droid)
         .par_iter()
-        .flat_map(|path| {
-            sessions::droid::parse_droid_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::droid::parse_droid_file(path)
+            })
         })
         .collect();
-    all_messages.extend(droid_messages);
+    for outcome in droid_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let openclaw_messages: Vec<UnifiedMessage> = scan_result
+    let openclaw_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenClaw)
         .par_iter()
-        .flat_map(|path| {
-            sessions::openclaw::parse_openclaw_transcript(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::openclaw::parse_openclaw_transcript(path)
+            })
         })
         .collect();
-    all_messages.extend(openclaw_messages);
+    for outcome in openclaw_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let pi_messages: Vec<UnifiedMessage> = scan_result
+    let pi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Pi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::pi::parse_pi_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::pi::parse_pi_file(path)
+            })
         })
         .collect();
-    all_messages.extend(pi_messages);
+    for outcome in pi_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let kimi_messages: Vec<UnifiedMessage> = scan_result
+    let kimi_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Kimi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::kimi::parse_kimi_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::kimi::parse_kimi_file(path)
+            })
         })
         .collect();
-    all_messages.extend(kimi_messages);
+    for outcome in kimi_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
     // Parse Qwen files
-    let qwen_messages: Vec<UnifiedMessage> = scan_result
+    let qwen_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Qwen)
         .par_iter()
-        .flat_map(|path| {
-            sessions::qwen::parse_qwen_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::qwen::parse_qwen_file(path)
+            })
         })
         .collect();
-    all_messages.extend(qwen_messages);
+    for outcome in qwen_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let roocode_messages: Vec<UnifiedMessage> = scan_result
+    let roocode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::RooCode)
         .par_iter()
-        .flat_map(|path| {
-            sessions::roocode::parse_roocode_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::roocode::parse_roocode_file(path)
+            })
         })
         .collect();
-    all_messages.extend(roocode_messages);
+    for outcome in roocode_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let kilocode_messages: Vec<UnifiedMessage> = scan_result
+    let kilocode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::KiloCode)
         .par_iter()
-        .flat_map(|path| {
-            sessions::kilocode::parse_kilocode_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::kilocode::parse_kilocode_file(path)
+            })
         })
         .collect();
-    all_messages.extend(kilocode_messages);
+    for outcome in kilocode_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
-    let mux_messages: Vec<UnifiedMessage> = scan_result
+    let mux_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Mux)
         .par_iter()
-        .flat_map(|path| {
-            sessions::mux::parse_mux_file(path)
-                .into_iter()
-                .map(|mut msg| {
-                    apply_pricing_if_available(&mut msg, pricing);
-                    msg
-                })
-                .collect::<Vec<_>>()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+                sessions::mux::parse_mux_file(path)
+            })
         })
         .collect();
-    all_messages.extend(mux_messages);
+    for outcome in mux_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
-            let synthetic_messages: Vec<UnifiedMessage> =
-                sessions::synthetic::parse_octofriend_sqlite(db_path)
-                    .into_iter()
-                    .map(|mut msg| {
-                        apply_pricing_if_available(&mut msg, pricing);
-                        msg
-                    })
-                    .collect();
-            all_messages.extend(synthetic_messages);
+            let outcome = load_or_parse_source(db_path, &source_cache.entries, pricing, |path| {
+                sessions::synthetic::parse_octofriend_sqlite(path)
+            });
+            all_messages.extend(outcome.messages);
+            if let Some(entry) = outcome.cache_entry {
+                source_cache.insert(entry);
+            }
         }
     }
 
@@ -582,6 +773,8 @@ fn parse_all_messages_with_pricing(
             );
         }
     }
+
+    source_cache.save_if_dirty();
 
     all_messages
 }
@@ -1452,6 +1645,58 @@ mod tests {
         assert_eq!(messages[0].client, "cursor");
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_source_cache_does_not_reuse_priced_cost_without_pricing_service() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+        let test_result = (|| {
+            let cursor_cache_dir = source_home.path().join(".config/tokscale/cursor-cache");
+            std::fs::create_dir_all(&cursor_cache_dir).unwrap();
+
+            let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+            std::fs::write(cursor_cache_dir.join("usage.csv"), csv).unwrap();
+
+            let mut litellm = HashMap::new();
+            litellm.insert(
+                "Composer 1.5".into(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(0.001),
+                    output_cost_per_token: Some(0.002),
+                    cache_read_input_token_cost: Some(0.0005),
+                    ..Default::default()
+                },
+            );
+            let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+            let repriced_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["cursor".to_string()],
+                Some(&pricing),
+            );
+            assert_eq!(repriced_messages.len(), 1);
+            assert!(repriced_messages[0].cost > 0.0);
+
+            let cached_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["cursor".to_string()],
+                None,
+            );
+
+            assert_eq!(cached_messages.len(), 1);
+            assert_eq!(cached_messages[0].cost, 0.0);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
     }
 
     #[test]

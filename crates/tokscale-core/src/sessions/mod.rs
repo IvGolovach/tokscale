@@ -21,7 +21,7 @@ pub(crate) mod utils;
 
 use crate::TokenBreakdown;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UnifiedMessage {
     pub client: String,
     pub model_id: String,
