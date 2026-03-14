@@ -11,7 +11,7 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-const CACHE_SCHEMA_VERSION: u32 = 3;
+const CACHE_SCHEMA_VERSION: u32 = 4;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
 const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
@@ -788,6 +788,35 @@ mod tests {
             ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
             let file = File::create(&cache_file).unwrap();
             file.set_len(MAX_CACHE_FILE_BYTES + 1).unwrap();
+
+            let loaded = SourceMessageCache::load();
+            assert!(loaded.entries.is_empty());
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_load_ignores_stale_schema_version() {
+        let temp_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let test_result = (|| {
+            let cache_file = cache_path().unwrap();
+            ensure_cache_dir(cache_file.parent().unwrap()).unwrap();
+            let store = CachedSourceStore {
+                schema_version: CACHE_SCHEMA_VERSION - 1,
+                entries: Vec::new(),
+            };
+
+            let writer = BufWriter::new(File::create(&cache_file).unwrap());
+            bincode::options().serialize_into(writer, &store).unwrap();
 
             let loaded = SourceMessageCache::load();
             assert!(loaded.entries.is_empty());

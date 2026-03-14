@@ -441,7 +441,7 @@ fn parse_all_messages_with_pricing(
         };
 
         if let Some(cached) = source_cache.get(path) {
-            if cached.fingerprint == fingerprint {
+            if cached.fingerprint == fingerprint && !cached.messages.is_empty() {
                 return CachedParseOutcome {
                     messages: cached_messages(cached, pricing),
                     cache_entry: None,
@@ -1887,6 +1887,56 @@ mod tests {
                 None,
             );
             assert_eq!(second_messages.len(), 1);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_empty_cache_hits_are_reparsed_for_optional_file_sources() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let test_result = (|| {
+            let message_dir = source_home
+                .path()
+                .join(".local/share/opencode/storage/message/project-1");
+            std::fs::create_dir_all(&message_dir).unwrap();
+            let path = message_dir.join("msg_001.json");
+            std::fs::write(
+                &path,
+                r#"{"id":"msg-1","sessionID":"session-1","role":"assistant","modelID":"accounts/fireworks/models/deepseek-v3-0324","providerID":"fireworks","cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011200000}}"#,
+            )
+            .unwrap();
+
+            let fingerprint = message_cache::SourceFingerprint::from_path(&path).unwrap();
+            let mut cache = message_cache::SourceMessageCache::default();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                &path,
+                fingerprint,
+                Vec::new(),
+                Vec::new(),
+                None,
+            ));
+            cache.save_if_dirty();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+            assert_eq!(messages.len(), 1);
+
+            let loaded = message_cache::SourceMessageCache::load();
+            let repaired_entry = loaded.get(&path).unwrap();
+            assert_eq!(repaired_entry.messages.len(), 1);
         })();
 
         match original_home {

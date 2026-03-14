@@ -391,11 +391,7 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
         0,
         CodexParseState::default(),
     );
-    if parsed.parse_succeeded {
-        parsed.messages
-    } else {
-        Vec::new()
-    }
+    parsed.messages
 }
 
 pub(crate) fn parse_codex_file_incremental(
@@ -740,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_file_returns_empty_after_late_invalid_utf8_line_error() {
+    fn test_parse_file_preserves_valid_messages_after_late_invalid_utf8_line_error() {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(
             concat!(
@@ -756,7 +752,11 @@ mod tests {
         file.flush().unwrap();
 
         let messages = parse_codex_file(file.path());
-        assert!(messages.is_empty());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "gpt-5.4");
+        assert_eq!(messages[0].tokens.input, 8);
+        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.cache_read, 2);
 
         let incremental = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
         assert!(!incremental.parse_succeeded);
