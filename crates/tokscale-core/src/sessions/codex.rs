@@ -159,6 +159,7 @@ pub(crate) struct ParsedCodexFile {
     pub messages: Vec<UnifiedMessage>,
     pub fallback_timestamp_indices: Vec<usize>,
     pub consumed_offset: u64,
+    pub parse_succeeded: bool,
     pub state: CodexParseState,
 }
 
@@ -364,6 +365,7 @@ fn parse_codex_reader<R: BufRead>(
         messages,
         fallback_timestamp_indices,
         consumed_offset,
+        parse_succeeded: true,
         state,
     }
 }
@@ -400,6 +402,7 @@ pub(crate) fn parse_codex_file_incremental(
                 messages: Vec::new(),
                 fallback_timestamp_indices: Vec::new(),
                 consumed_offset: start_offset,
+                parse_succeeded: false,
                 state,
             }
         }
@@ -410,6 +413,7 @@ pub(crate) fn parse_codex_file_incremental(
             messages: Vec::new(),
             fallback_timestamp_indices: Vec::new(),
             consumed_offset: start_offset,
+            parse_succeeded: false,
             state,
         };
     }

@@ -106,15 +106,70 @@ pub(crate) struct CodexIncrementalCache {
     pub state: CodexParseState,
     pub consumed_offset: u64,
     pub ends_with_newline: bool,
-    pub fallback_timestamp_indices: Vec<usize>,
     pub prefix_hash: [u8; 32],
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct CachedPath(Vec<u8>);
+
+#[cfg(unix)]
+impl CachedPath {
+    pub(crate) fn from_path(path: &Path) -> Self {
+        use std::os::unix::ffi::OsStrExt;
+
+        Self(path.as_os_str().as_bytes().to_vec())
+    }
+
+    pub(crate) fn to_path_buf(&self) -> PathBuf {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_vec(self.0.clone()))
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct CachedPath(Vec<u16>);
+
+#[cfg(windows)]
+impl CachedPath {
+    pub(crate) fn from_path(path: &Path) -> Self {
+        use std::os::windows::ffi::OsStrExt;
+
+        Self(path.as_os_str().encode_wide().collect())
+    }
+
+    pub(crate) fn to_path_buf(&self) -> PathBuf {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        PathBuf::from(OsString::from_wide(&self.0))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct CachedPath(String);
+
+#[cfg(not(any(unix, windows)))]
+impl CachedPath {
+    pub(crate) fn from_path(path: &Path) -> Self {
+        Self(path.to_string_lossy().into_owned())
+    }
+
+    pub(crate) fn to_path_buf(&self) -> PathBuf {
+        PathBuf::from(&self.0)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CachedSourceEntry {
-    pub path: String,
+    pub path: CachedPath,
     pub fingerprint: SourceFingerprint,
     pub messages: Vec<UnifiedMessage>,
+    pub fallback_timestamp_indices: Vec<usize>,
     pub codex_incremental: Option<CodexIncrementalCache>,
 }
 
@@ -123,12 +178,14 @@ impl CachedSourceEntry {
         path: &Path,
         fingerprint: SourceFingerprint,
         messages: Vec<UnifiedMessage>,
+        fallback_timestamp_indices: Vec<usize>,
         codex_incremental: Option<CodexIncrementalCache>,
     ) -> Self {
         Self {
-            path: path.to_string_lossy().to_string(),
+            path: CachedPath::from_path(path),
             fingerprint,
             messages,
+            fallback_timestamp_indices,
             codex_incremental,
         }
     }
@@ -142,7 +199,7 @@ struct CachedSourceStore {
 
 #[derive(Default)]
 pub(crate) struct SourceMessageCache {
-    pub entries: HashMap<String, CachedSourceEntry>,
+    pub entries: HashMap<CachedPath, CachedSourceEntry>,
     dirty: bool,
 }
 
@@ -193,15 +250,20 @@ impl SourceMessageCache {
         self.dirty = true;
     }
 
+    pub(crate) fn get(&self, path: &Path) -> Option<&CachedSourceEntry> {
+        let key = CachedPath::from_path(path);
+        self.entries.get(&key)
+    }
+
     pub(crate) fn prune_missing_files(&mut self) {
         let original_len = self.entries.len();
-        self.entries.retain(|path, _| Path::new(path).exists());
+        self.entries.retain(|path, _| path.to_path_buf().exists());
         if self.entries.len() != original_len {
             self.dirty = true;
         }
     }
 
-    pub(crate) fn save_if_dirty(&self) {
+    pub(crate) fn save_if_dirty(&mut self) {
         if !self.dirty {
             return;
         }
@@ -250,7 +312,10 @@ impl SourceMessageCache {
 
         if write_result.is_err() {
             let _ = fs::remove_file(&tmp_path);
+            return;
         }
+
+        self.dirty = false;
     }
 }
 
@@ -346,13 +411,11 @@ pub(crate) fn build_codex_incremental_cache(
     path: &Path,
     consumed_offset: u64,
     state: CodexParseState,
-    fallback_timestamp_indices: Vec<usize>,
 ) -> Option<CodexIncrementalCache> {
     Some(CodexIncrementalCache {
         state,
         consumed_offset,
         ends_with_newline: consumed_offset == 0 || file_ends_with_newline(path, consumed_offset),
-        fallback_timestamp_indices,
         prefix_hash: hash_prefix(path, consumed_offset)?,
     })
 }
@@ -407,7 +470,6 @@ mod tests {
             file.path(),
             fingerprint.size,
             CodexParseState::default(),
-            Vec::new(),
         )
         .unwrap();
 
@@ -438,7 +500,6 @@ mod tests {
             file.path(),
             fingerprint.size,
             CodexParseState::default(),
-            Vec::new(),
         )
         .unwrap();
 
@@ -457,7 +518,6 @@ mod tests {
             file.path(),
             fingerprint.size,
             CodexParseState::default(),
-            Vec::new(),
         )
         .unwrap();
 
@@ -496,6 +556,7 @@ mod tests {
                 },
                 0.0,
             )],
+            Vec::new(),
             None,
         );
 
@@ -505,9 +566,7 @@ mod tests {
 
         let loaded = SourceMessageCache::load();
         assert_eq!(loaded.entries.len(), 1);
-        assert!(loaded
-            .entries
-            .contains_key(&file.path().to_string_lossy().to_string()));
+        assert!(loaded.get(file.path()).is_some());
 
         match original_home {
             Some(home) => std::env::set_var("HOME", home),
@@ -522,7 +581,13 @@ mod tests {
         let path = file.path().to_path_buf();
 
         let mut cache = SourceMessageCache::default();
-        cache.insert(CachedSourceEntry::new(&path, fingerprint, Vec::new(), None));
+        cache.insert(CachedSourceEntry::new(
+            &path,
+            fingerprint,
+            Vec::new(),
+            Vec::new(),
+            None,
+        ));
 
         std::fs::remove_file(&path).unwrap();
         cache.prune_missing_files();
@@ -569,7 +634,8 @@ mod tests {
         let test_result = (|| {
             let file = write_temp_file(b"{}\n");
             let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
-            let entry = CachedSourceEntry::new(file.path(), fingerprint, Vec::new(), None);
+            let entry =
+                CachedSourceEntry::new(file.path(), fingerprint, Vec::new(), Vec::new(), None);
 
             let mut cache = SourceMessageCache::default();
             cache.insert(entry);
@@ -592,5 +658,50 @@ mod tests {
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
         test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_marks_cache_clean() {
+        let temp_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let mut cache = SourceMessageCache::default();
+        assert!(!cache.dirty);
+
+        let test_result = (|| {
+            let file = write_temp_file(b"{}\n");
+            let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
+            cache.insert(CachedSourceEntry::new(
+                file.path(),
+                fingerprint,
+                Vec::new(),
+                Vec::new(),
+                None,
+            ));
+            assert!(cache.dirty);
+
+            cache.save_if_dirty();
+            assert!(!cache.dirty);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_cached_path_preserves_non_utf8_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(vec![0x66, 0x6f, 0x80, 0x6f]));
+        let cached_path = CachedPath::from_path(&path);
+
+        assert_eq!(cached_path.to_path_buf(), path);
     }
 }

@@ -382,18 +382,14 @@ fn parse_all_messages_with_pricing(
             path,
             fingerprint,
             raw_messages,
-            message_cache::build_codex_incremental_cache(
-                path,
-                consumed_offset,
-                state,
-                fallback_timestamp_indices,
-            ),
+            fallback_timestamp_indices,
+            message_cache::build_codex_incremental_cache(path, consumed_offset, state),
         ))
     }
 
     fn load_or_parse_source<F>(
         path: &Path,
-        source_cache: &HashMap<String, message_cache::CachedSourceEntry>,
+        source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         parse: F,
     ) -> CachedParseOutcome
@@ -404,8 +400,7 @@ fn parse_all_messages_with_pricing(
             return parse_uncached_messages(path, pricing, parse);
         };
 
-        let cache_key = path.to_string_lossy().to_string();
-        if let Some(cached) = source_cache.get(&cache_key) {
+        if let Some(cached) = source_cache.get(path) {
             if cached.fingerprint == fingerprint {
                 return CachedParseOutcome {
                     messages: cached_messages(cached, pricing),
@@ -415,8 +410,13 @@ fn parse_all_messages_with_pricing(
         }
 
         let messages = parse(path);
-        let cache_entry =
-            message_cache::CachedSourceEntry::new(path, fingerprint, messages.clone(), None);
+        let cache_entry = message_cache::CachedSourceEntry::new(
+            path,
+            fingerprint,
+            messages.clone(),
+            Vec::new(),
+            None,
+        );
         let mut messages = messages;
         apply_pricing_to_messages(&mut messages, pricing);
 
@@ -428,7 +428,7 @@ fn parse_all_messages_with_pricing(
 
     fn load_or_parse_codex_source(
         path: &Path,
-        source_cache: &HashMap<String, message_cache::CachedSourceEntry>,
+        source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         headless_roots: &[PathBuf],
     ) -> CachedParseOutcome {
@@ -446,21 +446,17 @@ fn parse_all_messages_with_pricing(
             };
         };
 
-        let cache_key = path.to_string_lossy().to_string();
         let is_headless = is_headless_path(path, headless_roots);
         let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
 
-        if let Some(cached) = source_cache.get(&cache_key) {
+        if let Some(cached) = source_cache.get(path) {
             if cached.fingerprint == fingerprint {
                 return CachedParseOutcome {
                     messages: finalize_codex_messages(
                         cached.messages.clone(),
                         pricing,
                         is_headless,
-                        cached
-                            .codex_incremental
-                            .as_ref()
-                            .map_or(&[], |cache| cache.fallback_timestamp_indices.as_slice()),
+                        &cached.fallback_timestamp_indices,
                         fallback_timestamp,
                     ),
                     cache_entry: None,
@@ -476,38 +472,39 @@ fn parse_all_messages_with_pricing(
                         codex_incremental.consumed_offset,
                         codex_incremental.state.clone(),
                     );
+                    if parsed.parse_succeeded {
+                        let mut raw_messages = cached.messages.clone();
+                        let mut fallback_timestamp_indices =
+                            cached.fallback_timestamp_indices.clone();
+                        let existing_len = raw_messages.len();
+                        fallback_timestamp_indices.extend(
+                            parsed
+                                .fallback_timestamp_indices
+                                .iter()
+                                .map(|index| existing_len + index),
+                        );
+                        raw_messages.extend(parsed.messages.clone());
+                        let messages = finalize_codex_messages(
+                            raw_messages.clone(),
+                            pricing,
+                            is_headless,
+                            &fallback_timestamp_indices,
+                            fallback_timestamp,
+                        );
 
-                    let mut raw_messages = cached.messages.clone();
-                    let mut fallback_timestamp_indices =
-                        codex_incremental.fallback_timestamp_indices.clone();
-                    let existing_len = raw_messages.len();
-                    fallback_timestamp_indices.extend(
-                        parsed
-                            .fallback_timestamp_indices
-                            .iter()
-                            .map(|index| existing_len + index),
-                    );
-                    raw_messages.extend(parsed.messages.clone());
-                    let messages = finalize_codex_messages(
-                        raw_messages.clone(),
-                        pricing,
-                        is_headless,
-                        &fallback_timestamp_indices,
-                        fallback_timestamp,
-                    );
+                        let cache_entry = build_codex_cache_entry(
+                            path,
+                            raw_messages,
+                            parsed.consumed_offset,
+                            parsed.state,
+                            fallback_timestamp_indices,
+                        );
 
-                    let cache_entry = build_codex_cache_entry(
-                        path,
-                        raw_messages,
-                        parsed.consumed_offset,
-                        parsed.state,
-                        fallback_timestamp_indices,
-                    );
-
-                    return CachedParseOutcome {
-                        messages,
-                        cache_entry,
-                    };
+                        return CachedParseOutcome {
+                            messages,
+                            cache_entry,
+                        };
+                    }
                 }
             }
         }
@@ -551,7 +548,7 @@ fn parse_all_messages_with_pricing(
     let mut opencode_seen: HashSet<String> = HashSet::new();
 
     if let Some(db_path) = &scan_result.opencode_db {
-        let outcome = load_or_parse_source(db_path, &source_cache.entries, pricing, |path| {
+        let outcome = load_or_parse_source(db_path, &source_cache, pricing, |path| {
             sessions::opencode::parse_opencode_sqlite(path)
         });
         for message in &outcome.messages {
@@ -569,16 +566,11 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::OpenCode)
         .par_iter()
         .filter_map(|path| {
-            Some(load_or_parse_source(
-                path,
-                &source_cache.entries,
-                pricing,
-                |path| {
-                    sessions::opencode::parse_opencode_file(path)
-                        .into_iter()
-                        .collect()
-                },
-            ))
+            Some(load_or_parse_source(path, &source_cache, pricing, |path| {
+                sessions::opencode::parse_opencode_file(path)
+                    .into_iter()
+                    .collect()
+            }))
         })
         .collect();
     for outcome in opencode_outcomes {
@@ -597,7 +589,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Claude)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::claudecode::parse_claude_file(path)
             })
         })
@@ -624,9 +616,7 @@ fn parse_all_messages_with_pricing(
     let codex_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Codex)
         .par_iter()
-        .map(|path| {
-            load_or_parse_codex_source(path, &source_cache.entries, pricing, &headless_roots)
-        })
+        .map(|path| load_or_parse_codex_source(path, &source_cache, pricing, &headless_roots))
         .collect();
     for outcome in codex_outcomes {
         all_messages.extend(outcome.messages);
@@ -639,7 +629,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Gemini)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::gemini::parse_gemini_file(path)
             })
         })
@@ -655,7 +645,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Cursor)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::cursor::parse_cursor_file(path)
             })
         })
@@ -671,7 +661,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Amp)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::amp::parse_amp_file(path)
             })
         })
@@ -687,7 +677,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Droid)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::droid::parse_droid_file(path)
             })
         })
@@ -703,7 +693,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::OpenClaw)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::openclaw::parse_openclaw_transcript(path)
             })
         })
@@ -719,7 +709,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Pi)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::pi::parse_pi_file(path)
             })
         })
@@ -735,7 +725,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Kimi)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::kimi::parse_kimi_file(path)
             })
         })
@@ -752,7 +742,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Qwen)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::qwen::parse_qwen_file(path)
             })
         })
@@ -768,7 +758,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::RooCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::roocode::parse_roocode_file(path)
             })
         })
@@ -784,7 +774,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::KiloCode)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::kilocode::parse_kilocode_file(path)
             })
         })
@@ -800,7 +790,7 @@ fn parse_all_messages_with_pricing(
         .get(ClientId::Mux)
         .par_iter()
         .map(|path| {
-            load_or_parse_source(path, &source_cache.entries, pricing, |path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
                 sessions::mux::parse_mux_file(path)
             })
         })
@@ -814,7 +804,7 @@ fn parse_all_messages_with_pricing(
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
-            let outcome = load_or_parse_source(db_path, &source_cache.entries, pricing, |path| {
+            let outcome = load_or_parse_source(db_path, &source_cache, pricing, |path| {
                 sessions::synthetic::parse_octofriend_sqlite(path)
             });
             all_messages.extend(outcome.messages);
@@ -1761,6 +1751,7 @@ mod tests {
                 &path,
                 fingerprint,
                 vec![stale_message],
+                Vec::new(),
                 None,
             ));
             cache.save_if_dirty();
@@ -1861,6 +1852,63 @@ mod tests {
             );
 
             assert_eq!(warm_messages, fresh_messages);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_exact_hit_codex_cache_repairs_fallback_timestamps_without_incremental_state() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let test_result = (|| {
+            let session_dir = source_home.path().join(".codex/sessions");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let path = session_dir.join("session.jsonl");
+            std::fs::write(
+                &path,
+                concat!(
+                    r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
+
+            let expected = crate::sessions::codex::parse_codex_file(&path);
+            assert_eq!(expected.len(), 1);
+
+            let fingerprint = message_cache::SourceFingerprint::from_path(&path).unwrap();
+            let mut stale_message = expected[0].clone();
+            stale_message.timestamp = 0;
+            stale_message.date = "1900-01-01".to_string();
+
+            let mut cache = message_cache::SourceMessageCache::default();
+            cache.insert(message_cache::CachedSourceEntry::new(
+                &path,
+                fingerprint,
+                vec![stale_message],
+                vec![0],
+                None,
+            ));
+            cache.save_if_dirty();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["codex".to_string()],
+                None,
+            );
+
+            assert_eq!(messages, expected);
         })();
 
         match original_home {
