@@ -19,17 +19,18 @@ const HASH_BUFFER_BYTES: usize = 64 * 1024;
 
 fn cache_dir() -> Option<PathBuf> {
     dirs::cache_dir()
-        .or_else(fallback_cache_base_dir)
         .map(|path| path.join("tokscale"))
+        .or_else(fallback_cache_dir)
 }
 
 fn cache_path() -> Option<PathBuf> {
     Some(cache_dir()?.join(CACHE_FILENAME))
 }
 
-fn fallback_cache_base_dir() -> Option<PathBuf> {
+fn fallback_cache_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
+        .map(|path| path.join("tokscale"))
         .or_else(user_scoped_temp_dir)
 }
 
@@ -97,7 +98,7 @@ impl SourceFingerprint {
     }
 
     pub(crate) fn from_sqlite_path(path: &Path) -> Option<Self> {
-        let related_paths = ["-wal", "-shm"]
+        let related_paths = ["-wal"]
             .into_iter()
             .map(|suffix| (suffix.to_string(), append_path_suffix(path, suffix)));
         Self::from_path_with_related(path, related_paths)
@@ -564,10 +565,11 @@ mod tests {
         let updated_wal = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
         assert_ne!(with_wal, updated_wal);
 
+        let before_shm = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
         let shm_path = append_path_suffix(&db_path, "-shm");
         std::fs::write(&shm_path, b"shm-1").unwrap();
         let with_shm = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
-        assert_ne!(updated_wal, with_shm);
+        assert_eq!(before_shm, with_shm);
     }
 
     #[test]

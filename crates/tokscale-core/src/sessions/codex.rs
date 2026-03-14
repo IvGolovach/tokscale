@@ -391,11 +391,7 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
         0,
         CodexParseState::default(),
     );
-    if parsed.parse_succeeded {
-        parsed.messages
-    } else {
-        Vec::new()
-    }
+    parsed.messages
 }
 
 pub(crate) fn parse_codex_file_incremental(
@@ -737,6 +733,34 @@ mod tests {
 
         let incremental = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
         assert!(!incremental.parse_succeeded);
+    }
+
+    #[test]
+    fn test_parse_file_preserves_valid_messages_before_invalid_utf8_line_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            concat!(
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        file.write_all(&[0xff, b'\n']).unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_codex_file(file.path());
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "gpt-5.4");
+        assert_eq!(messages[0].tokens.input, 8);
+        assert_eq!(messages[0].tokens.output, 3);
+        assert_eq!(messages[0].tokens.cache_read, 2);
+
+        let incremental = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(!incremental.parse_succeeded);
+        assert_eq!(incremental.messages.len(), 1);
     }
 
     #[test]

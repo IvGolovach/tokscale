@@ -358,13 +358,6 @@ fn parse_all_messages_with_pricing(
             0,
             sessions::codex::CodexParseState::default(),
         );
-        if !parsed.parse_succeeded {
-            return CachedParseOutcome {
-                messages: Vec::new(),
-                cache_entry: None,
-            };
-        }
-
         let messages = finalize_codex_messages(
             parsed.messages.clone(),
             pricing,
@@ -372,6 +365,12 @@ fn parse_all_messages_with_pricing(
             &parsed.fallback_timestamp_indices,
             fallback_timestamp,
         );
+        if !parsed.parse_succeeded {
+            return CachedParseOutcome {
+                messages,
+                cache_entry: None,
+            };
+        }
 
         let cache_entry = build_codex_cache_entry(
             path,
@@ -2032,6 +2031,52 @@ mod tests {
             );
 
             assert_eq!(messages, expected);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_full_log_parse_preserves_valid_messages_before_invalid_line_error() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let test_result = (|| {
+            let session_dir = source_home.path().join(".codex/sessions");
+            std::fs::create_dir_all(&session_dir).unwrap();
+            let path = session_dir.join("session.jsonl");
+
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.write_all(
+                concat!(
+                    r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+                    "\n"
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            file.write_all(&[0xff, b'\n']).unwrap();
+            file.flush().unwrap();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["codex".to_string()],
+                None,
+            );
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].model_id, "gpt-5.4");
+
+            let cache = message_cache::SourceMessageCache::load();
+            assert!(cache.get(&path).is_none());
         })();
 
         match original_home {
