@@ -1,17 +1,19 @@
 use crate::sessions::codex::CodexParseState;
 use crate::UnifiedMessage;
 use bincode::Options;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 const CACHE_SCHEMA_VERSION: u32 = 3;
 const CACHE_FILENAME: &str = "source-message-cache.bin";
+const CACHE_LOCK_FILENAME: &str = "source-message-cache.lock";
 const MAX_CACHE_FILE_BYTES: u64 = 256 * 1024 * 1024;
 const FINGERPRINT_SAMPLE_BYTES: usize = 4096;
 const FINGERPRINT_SAMPLE_POINTS: usize = 5;
@@ -25,6 +27,10 @@ fn cache_dir() -> Option<PathBuf> {
 
 fn cache_path() -> Option<PathBuf> {
     Some(cache_dir()?.join(CACHE_FILENAME))
+}
+
+fn cache_lock_path() -> Option<PathBuf> {
+    Some(cache_dir()?.join(CACHE_LOCK_FILENAME))
 }
 
 fn fallback_cache_dir() -> Option<PathBuf> {
@@ -81,6 +87,7 @@ pub(crate) struct SourceFingerprint {
     pub size: u64,
     pub modified_ns: u64,
     pub sample_hashes: Vec<FileSampleHash>,
+    pub content_hash: [u8; 32],
     pub related_files: Vec<RelatedFileFingerprint>,
 }
 
@@ -90,6 +97,7 @@ pub(crate) struct RelatedFileFingerprint {
     pub size: u64,
     pub modified_ns: u64,
     pub sample_hashes: Vec<FileSampleHash>,
+    pub content_hash: [u8; 32],
 }
 
 impl SourceFingerprint {
@@ -108,7 +116,7 @@ impl SourceFingerprint {
     where
         I: IntoIterator<Item = (String, PathBuf)>,
     {
-        let (size, modified_ns, sample_hashes) = file_fingerprint_parts(path)?;
+        let (size, modified_ns, sample_hashes, content_hash) = file_fingerprint_parts(path)?;
         let mut related_files: Vec<RelatedFileFingerprint> = related_paths
             .into_iter()
             .filter_map(|(suffix, related_path)| {
@@ -121,6 +129,7 @@ impl SourceFingerprint {
             size,
             modified_ns,
             sample_hashes,
+            content_hash,
             related_files,
         })
     }
@@ -128,12 +137,13 @@ impl SourceFingerprint {
 
 impl RelatedFileFingerprint {
     fn from_path(suffix: String, path: &Path) -> Option<Self> {
-        let (size, modified_ns, sample_hashes) = file_fingerprint_parts(path)?;
+        let (size, modified_ns, sample_hashes, content_hash) = file_fingerprint_parts(path)?;
         Some(Self {
             suffix,
             size,
             modified_ns,
             sample_hashes,
+            content_hash,
         })
     }
 }
@@ -238,6 +248,8 @@ struct CachedSourceStore {
 pub(crate) struct SourceMessageCache {
     pub entries: HashMap<CachedPath, CachedSourceEntry>,
     dirty: bool,
+    dirty_keys: HashSet<CachedPath>,
+    deleted_paths: HashSet<CachedPath>,
 }
 
 impl SourceMessageCache {
@@ -245,30 +257,27 @@ impl SourceMessageCache {
         let Some(path) = cache_path() else {
             return Self::default();
         };
-        let file = match File::open(path) {
+        let Some(lock_path) = cache_lock_path() else {
+            return Self::default();
+        };
+        let lock_file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+        {
             Ok(file) => file,
             Err(_) => return Self::default(),
         };
-        let metadata = match file.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => return Self::default(),
-        };
-        if metadata.len() > MAX_CACHE_FILE_BYTES {
+        if lock_file.lock_shared().is_err() {
             return Self::default();
         }
 
-        let reader = BufReader::new(file);
-        let store: CachedSourceStore = match bincode::options()
-            .with_limit(MAX_CACHE_FILE_BYTES)
-            .deserialize_from(reader)
-        {
-            Ok(store) => store,
-            Err(_) => return Self::default(),
+        let store = match read_store_from_path(&path) {
+            Some(store) => store,
+            None => return Self::default(),
         };
-
-        if store.schema_version != CACHE_SCHEMA_VERSION {
-            return Self::default();
-        }
 
         let entries = store
             .entries
@@ -279,11 +288,16 @@ impl SourceMessageCache {
         Self {
             entries,
             dirty: false,
+            dirty_keys: HashSet::new(),
+            deleted_paths: HashSet::new(),
         }
     }
 
     pub(crate) fn insert(&mut self, entry: CachedSourceEntry) {
-        self.entries.insert(entry.path.clone(), entry);
+        let key = entry.path.clone();
+        self.entries.insert(key.clone(), entry);
+        self.deleted_paths.remove(&key);
+        self.dirty_keys.insert(key);
         self.dirty = true;
     }
 
@@ -293,11 +307,22 @@ impl SourceMessageCache {
     }
 
     pub(crate) fn prune_missing_files(&mut self) {
-        let original_len = self.entries.len();
-        self.entries.retain(|path, _| path.to_path_buf().exists());
-        if self.entries.len() != original_len {
-            self.dirty = true;
+        let removed_paths: Vec<CachedPath> = self
+            .entries
+            .keys()
+            .filter(|path| !path.to_path_buf().exists())
+            .cloned()
+            .collect();
+        if removed_paths.is_empty() {
+            return;
         }
+
+        for path in removed_paths {
+            self.entries.remove(&path);
+            self.dirty_keys.remove(&path);
+            self.deleted_paths.insert(path);
+        }
+        self.dirty = true;
     }
 
     pub(crate) fn save_if_dirty(&mut self) {
@@ -312,14 +337,51 @@ impl SourceMessageCache {
             return;
         }
 
-        let store = CachedSourceStore {
-            schema_version: CACHE_SCHEMA_VERSION,
-            entries: self.entries.values().cloned().collect(),
-        };
-
         let Some(final_path) = cache_path() else {
             return;
         };
+        let Some(lock_path) = cache_lock_path() else {
+            return;
+        };
+        let lock_file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(lock_path)
+        {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        if lock_file.lock_exclusive().is_err() {
+            return;
+        }
+
+        let mut merged_entries: HashMap<CachedPath, CachedSourceEntry> =
+            read_store_from_path(&final_path)
+                .map(|store| {
+                    store
+                        .entries
+                        .into_iter()
+                        .map(|entry| (entry.path.clone(), entry))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+        for path in &self.deleted_paths {
+            merged_entries.remove(path);
+        }
+        for path in &self.dirty_keys {
+            if let Some(entry) = self.entries.get(path) {
+                merged_entries.insert(path.clone(), entry.clone());
+            }
+        }
+
+        let store = CachedSourceStore {
+            schema_version: CACHE_SCHEMA_VERSION,
+            entries: merged_entries.values().cloned().collect(),
+        };
+
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -342,6 +404,8 @@ impl SourceMessageCache {
             writer.get_ref().sync_all()?;
             if fs::rename(&tmp_path, &final_path).is_err() {
                 fs::copy(&tmp_path, &final_path)?;
+                let final_file = File::open(&final_path)?;
+                final_file.sync_all()?;
                 let _ = fs::remove_file(&tmp_path);
             }
             Ok(())
@@ -352,8 +416,29 @@ impl SourceMessageCache {
             return;
         }
 
+        self.entries = merged_entries;
         self.dirty = false;
+        self.dirty_keys.clear();
+        self.deleted_paths.clear();
     }
+}
+
+fn read_store_from_path(path: &Path) -> Option<CachedSourceStore> {
+    let file = File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if metadata.len() > MAX_CACHE_FILE_BYTES {
+        return None;
+    }
+
+    let reader = BufReader::new(file);
+    let store: CachedSourceStore = bincode::options()
+        .with_limit(MAX_CACHE_FILE_BYTES)
+        .deserialize_from(reader)
+        .ok()?;
+    if store.schema_version != CACHE_SCHEMA_VERSION {
+        return None;
+    }
+    Some(store)
 }
 
 fn read_sample_hash(file: &mut File, offset: u64, len: usize) -> Option<FileSampleHash> {
@@ -425,7 +510,7 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn file_fingerprint_parts(path: &Path) -> Option<(u64, u64, Vec<FileSampleHash>)> {
+fn file_fingerprint_parts(path: &Path) -> Option<(u64, u64, Vec<FileSampleHash>, [u8; 32])> {
     let metadata = path.metadata().ok()?;
     let size = metadata.len();
     let modified_ns = metadata
@@ -435,7 +520,8 @@ fn file_fingerprint_parts(path: &Path) -> Option<(u64, u64, Vec<FileSampleHash>)
         .ok()?
         .as_nanos() as u64;
     let sample_hashes = compute_sample_hashes(path, size)?;
-    Some((size, modified_ns, sample_hashes))
+    let content_hash = hash_prefix(path, size)?;
+    Some((size, modified_ns, sample_hashes, content_hash))
 }
 
 fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -543,6 +629,21 @@ mod tests {
         let before = SourceFingerprint::from_path(file.path()).unwrap();
 
         std::fs::write(file.path(), b"aaaa\nzzzz\ncccc\n").unwrap();
+
+        let after = SourceFingerprint::from_path(file.path()).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn test_source_fingerprint_changes_for_large_same_size_unsampled_rewrite() {
+        let mut original = vec![b'a'; 128 * 1024];
+        original.extend_from_slice(b"\n");
+        let file = write_temp_file(&original);
+        let before = SourceFingerprint::from_path(file.path()).unwrap();
+
+        let mut rewritten = original.clone();
+        rewritten[73 * 1024] = b'z';
+        std::fs::write(file.path(), &rewritten).unwrap();
 
         let after = SourceFingerprint::from_path(file.path()).unwrap();
         assert_ne!(before, after);
@@ -701,38 +802,18 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_source_message_cache_round_trip_with_runtime_dir_fallback() {
+    fn test_fallback_cache_dir_prefers_runtime_dir() {
         let runtime_dir = TempDir::new().unwrap();
-        let original_home = std::env::var("HOME").ok();
-        let original_xdg_cache_home = std::env::var("XDG_CACHE_HOME").ok();
         let original_xdg_runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok();
-
-        std::env::remove_var("HOME");
-        std::env::remove_var("XDG_CACHE_HOME");
         std::env::set_var("XDG_RUNTIME_DIR", runtime_dir.path());
 
         let test_result = (|| {
-            let file = write_temp_file(b"{}\n");
-            let fingerprint = SourceFingerprint::from_path(file.path()).unwrap();
-            let entry =
-                CachedSourceEntry::new(file.path(), fingerprint, Vec::new(), Vec::new(), None);
-
-            let mut cache = SourceMessageCache::default();
-            cache.insert(entry);
-            cache.save_if_dirty();
-
-            let loaded = SourceMessageCache::load();
-            assert_eq!(loaded.entries.len(), 1);
+            assert_eq!(
+                fallback_cache_dir(),
+                Some(runtime_dir.path().join("tokscale"))
+            );
         })();
 
-        match original_home {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-        match original_xdg_cache_home {
-            Some(path) => std::env::set_var("XDG_CACHE_HOME", path),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
         match original_xdg_runtime_dir {
             Some(path) => std::env::set_var("XDG_RUNTIME_DIR", path),
             None => std::env::remove_var("XDG_RUNTIME_DIR"),
@@ -764,6 +845,50 @@ mod tests {
 
             cache.save_if_dirty();
             assert!(!cache.dirty);
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_save_if_dirty_merges_concurrent_writers() {
+        let temp_home = TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", temp_home.path());
+
+        let test_result = (|| {
+            let file_one = write_temp_file(b"{\"id\":1}\n");
+            let file_two = write_temp_file(b"{\"id\":2}\n");
+
+            let mut writer_one = SourceMessageCache::load();
+            let mut writer_two = SourceMessageCache::load();
+
+            writer_one.insert(CachedSourceEntry::new(
+                file_one.path(),
+                SourceFingerprint::from_path(file_one.path()).unwrap(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ));
+            writer_two.insert(CachedSourceEntry::new(
+                file_two.path(),
+                SourceFingerprint::from_path(file_two.path()).unwrap(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            ));
+
+            writer_one.save_if_dirty();
+            writer_two.save_if_dirty();
+
+            let loaded = SourceMessageCache::load();
+            assert!(loaded.get(file_one.path()).is_some());
+            assert!(loaded.get(file_two.path()).is_some());
         })();
 
         match original_home {

@@ -450,19 +450,23 @@ fn parse_all_messages_with_pricing(
         }
 
         let messages = parse(path);
-        let cache_entry = message_cache::CachedSourceEntry::new(
-            path,
-            fingerprint,
-            messages.clone(),
-            Vec::new(),
-            None,
-        );
         let mut messages = messages;
+        let cache_entry = if messages.is_empty() {
+            None
+        } else {
+            Some(message_cache::CachedSourceEntry::new(
+                path,
+                fingerprint,
+                messages.clone(),
+                Vec::new(),
+                None,
+            ))
+        };
         apply_pricing_to_messages(&mut messages, pricing);
 
         CachedParseOutcome {
             messages,
-            cache_entry: Some(cache_entry),
+            cache_entry,
         }
     }
 
@@ -1827,6 +1831,62 @@ mod tests {
                 )
                 .date
             );
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn test_empty_parse_results_are_not_cached_for_optional_file_sources() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let test_result = (|| {
+            let message_dir = source_home
+                .path()
+                .join(".local/share/opencode/storage/message/project-1");
+            std::fs::create_dir_all(&message_dir).unwrap();
+            let path = message_dir.join("msg_001.json");
+            std::fs::write(
+                &path,
+                r#"{"id":"msg-1","sessionID":"session-1","role":"assistant","modelID":"accounts/fireworks/models/deepseek-v3-0324","providerID":"fireworks","cost":0,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1733011200000}}"#,
+            )
+            .unwrap();
+
+            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+            permissions.set_mode(0o000);
+            std::fs::set_permissions(&path, permissions).unwrap();
+
+            let first_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+            assert!(first_messages.is_empty());
+
+            let cache = message_cache::SourceMessageCache::load();
+            assert!(cache.get(&path).is_none());
+
+            let mut readable_permissions = std::fs::metadata(&path).unwrap().permissions();
+            readable_permissions.set_mode(0o644);
+            std::fs::set_permissions(&path, readable_permissions).unwrap();
+
+            let second_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+            assert_eq!(second_messages.len(), 1);
         })();
 
         match original_home {
