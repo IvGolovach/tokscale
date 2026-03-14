@@ -182,13 +182,17 @@ fn parse_codex_reader<R: BufRead>(
     let mut buffer = Vec::with_capacity(4096);
     let mut line = String::with_capacity(4096);
     let mut consumed_offset = start_offset;
+    let mut parse_succeeded = true;
 
     loop {
         line.clear();
         let bytes_read = match reader.read_line(&mut line) {
             Ok(0) => break,
             Ok(bytes_read) => bytes_read,
-            Err(_) => break,
+            Err(_) => {
+                parse_succeeded = false;
+                break;
+            }
         };
         consumed_offset += bytes_read as u64;
 
@@ -365,7 +369,7 @@ fn parse_codex_reader<R: BufRead>(
         messages,
         fallback_timestamp_indices,
         consumed_offset,
-        parse_succeeded: true,
+        parse_succeeded,
         state,
     }
 }
@@ -380,14 +384,18 @@ pub fn parse_codex_file(path: &Path) -> Vec<UnifiedMessage> {
     let session_id = session_id_from_path(path);
     let fallback_timestamp = file_modified_timestamp_ms(path);
     let reader = BufReader::new(file);
-    parse_codex_reader(
+    let parsed = parse_codex_reader(
         reader,
         &session_id,
         fallback_timestamp,
         0,
         CodexParseState::default(),
-    )
-    .messages
+    );
+    if parsed.parse_succeeded {
+        parsed.messages
+    } else {
+        Vec::new()
+    }
 }
 
 pub(crate) fn parse_codex_file_incremental(
@@ -572,7 +580,7 @@ fn extract_timestamp_from_value(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Seek, SeekFrom, Write};
+    use std::io::{BufRead, Cursor, Error, ErrorKind, Seek, SeekFrom, Write};
     use tempfile::NamedTempFile;
 
     fn create_test_file(content: &str) -> NamedTempFile {
@@ -580,6 +588,50 @@ mod tests {
         file.write_all(content.as_bytes()).unwrap();
         file.flush().unwrap();
         file
+    }
+
+    struct FailAfterFirstLine {
+        inner: Cursor<Vec<u8>>,
+        fail_next_read: bool,
+    }
+
+    impl FailAfterFirstLine {
+        fn new(contents: &str) -> Self {
+            Self {
+                inner: Cursor::new(contents.as_bytes().to_vec()),
+                fail_next_read: false,
+            }
+        }
+    }
+
+    impl std::io::Read for FailAfterFirstLine {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl BufRead for FailAfterFirstLine {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amt: usize) {
+            self.inner.consume(amt);
+        }
+
+        fn read_line(&mut self, buf: &mut String) -> std::io::Result<usize> {
+            if self.fail_next_read {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "synthetic line decode failure",
+                ));
+            }
+            let bytes_read = self.inner.read_line(buf)?;
+            if bytes_read > 0 {
+                self.fail_next_read = true;
+            }
+            Ok(bytes_read)
+        }
     }
 
     #[test]
@@ -649,6 +701,42 @@ mod tests {
 
         let full = parse_codex_file(file.path());
         assert_eq!(combined, full);
+    }
+
+    #[test]
+    fn test_parse_reader_marks_failure_on_line_read_error() {
+        let reader = FailAfterFirstLine::new(concat!(
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+            "\n"
+        ));
+
+        let parsed = parse_codex_reader(reader, "session", 0, 0, CodexParseState::default());
+
+        assert!(!parsed.parse_succeeded);
+        assert!(parsed.messages.is_empty());
+    }
+
+    #[test]
+    fn test_parse_file_returns_empty_on_invalid_utf8_line_error() {
+        let mut file = NamedTempFile::new().unwrap();
+        file.write_all(
+            concat!(
+                r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+                "\n"
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        file.write_all(&[0xff, b'\n']).unwrap();
+        file.flush().unwrap();
+
+        let messages = parse_codex_file(file.path());
+        assert!(messages.is_empty());
+
+        let incremental = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
+        assert!(!incremental.parse_succeeded);
     }
 
     #[test]

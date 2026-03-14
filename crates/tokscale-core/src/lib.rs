@@ -347,6 +347,46 @@ fn parse_all_messages_with_pricing(
         }
     }
 
+    fn parse_full_log_source(
+        path: &Path,
+        pricing: Option<&pricing::PricingService>,
+        is_headless: bool,
+    ) -> CachedParseOutcome {
+        let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
+        let parsed = sessions::codex::parse_codex_file_incremental(
+            path,
+            0,
+            sessions::codex::CodexParseState::default(),
+        );
+        if !parsed.parse_succeeded {
+            return CachedParseOutcome {
+                messages: Vec::new(),
+                cache_entry: None,
+            };
+        }
+
+        let messages = finalize_codex_messages(
+            parsed.messages.clone(),
+            pricing,
+            is_headless,
+            &parsed.fallback_timestamp_indices,
+            fallback_timestamp,
+        );
+
+        let cache_entry = build_codex_cache_entry(
+            path,
+            parsed.messages,
+            parsed.consumed_offset,
+            parsed.state,
+            parsed.fallback_timestamp_indices,
+        );
+
+        CachedParseOutcome {
+            messages,
+            cache_entry,
+        }
+    }
+
     fn finalize_codex_messages(
         mut messages: Vec<UnifiedMessage>,
         pricing: Option<&pricing::PricingService>,
@@ -387,16 +427,17 @@ fn parse_all_messages_with_pricing(
         ))
     }
 
-    fn load_or_parse_source<F>(
+    fn load_or_parse_source_with_fingerprint<F>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
+        fingerprint_from_path: fn(&Path) -> Option<message_cache::SourceFingerprint>,
         parse: F,
     ) -> CachedParseOutcome
     where
         F: Fn(&Path) -> Vec<UnifiedMessage>,
     {
-        let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
+        let Some(fingerprint) = fingerprint_from_path(path) else {
             return parse_uncached_messages(path, pricing, parse);
         };
 
@@ -426,27 +467,52 @@ fn parse_all_messages_with_pricing(
         }
     }
 
+    fn load_or_parse_source<F>(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+        parse: F,
+    ) -> CachedParseOutcome
+    where
+        F: Fn(&Path) -> Vec<UnifiedMessage>,
+    {
+        load_or_parse_source_with_fingerprint(
+            path,
+            source_cache,
+            pricing,
+            message_cache::SourceFingerprint::from_path,
+            parse,
+        )
+    }
+
+    fn load_or_parse_sqlite_source<F>(
+        path: &Path,
+        source_cache: &message_cache::SourceMessageCache,
+        pricing: Option<&pricing::PricingService>,
+        parse: F,
+    ) -> CachedParseOutcome
+    where
+        F: Fn(&Path) -> Vec<UnifiedMessage>,
+    {
+        load_or_parse_source_with_fingerprint(
+            path,
+            source_cache,
+            pricing,
+            message_cache::SourceFingerprint::from_sqlite_path,
+            parse,
+        )
+    }
+
     fn load_or_parse_codex_source(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
         headless_roots: &[PathBuf],
     ) -> CachedParseOutcome {
-        let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
-            let parsed = sessions::codex::parse_codex_file_incremental(path, 0, Default::default());
-            return CachedParseOutcome {
-                messages: finalize_codex_messages(
-                    parsed.messages,
-                    pricing,
-                    is_headless_path(path, headless_roots),
-                    &parsed.fallback_timestamp_indices,
-                    sessions::utils::file_modified_timestamp_ms(path),
-                ),
-                cache_entry: None,
-            };
-        };
-
         let is_headless = is_headless_path(path, headless_roots);
+        let Some(fingerprint) = message_cache::SourceFingerprint::from_path(path) else {
+            return parse_full_log_source(path, pricing, is_headless);
+        };
         let fallback_timestamp = sessions::utils::file_modified_timestamp_ms(path);
 
         if let Some(cached) = source_cache.get(path) {
@@ -499,6 +565,9 @@ fn parse_all_messages_with_pricing(
                             parsed.state,
                             fallback_timestamp_indices,
                         );
+                        if cache_entry.is_none() {
+                            return parse_full_log_source(path, pricing, is_headless);
+                        }
 
                         return CachedParseOutcome {
                             messages,
@@ -509,31 +578,7 @@ fn parse_all_messages_with_pricing(
             }
         }
 
-        let parsed = sessions::codex::parse_codex_file_incremental(
-            path,
-            0,
-            sessions::codex::CodexParseState::default(),
-        );
-        let messages = finalize_codex_messages(
-            parsed.messages.clone(),
-            pricing,
-            is_headless,
-            &parsed.fallback_timestamp_indices,
-            fallback_timestamp,
-        );
-
-        let cache_entry = build_codex_cache_entry(
-            path,
-            parsed.messages,
-            parsed.consumed_offset,
-            parsed.state,
-            parsed.fallback_timestamp_indices,
-        );
-
-        CachedParseOutcome {
-            messages,
-            cache_entry,
-        }
+        parse_full_log_source(path, pricing, is_headless)
     }
 
     let scan_result = scanner::scan_all_clients(home_dir, clients);
@@ -548,7 +593,7 @@ fn parse_all_messages_with_pricing(
     let mut opencode_seen: HashSet<String> = HashSet::new();
 
     if let Some(db_path) = &scan_result.opencode_db {
-        let outcome = load_or_parse_source(db_path, &source_cache, pricing, |path| {
+        let outcome = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
             sessions::opencode::parse_opencode_sqlite(path)
         });
         for message in &outcome.messages {
@@ -804,7 +849,7 @@ fn parse_all_messages_with_pricing(
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {
-            let outcome = load_or_parse_source(db_path, &source_cache, pricing, |path| {
+            let outcome = load_or_parse_sqlite_source(db_path, &source_cache, pricing, |path| {
                 sessions::synthetic::parse_octofriend_sqlite(path)
             });
             all_messages.extend(outcome.messages);
@@ -1783,6 +1828,84 @@ mod tests {
                 )
                 .date
             );
+        })();
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        test_result
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_sqlite_source_cache_invalidates_on_wal_change() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        let test_result = (|| {
+            let db_dir = source_home.path().join(".local/share/opencode");
+            std::fs::create_dir_all(&db_dir).unwrap();
+            let db_path = db_dir.join("opencode.db");
+
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode=WAL;", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(journal_mode.to_lowercase(), "wal");
+            conn.execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE message (
+                     id TEXT PRIMARY KEY,
+                     session_id TEXT NOT NULL,
+                     data TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+
+            let row_one = r#"{
+                "role": "assistant",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "tokens": { "input": 100, "output": 50, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+                "time": { "created": 1700000000000.0 }
+            }"#;
+            let row_two = r#"{
+                "role": "assistant",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "tokens": { "input": 120, "output": 60, "reasoning": 0, "cache": { "read": 0, "write": 0 } },
+                "time": { "created": 1700000001000.0 }
+            }"#;
+
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["msg-1", "session-1", row_one],
+            )
+            .unwrap();
+
+            let first_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+            assert_eq!(first_messages.len(), 1);
+
+            conn.execute(
+                "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+                rusqlite::params!["msg-2", "session-1", row_two],
+            )
+            .unwrap();
+            assert!(db_path.with_extension("db-wal").exists());
+
+            let refreshed_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+            assert_eq!(refreshed_messages.len(), 2);
         })();
 
         match original_home {

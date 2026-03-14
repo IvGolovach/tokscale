@@ -4,6 +4,7 @@ use bincode::Options;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -79,21 +80,56 @@ pub(crate) struct SourceFingerprint {
     pub size: u64,
     pub modified_ns: u64,
     pub sample_hashes: Vec<FileSampleHash>,
+    pub related_files: Vec<RelatedFileFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RelatedFileFingerprint {
+    pub suffix: String,
+    pub size: u64,
+    pub modified_ns: u64,
+    pub sample_hashes: Vec<FileSampleHash>,
 }
 
 impl SourceFingerprint {
     pub(crate) fn from_path(path: &Path) -> Option<Self> {
-        let metadata = path.metadata().ok()?;
-        let size = metadata.len();
-        let modified_ns = metadata
-            .modified()
-            .ok()?
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_nanos() as u64;
-        let sample_hashes = compute_sample_hashes(path, size)?;
+        Self::from_path_with_related(path, std::iter::empty())
+    }
+
+    pub(crate) fn from_sqlite_path(path: &Path) -> Option<Self> {
+        let related_paths = ["-wal", "-shm"]
+            .into_iter()
+            .map(|suffix| (suffix.to_string(), append_path_suffix(path, suffix)));
+        Self::from_path_with_related(path, related_paths)
+    }
+
+    fn from_path_with_related<I>(path: &Path, related_paths: I) -> Option<Self>
+    where
+        I: IntoIterator<Item = (String, PathBuf)>,
+    {
+        let (size, modified_ns, sample_hashes) = file_fingerprint_parts(path)?;
+        let mut related_files: Vec<RelatedFileFingerprint> = related_paths
+            .into_iter()
+            .filter_map(|(suffix, related_path)| {
+                RelatedFileFingerprint::from_path(suffix, &related_path)
+            })
+            .collect();
+        related_files.sort_by(|left, right| left.suffix.cmp(&right.suffix));
 
         Some(Self {
+            size,
+            modified_ns,
+            sample_hashes,
+            related_files,
+        })
+    }
+}
+
+impl RelatedFileFingerprint {
+    fn from_path(suffix: String, path: &Path) -> Option<Self> {
+        let (size, modified_ns, sample_hashes) = file_fingerprint_parts(path)?;
+        Some(Self {
+            suffix,
             size,
             modified_ns,
             sample_hashes,
@@ -388,6 +424,25 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     hash
 }
 
+fn file_fingerprint_parts(path: &Path) -> Option<(u64, u64, Vec<FileSampleHash>)> {
+    let metadata = path.metadata().ok()?;
+    let size = metadata.len();
+    let modified_ns = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    let sample_hashes = compute_sample_hashes(path, size)?;
+    Some((size, modified_ns, sample_hashes))
+}
+
+fn append_path_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut os = OsString::from(path.as_os_str());
+    os.push(suffix);
+    PathBuf::from(os)
+}
+
 fn hash_prefix(path: &Path, len: u64) -> Option<[u8; 32]> {
     let mut file = File::open(path).ok()?;
     let mut hasher = Sha256::new();
@@ -490,6 +545,29 @@ mod tests {
 
         let after = SourceFingerprint::from_path(file.path()).unwrap();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn test_sqlite_source_fingerprint_tracks_sidecar_changes() {
+        let dir = TempDir::new().unwrap();
+        let db_path = dir.path().join("history.db");
+        std::fs::write(&db_path, b"main-db").unwrap();
+
+        let base = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
+
+        let wal_path = append_path_suffix(&db_path, "-wal");
+        std::fs::write(&wal_path, b"wal-1").unwrap();
+        let with_wal = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
+        assert_ne!(base, with_wal);
+
+        std::fs::write(&wal_path, b"wal-2").unwrap();
+        let updated_wal = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
+        assert_ne!(with_wal, updated_wal);
+
+        let shm_path = append_path_suffix(&db_path, "-shm");
+        std::fs::write(&shm_path, b"shm-1").unwrap();
+        let with_shm = SourceFingerprint::from_sqlite_path(&db_path).unwrap();
+        assert_ne!(updated_wal, with_shm);
     }
 
     #[test]
