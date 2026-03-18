@@ -1212,6 +1212,31 @@ async fn load_pricing_for_local_parse() -> Option<Arc<pricing::PricingService>> 
     )
 }
 
+fn resolve_local_parse_request(
+    options: &LocalParseOptions,
+) -> Result<(String, Vec<String>), String> {
+    let home_dir = get_home_dir_string(&options.home_dir)?;
+    let clients = options.clients.clone().unwrap_or_else(|| {
+        let mut clients: Vec<String> = ClientId::iter()
+            .filter(|c| c.parse_local())
+            .map(|c| c.as_str().to_string())
+            .collect();
+        clients.push("synthetic".to_string());
+        clients
+    });
+    Ok((home_dir, clients))
+}
+
+fn parse_local_unified_messages_resolved(
+    options: LocalParseOptions,
+    home_dir: &str,
+    clients: &[String],
+    pricing: Option<&pricing::PricingService>,
+) -> Result<Vec<UnifiedMessage>, String> {
+    let messages = parse_all_messages_with_pricing(home_dir, clients, pricing);
+    Ok(filter_unified_messages(messages, &options))
+}
+
 pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages, String> {
     let start = Instant::now();
 
@@ -1505,27 +1530,16 @@ pub async fn parse_local_unified_messages_with_pricing(
     options: LocalParseOptions,
     pricing: Option<&pricing::PricingService>,
 ) -> Result<Vec<UnifiedMessage>, String> {
-    let home_dir = get_home_dir_string(&options.home_dir)?;
-
-    let clients: Vec<String> = options.clients.clone().unwrap_or_else(|| {
-        let mut clients: Vec<String> = ClientId::iter()
-            .filter(|c| c.parse_local())
-            .map(|c| c.as_str().to_string())
-            .collect();
-        clients.push("synthetic".to_string());
-        clients
-    });
-
-    let messages = parse_all_messages_with_pricing(&home_dir, &clients, pricing);
-
-    Ok(filter_unified_messages(messages, &options))
+    let (home_dir, clients) = resolve_local_parse_request(&options)?;
+    parse_local_unified_messages_resolved(options, &home_dir, &clients, pricing)
 }
 
 pub async fn parse_local_unified_messages(
     options: LocalParseOptions,
 ) -> Result<Vec<UnifiedMessage>, String> {
+    let (home_dir, clients) = resolve_local_parse_request(&options)?;
     let pricing = load_pricing_for_local_parse().await;
-    parse_local_unified_messages_with_pricing(options, pricing.as_deref()).await
+    parse_local_unified_messages_resolved(options, &home_dir, &clients, pricing.as_deref())
 }
 
 fn unified_to_parsed(msg: &UnifiedMessage) -> ParsedMessage {
