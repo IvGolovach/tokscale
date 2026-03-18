@@ -536,48 +536,96 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use std::fs;
-    use std::sync::Arc;
     use tempfile::TempDir;
-    use tokscale_core::pricing::PricingService;
+    use tokio::runtime::{Handle, Runtime};
+    use tokscale_core::parse_local_unified_messages_with_pricing;
+    use tokscale_core::pricing::{ModelPricing, PricingService};
     use tokscale_core::TokenBreakdown as CoreTokenBreakdown;
 
-    fn current_local_parse_pricing() -> Option<Arc<PricingService>> {
-        tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(async { PricingService::get_or_init().await.ok() })
-            .or_else(|| PricingService::load_cached_any_age().map(Arc::new))
+    fn test_pricing_service() -> PricingService {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.00001),
+                output_cost_per_token: Some(0.00002),
+                cache_read_input_token_cost: Some(0.000003),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "claude-haiku-4".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000004),
+                output_cost_per_token: Some(0.000006),
+                cache_read_input_token_cost: Some(0.000001),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "accounts/fireworks/models/deepseek-v3-0324".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.03),
+                ..Default::default()
+            },
+        );
+
+        PricingService::new(litellm, HashMap::new())
+    }
+
+    fn load_with_pricing(
+        loader: &DataLoader,
+        enabled_clients: &[ClientId],
+        group_by: &GroupBy,
+        include_synthetic: bool,
+        pricing: Option<&PricingService>,
+    ) -> Result<UsageData> {
+        let home = dirs::home_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?
+            .to_string_lossy()
+            .to_string();
+
+        let mut sources: Vec<String> = enabled_clients
+            .iter()
+            .map(|client| client.as_str().to_string())
+            .collect();
+        if include_synthetic {
+            sources.push("synthetic".to_string());
+        }
+
+        let opts = LocalParseOptions {
+            home_dir: Some(home),
+            clients: Some(sources),
+            since: loader.since.clone(),
+            until: loader.until.clone(),
+            year: loader.year.clone(),
+        };
+
+        let messages = if Handle::try_current().is_ok() {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let rt = Runtime::new().map_err(|e| e.to_string())?;
+                    rt.block_on(parse_local_unified_messages_with_pricing(opts, pricing))
+                })
+                .join()
+                .unwrap_or_else(|_| Err("data loader thread panicked".to_string()))
+            })
+        } else {
+            Runtime::new()?.block_on(parse_local_unified_messages_with_pricing(opts, pricing))
+        }
+        .map_err(anyhow::Error::msg)?;
+
+        loader.aggregate_messages(messages, group_by)
     }
 
     fn expected_message_cost(
-        pricing: Option<&PricingService>,
-        client: &str,
+        pricing: &PricingService,
         model_id: &str,
         provider_id: &str,
         tokens: CoreTokenBreakdown,
-        embedded_cost: f64,
     ) -> f64 {
-        let calculated_cost = pricing
-            .map(|pricing| {
-                if client.eq_ignore_ascii_case("gemini") {
-                    let usage = CoreTokenBreakdown {
-                        input: tokens.input,
-                        output: tokens.output + tokens.reasoning,
-                        cache_read: 0,
-                        cache_write: 0,
-                        reasoning: 0,
-                    };
-                    pricing.calculate_cost_with_provider(model_id, Some(provider_id), &usage)
-                } else {
-                    pricing.calculate_cost_with_provider(model_id, Some(provider_id), &tokens)
-                }
-            })
-            .unwrap_or(0.0);
-
-        if calculated_cost > 0.0 {
-            calculated_cost
-        } else {
-            embedded_cost
-        }
+        pricing.calculate_cost_with_provider(model_id, Some(provider_id), &tokens)
     }
 
     fn assert_cost_matches(actual: f64, expected: f64) {
@@ -1095,15 +1143,19 @@ after"#,
             env::set_var("HOME", temp_dir.path());
         }
 
-        let pricing = current_local_parse_pricing();
+        let pricing = test_pricing_service();
         let loader = DataLoader::new(None);
-        let usage = loader
-            .load(&[ClientId::RooCode], &GroupBy::Model, false)
-            .unwrap();
+        let usage = load_with_pricing(
+            &loader,
+            &[ClientId::RooCode],
+            &GroupBy::Model,
+            false,
+            Some(&pricing),
+        )
+        .unwrap();
 
         let architect_expected = expected_message_cost(
-            pricing.as_deref(),
-            "roocode",
+            &pricing,
             "claude-sonnet-4",
             "anthropic",
             CoreTokenBreakdown {
@@ -1113,10 +1165,8 @@ after"#,
                 cache_write: 0,
                 reasoning: 0,
             },
-            8.4,
         ) + expected_message_cost(
-            pricing.as_deref(),
-            "roocode",
+            &pricing,
             "claude-sonnet-4",
             "anthropic",
             CoreTokenBreakdown {
@@ -1126,11 +1176,9 @@ after"#,
                 cache_write: 0,
                 reasoning: 0,
             },
-            3.1,
         );
         let reviewer_expected = expected_message_cost(
-            pricing.as_deref(),
-            "roocode",
+            &pricing,
             "claude-haiku-4",
             "anthropic",
             CoreTokenBreakdown {
@@ -1140,10 +1188,8 @@ after"#,
                 cache_write: 0,
                 reasoning: 0,
             },
-            1.8,
         ) + expected_message_cost(
-            pricing.as_deref(),
-            "roocode",
+            &pricing,
             "claude-haiku-4",
             "anthropic",
             CoreTokenBreakdown {
@@ -1153,7 +1199,6 @@ after"#,
                 cache_write: 0,
                 reasoning: 0,
             },
-            0.9,
         );
 
         assert_eq!(usage.agents.len(), 2);
@@ -1193,15 +1238,19 @@ after"#,
             env::set_var("HOME", temp_dir.path());
         }
 
-        let pricing = current_local_parse_pricing();
+        let pricing = test_pricing_service();
         let loader = DataLoader::new(None);
-        let usage = loader
-            .load(&[ClientId::OpenCode], &GroupBy::ClientProviderModel, true)
-            .unwrap();
+        let usage = load_with_pricing(
+            &loader,
+            &[ClientId::OpenCode],
+            &GroupBy::ClientProviderModel,
+            true,
+            Some(&pricing),
+        )
+        .unwrap();
 
         let expected_cost = expected_message_cost(
-            pricing.as_deref(),
-            "opencode",
+            &pricing,
             "accounts/fireworks/models/deepseek-v3-0324",
             "fireworks",
             CoreTokenBreakdown {
@@ -1211,7 +1260,6 @@ after"#,
                 cache_write: 0,
                 reasoning: 0,
             },
-            0.25,
         );
 
         assert_eq!(usage.models.len(), 1);

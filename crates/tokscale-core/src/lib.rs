@@ -1500,8 +1500,10 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     })
 }
 
-pub async fn parse_local_unified_messages(
+#[doc(hidden)]
+pub async fn parse_local_unified_messages_with_pricing(
     options: LocalParseOptions,
+    pricing: Option<&pricing::PricingService>,
 ) -> Result<Vec<UnifiedMessage>, String> {
     let home_dir = get_home_dir_string(&options.home_dir)?;
 
@@ -1514,10 +1516,16 @@ pub async fn parse_local_unified_messages(
         clients
     });
 
-    let pricing = load_pricing_for_local_parse().await;
-    let messages = parse_all_messages_with_pricing(&home_dir, &clients, pricing.as_deref());
+    let messages = parse_all_messages_with_pricing(&home_dir, &clients, pricing);
 
     Ok(filter_unified_messages(messages, &options))
+}
+
+pub async fn parse_local_unified_messages(
+    options: LocalParseOptions,
+) -> Result<Vec<UnifiedMessage>, String> {
+    let pricing = load_pricing_for_local_parse().await;
+    parse_local_unified_messages_with_pricing(options, pricing.as_deref()).await
 }
 
 fn unified_to_parsed(msg: &UnifiedMessage) -> ParsedMessage {
