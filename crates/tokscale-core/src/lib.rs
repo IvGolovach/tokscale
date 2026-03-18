@@ -5,6 +5,7 @@ pub mod clients;
 mod message_cache;
 mod parser;
 pub mod pricing;
+mod provider_identity;
 pub mod scanner;
 pub mod sessions;
 
@@ -17,6 +18,7 @@ pub use sessions::UnifiedMessage;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
@@ -1169,28 +1171,45 @@ fn apply_pricing_if_available(
     };
 
     let calculated_cost = if message.client.eq_ignore_ascii_case("gemini") {
-        pricing.calculate_cost(
-            &message.model_id,
-            message.tokens.input,
-            message.tokens.output + message.tokens.reasoning,
-            0,
-            0,
-            0,
-        )
+        let usage = TokenBreakdown {
+            input: message.tokens.input,
+            output: message.tokens.output + message.tokens.reasoning,
+            cache_read: 0,
+            cache_write: 0,
+            reasoning: 0,
+        };
+        pricing.calculate_cost_with_provider(&message.model_id, Some(&message.provider_id), &usage)
     } else {
-        pricing.calculate_cost(
+        pricing.calculate_cost_with_provider(
             &message.model_id,
-            message.tokens.input,
-            message.tokens.output,
-            message.tokens.cache_read,
-            message.tokens.cache_write,
-            message.tokens.reasoning,
+            Some(&message.provider_id),
+            &message.tokens,
         )
     };
 
     if calculated_cost > 0.0 {
         message.cost = calculated_cost;
     }
+}
+
+fn select_local_parse_pricing<F>(
+    fresh: Result<Arc<pricing::PricingService>, String>,
+    stale: F,
+) -> Option<Arc<pricing::PricingService>>
+where
+    F: FnOnce() -> Option<pricing::PricingService>,
+{
+    fresh.ok().or_else(|| stale().map(Arc::new))
+}
+
+async fn load_pricing_for_local_parse() -> Option<Arc<pricing::PricingService>> {
+    // Interactive/local views should pick up newly released model pricing as soon
+    // as a fresh fetch succeeds, but still remain usable offline by falling back
+    // to any cached dataset when the network path fails.
+    select_local_parse_pricing(
+        pricing::PricingService::get_or_init().await,
+        pricing::PricingService::load_cached_any_age,
+    )
 }
 
 pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages, String> {
@@ -1495,8 +1514,8 @@ pub async fn parse_local_unified_messages(
         clients
     });
 
-    let pricing = pricing::PricingService::load_cached_any_age();
-    let messages = parse_all_messages_with_pricing(&home_dir, &clients, pricing.as_ref());
+    let pricing = load_pricing_for_local_parse().await;
+    let messages = parse_all_messages_with_pricing(&home_dir, &clients, pricing.as_deref());
 
     Ok(filter_unified_messages(messages, &options))
 }
@@ -1566,12 +1585,13 @@ mod tests {
     use super::{
         apply_pricing_if_available, message_cache, normalize_model_for_grouping,
         parse_all_messages_with_pricing, parse_local_clients, pricing,
-        retain_for_requested_clients, ClientId, GroupBy, LocalParseOptions, TokenBreakdown,
-        UnifiedMessage,
+        retain_for_requested_clients, select_local_parse_pricing, ClientId, GroupBy,
+        LocalParseOptions, TokenBreakdown, UnifiedMessage,
     };
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
     use std::str::FromStr;
+    use std::sync::Arc;
 
     #[test]
     fn test_normalize_model_for_grouping() {
@@ -2338,6 +2358,283 @@ mod tests {
         apply_pricing_if_available(&mut msg, Some(&pricing));
 
         assert_eq!(msg.cost, 0.034);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_uses_market_rate_for_free_variant() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "z-ai/glm-4.7".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(HashMap::new(), openrouter);
+
+        let mut msg = UnifiedMessage::new(
+            "opencode",
+            "glm-4.7-free",
+            "modal",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.02);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_prefers_provider_aware_match() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "xai/grok-code-fast-1-0825".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "azure_ai/grok-code-fast-1".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        let mut msg = UnifiedMessage::new(
+            "opencode",
+            "grok-code",
+            "azure",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.2);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_uses_nested_reseller_exact_match() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-4".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "azure/openai/gpt-4".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        let mut msg = UnifiedMessage::new(
+            "opencode",
+            "gpt-4",
+            "azure",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.2);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_prefers_provider_specific_exact_match_over_plain_exact() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gemini-2.5-pro".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "google/gemini-2.5-pro".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.001),
+                output_cost_per_token: Some(0.002),
+                cache_creation_input_token_cost: Some(0.01),
+                ..Default::default()
+            },
+        );
+
+        let pricing = pricing::PricingService::new(litellm, openrouter);
+
+        let mut msg = UnifiedMessage::new(
+            "opencode",
+            "gemini-2.5-pro",
+            "google",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 3,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.05);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_normalizes_openai_codex_provider() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "openai/gpt-5.2-preview".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        litellm.insert(
+            "google/gpt-5.2-preview-max".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.1),
+                output_cost_per_token: Some(0.2),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        let mut msg = UnifiedMessage::new(
+            "openclaw",
+            "gpt-5.2",
+            "openai-codex",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.2);
+    }
+
+    #[test]
+    fn test_select_local_parse_pricing_prefers_fresh_service_for_new_models() {
+        let mut fresh_litellm = HashMap::new();
+        fresh_litellm.insert(
+            "gpt-5.4".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.000002),
+                output_cost_per_token: Some(0.00001),
+                ..Default::default()
+            },
+        );
+        let fresh = Arc::new(pricing::PricingService::new(fresh_litellm, HashMap::new()));
+        let stale = pricing::PricingService::new(HashMap::new(), HashMap::new());
+        let selected = select_local_parse_pricing(Ok(Arc::clone(&fresh)), || Some(stale)).unwrap();
+
+        let mut msg = UnifiedMessage::new(
+            "opencode",
+            "gpt-5.4",
+            "openai",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(selected.as_ref()));
+
+        assert!(msg.cost > 0.0);
+    }
+
+    #[test]
+    fn test_select_local_parse_pricing_falls_back_to_stale_cache_on_fetch_error() {
+        let mut stale_litellm = HashMap::new();
+        stale_litellm.insert(
+            "gpt-5.2".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.00000175),
+                output_cost_per_token: Some(0.000014),
+                ..Default::default()
+            },
+        );
+        let stale = pricing::PricingService::new(stale_litellm, HashMap::new());
+
+        let selected =
+            select_local_parse_pricing(Err("network failed".to_string()), || Some(stale)).unwrap();
+
+        assert!(selected.lookup_with_source("gpt-5.2", None).is_some());
+    }
+
+    #[test]
+    fn test_select_local_parse_pricing_does_not_evaluate_stale_fallback_on_fresh_success() {
+        let fresh = Arc::new(pricing::PricingService::new(HashMap::new(), HashMap::new()));
+        let mut stale_called = false;
+
+        let selected = select_local_parse_pricing(Ok(Arc::clone(&fresh)), || {
+            stale_called = true;
+            None
+        })
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&selected, &fresh));
+        assert!(!stale_called);
     }
 
     #[test]
