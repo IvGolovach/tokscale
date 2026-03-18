@@ -536,7 +536,56 @@ mod tests {
     use serial_test::serial;
     use std::env;
     use std::fs;
+    use std::sync::Arc;
     use tempfile::TempDir;
+    use tokscale_core::pricing::PricingService;
+    use tokscale_core::TokenBreakdown as CoreTokenBreakdown;
+
+    fn current_local_parse_pricing() -> Option<Arc<PricingService>> {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(async { PricingService::get_or_init().await.ok() })
+            .or_else(|| PricingService::load_cached_any_age().map(Arc::new))
+    }
+
+    fn expected_message_cost(
+        pricing: Option<&PricingService>,
+        client: &str,
+        model_id: &str,
+        provider_id: &str,
+        tokens: CoreTokenBreakdown,
+        embedded_cost: f64,
+    ) -> f64 {
+        let calculated_cost = pricing
+            .map(|pricing| {
+                if client.eq_ignore_ascii_case("gemini") {
+                    let usage = CoreTokenBreakdown {
+                        input: tokens.input,
+                        output: tokens.output + tokens.reasoning,
+                        cache_read: 0,
+                        cache_write: 0,
+                        reasoning: 0,
+                    };
+                    pricing.calculate_cost_with_provider(model_id, Some(provider_id), &usage)
+                } else {
+                    pricing.calculate_cost_with_provider(model_id, Some(provider_id), &tokens)
+                }
+            })
+            .unwrap_or(0.0);
+
+        if calculated_cost > 0.0 {
+            calculated_cost
+        } else {
+            embedded_cost
+        }
+    }
+
+    fn assert_cost_matches(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1e-9,
+            "expected cost {expected}, got {actual}"
+        );
+    }
 
     #[test]
     fn test_client_all() {
@@ -1046,25 +1095,78 @@ after"#,
             env::set_var("HOME", temp_dir.path());
         }
 
+        let pricing = current_local_parse_pricing();
         let loader = DataLoader::new(None);
         let usage = loader
             .load(&[ClientId::RooCode], &GroupBy::Model, false)
             .unwrap();
 
+        let architect_expected = expected_message_cost(
+            pricing.as_deref(),
+            "roocode",
+            "claude-sonnet-4",
+            "anthropic",
+            CoreTokenBreakdown {
+                input: 420_000,
+                output: 120_000,
+                cache_read: 32_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            8.4,
+        ) + expected_message_cost(
+            pricing.as_deref(),
+            "roocode",
+            "claude-sonnet-4",
+            "anthropic",
+            CoreTokenBreakdown {
+                input: 90_000,
+                output: 60_000,
+                cache_read: 12_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            3.1,
+        );
+        let reviewer_expected = expected_message_cost(
+            pricing.as_deref(),
+            "roocode",
+            "claude-haiku-4",
+            "anthropic",
+            CoreTokenBreakdown {
+                input: 70_000,
+                output: 26_000,
+                cache_read: 8_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            1.8,
+        ) + expected_message_cost(
+            pricing.as_deref(),
+            "roocode",
+            "claude-haiku-4",
+            "anthropic",
+            CoreTokenBreakdown {
+                input: 22_000,
+                output: 18_000,
+                cache_read: 3_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.9,
+        );
+
         assert_eq!(usage.agents.len(), 2);
         assert_eq!(usage.agents[0].agent, "architect");
         assert_eq!(usage.agents[0].clients, "roocode");
         assert_eq!(usage.agents[0].message_count, 2);
-        assert!(usage.agents[0].cost.is_finite());
-        assert!(usage.agents[0].cost > 0.0);
+        assert_cost_matches(usage.agents[0].cost, architect_expected);
         assert_eq!(usage.agents[0].tokens.total(), 734_000);
 
         assert_eq!(usage.agents[1].agent, "reviewer");
         assert_eq!(usage.agents[1].message_count, 2);
-        assert!(usage.agents[1].cost.is_finite());
-        assert!(usage.agents[1].cost >= 0.0);
+        assert_cost_matches(usage.agents[1].cost, reviewer_expected);
         assert_eq!(usage.agents[1].tokens.total(), 147_000);
-        assert!(usage.agents[0].cost >= usage.agents[1].cost);
 
         match previous_home {
             Some(home) => unsafe { env::set_var("HOME", home) },
@@ -1091,18 +1193,33 @@ after"#,
             env::set_var("HOME", temp_dir.path());
         }
 
+        let pricing = current_local_parse_pricing();
         let loader = DataLoader::new(None);
         let usage = loader
             .load(&[ClientId::OpenCode], &GroupBy::ClientProviderModel, true)
             .unwrap();
+
+        let expected_cost = expected_message_cost(
+            pricing.as_deref(),
+            "opencode",
+            "accounts/fireworks/models/deepseek-v3-0324",
+            "fireworks",
+            CoreTokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.25,
+        );
 
         assert_eq!(usage.models.len(), 1);
         assert_eq!(usage.models[0].client, "opencode");
         assert_eq!(usage.models[0].provider, "fireworks");
         assert_eq!(usage.models[0].model, "deepseek-v3-0324");
         assert_eq!(usage.models[0].tokens.total(), 15);
-        assert!(usage.models[0].cost.is_finite());
-        assert!(usage.models[0].cost > 0.0);
+        assert_cost_matches(usage.models[0].cost, expected_cost);
 
         match previous_home {
             Some(home) => unsafe { env::set_var("HOME", home) },
