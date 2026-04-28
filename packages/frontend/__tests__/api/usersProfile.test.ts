@@ -3,6 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 const mockState = vi.hoisted(() => {
   const selectResults: Array<Array<Record<string, unknown>>> = [];
   const executeResults: Array<Array<Record<string, unknown>>> = [];
+  const limitCalls: unknown[] = [];
 
   const tables = {
     users: {
@@ -69,7 +70,10 @@ const mockState = vi.hoisted(() => {
         where: vi.fn(() => builder),
         innerJoin: vi.fn(() => builder),
         orderBy: vi.fn(() => builder),
-        limit: vi.fn(() => builder),
+        limit: vi.fn((value: unknown) => {
+          limitCalls.push(value);
+          return builder;
+        }),
         then: (resolve: (value: unknown) => unknown) => resolve(nextSelectResult()),
       };
 
@@ -89,6 +93,7 @@ const mockState = vi.hoisted(() => {
     reset() {
       selectResults.length = 0;
       executeResults.length = 0;
+      limitCalls.length = 0;
       db.select.mockClear();
       db.execute.mockClear();
       eq.mockClear();
@@ -104,6 +109,7 @@ const mockState = vi.hoisted(() => {
     pushExecuteResult(rows: Array<Record<string, unknown>>) {
       executeResults.push(rows);
     },
+    limitCalls,
   };
 });
 
@@ -114,11 +120,23 @@ vi.mock("@/lib/db", () => ({
   dailyBreakdown: mockState.tables.dailyBreakdown,
 }));
 
-vi.mock("@/lib/db/usernameLookup", () => ({
-  normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
-  usernameEqualsIgnoreCase: (username: string) =>
-    mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
-}));
+vi.mock("@/lib/db/usernameLookup", () => {
+  class AmbiguousUsernameError extends Error {}
+
+  return {
+    AmbiguousUsernameError,
+    USERNAME_LOOKUP_LIMIT: 2,
+    getSingleUsernameMatch: (rows: readonly unknown[], username: string) => {
+      if (rows.length > 1) {
+        throw new AmbiguousUsernameError(`Multiple users match username ${username} case-insensitively`);
+      }
+      return rows[0] ?? null;
+    },
+    normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
+    usernameEqualsIgnoreCase: (username: string) =>
+      mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
+  };
+});
 
 vi.mock("@/lib/submissionFreshness", async () =>
   import("../../src/lib/submissionFreshness")
@@ -199,9 +217,39 @@ describe("GET /api/users/[username]", () => {
 
     expect(response.status).toBe(200);
     expect(body.user.username).toBe("ImLunaHey");
+    expect(mockState.limitCalls[0]).toBe(2);
     expect(sqlTexts.some((text) =>
       text.toLowerCase().includes("lower(users.username) = lower(imlunahey)")
     )).toBe(true);
+  });
+
+  it("rejects ambiguous case-insensitive username matches", async () => {
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "ImLunaHey",
+        displayName: "Luna",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        id: "user-2",
+        username: "imlunahey",
+        displayName: "Luna Duplicate",
+        avatarUrl: null,
+        createdAt: "2026-01-02T00:00:00.000Z",
+      },
+    ]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/imlunahey"),
+      { params: Promise.resolve({ username: "imlunahey" }) }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(409);
+    expect(body).toEqual({ error: "Username is ambiguous" });
+    expect(mockState.limitCalls[0]).toBe(2);
   });
 
   it("returns submission freshness metadata for the latest submission", async () => {

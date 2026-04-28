@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockState = vi.hoisted(() => {
@@ -20,7 +21,9 @@ vi.mock("drizzle-orm", async (importOriginal) => ({
 }));
 
 import {
+  USERNAME_LOOKUP_LIMIT,
   normalizeUsernameCacheKey,
+  getSingleUsernameMatch,
   usernameEqualsIgnoreCase,
 } from "../../src/lib/db/usernameLookup";
 
@@ -45,5 +48,35 @@ describe("username lookup helpers", () => {
 
   it("normalizes username cache keys with ASCII case folding", () => {
     expect(normalizeUsernameCacheKey("ImLunaHey")).toBe("imlunahey");
+  });
+
+  it("uses a two-row lookup limit to detect case-colliding usernames", () => {
+    expect(USERNAME_LOOKUP_LIMIT).toBe(2);
+  });
+
+  it("returns a single username match without changing the canonical row", () => {
+    const row = { username: "ImLunaHey" };
+
+    expect(getSingleUsernameMatch([row], "imlunahey")).toBe(row);
+  });
+
+  it("rejects ambiguous case-insensitive username matches", () => {
+    expect(() =>
+      getSingleUsernameMatch(
+        [{ username: "ImLunaHey" }, { username: "imlunahey" }],
+        "imlunahey",
+      )
+    ).toThrow("Multiple users match username imlunahey case-insensitively");
+  });
+
+  it("ships a unique functional index migration for case-insensitive usernames", async () => {
+    const migration = await readFile(
+      new URL("../../src/lib/db/migrations/0005_add_case_insensitive_username_index.sql", import.meta.url),
+      "utf8",
+    );
+
+    expect(migration).toContain("CREATE UNIQUE INDEX IF NOT EXISTS");
+    expect(migration).toContain('"users_username_lower_unique"');
+    expect(migration).toContain('ON "users" (lower("username"))');
   });
 });

@@ -12,8 +12,9 @@ import {
   integer,
   index,
   unique,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 
 // ============================================================================
 // USERS
@@ -37,6 +38,7 @@ export const users = pgTable(
   },
   (table) => [
     index("idx_users_username").on(table.username),
+    uniqueIndex("users_username_lower_unique").on(sql`lower(${table.username})`),
     index("idx_users_github_id").on(table.githubId),
   ]
 );

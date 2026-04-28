@@ -104,11 +104,23 @@ vi.mock("@/lib/db", () => ({
   dailyBreakdown: mockState.tables.dailyBreakdown,
 }));
 
-vi.mock("@/lib/db/usernameLookup", () => ({
-  normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
-  usernameEqualsIgnoreCase: (username: string) =>
-    mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
-}));
+vi.mock("@/lib/db/usernameLookup", () => {
+  class AmbiguousUsernameError extends Error {}
+
+  return {
+    AmbiguousUsernameError,
+    USERNAME_LOOKUP_LIMIT: 2,
+    getSingleUsernameMatch: (rows: readonly unknown[], username: string) => {
+      if (rows.length > 1) {
+        throw new AmbiguousUsernameError(`Multiple users match username ${username} case-insensitively`);
+      }
+      return rows[0] ?? null;
+    },
+    normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
+    usernameEqualsIgnoreCase: (username: string) =>
+      mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
+  };
+});
 
 vi.mock("@/lib/submissionFreshness", async () =>
   import("../../src/lib/submissionFreshness")
@@ -317,5 +329,28 @@ describe("period leaderboard data", () => {
       totalTokens: 250,
       totalCost: 3,
     });
+  });
+
+  it("rejects ambiguous case-insensitive period user rank matches", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-07T18:45:00Z"));
+    mockState.setPeriodRows([
+      ...rows,
+      {
+        userId: "user-alice-duplicate",
+        username: "ALICE",
+        displayName: "Alice Duplicate",
+        avatarUrl: null,
+        tokens: 50,
+        cost: 0.5,
+        updatedAt: "2026-03-07T11:00:00.000Z",
+        cliVersion: "1.5.0",
+        schemaVersion: 1,
+      },
+    ]);
+
+    await expect(getUserRank("alice", "week", "tokens")).rejects.toThrow(
+      "Multiple users match username alice case-insensitively"
+    );
   });
 });

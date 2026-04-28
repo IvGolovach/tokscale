@@ -1,6 +1,8 @@
 import { unstable_cache } from "next/cache";
 import { db, users, submissions, dailyBreakdown } from "@/lib/db";
 import {
+  USERNAME_LOOKUP_LIMIT,
+  getSingleUsernameMatch,
   normalizeUsernameCacheKey,
   usernameEqualsIgnoreCase,
 } from "@/lib/db/usernameLookup";
@@ -216,17 +218,18 @@ function buildPeriodUserRank(
 ): LeaderboardUser | null {
   const aggregatedUsers = aggregatePeriodRows(rows, sortBy);
   const usernameCacheKey = normalizeUsernameCacheKey(username);
-  const userIndex = aggregatedUsers.findIndex(
+  const matchingUsers = aggregatedUsers.filter(
     (user) => normalizeUsernameCacheKey(user.username) === usernameCacheKey
   );
+  const user = getSingleUsernameMatch(matchingUsers, username);
 
-  if (userIndex === -1) {
+  if (!user) {
     return null;
   }
 
   return {
-    ...aggregatedUsers[userIndex],
-    rank: userIndex + 1,
+    ...user,
+    rank: aggregatedUsers.indexOf(user) + 1,
   };
 }
 
@@ -505,13 +508,13 @@ async function fetchUserRank(
     .select({ id: users.id, username: users.username, displayName: users.displayName, avatarUrl: users.avatarUrl })
     .from(users)
     .where(usernameEqualsIgnoreCase(username))
-    .limit(1);
+    .limit(USERNAME_LOOKUP_LIMIT);
 
-  if (userResult.length === 0) {
+  const user = getSingleUsernameMatch(userResult, username);
+
+  if (!user) {
     return null;
   }
-
-  const user = userResult[0];
 
   const userStatsResult = await db
     .select({

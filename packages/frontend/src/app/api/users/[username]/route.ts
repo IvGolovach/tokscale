@@ -1,7 +1,12 @@
 import { NextResponse } from "next/server";
 import { db, users, submissions, dailyBreakdown } from "@/lib/db";
 import { eq, desc, sql, and, gte } from "drizzle-orm";
-import { usernameEqualsIgnoreCase } from "@/lib/db/usernameLookup";
+import {
+  AmbiguousUsernameError,
+  USERNAME_LOOKUP_LIMIT,
+  getSingleUsernameMatch,
+  usernameEqualsIgnoreCase,
+} from "@/lib/db/usernameLookup";
 import { buildSubmissionFreshness } from "@/lib/submissionFreshness";
 
 const LEGACY_CLIENT_ALIASES: Record<string, string> = { kilocode: "kilo" };
@@ -20,7 +25,7 @@ export async function GET(_request: Request, { params }: RouteParams) {
     const { username } = await params;
 
     // Find user
-    const [user] = await db
+    const matchingUsers = await db
       .select({
         id: users.id,
         username: users.username,
@@ -30,7 +35,8 @@ export async function GET(_request: Request, { params }: RouteParams) {
       })
       .from(users)
       .where(usernameEqualsIgnoreCase(username))
-      .limit(1);
+      .limit(USERNAME_LOOKUP_LIMIT);
+    const user = getSingleUsernameMatch(matchingUsers, username);
 
     if (!user) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
@@ -450,6 +456,13 @@ export async function GET(_request: Request, { params }: RouteParams) {
       contributions: graphContributions,
     });
   } catch (error) {
+    if (error instanceof AmbiguousUsernameError) {
+      return NextResponse.json(
+        { error: "Username is ambiguous" },
+        { status: 409 }
+      );
+    }
+
     console.error("Profile error:", error);
     return NextResponse.json(
       { error: "Failed to fetch profile" },

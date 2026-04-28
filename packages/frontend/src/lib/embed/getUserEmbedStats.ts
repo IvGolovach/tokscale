@@ -1,6 +1,8 @@
 import { unstable_cache } from "next/cache";
 import { db, users, submissions, dailyBreakdown } from "@/lib/db";
 import {
+  USERNAME_LOOKUP_LIMIT,
+  getSingleUsernameMatch,
   normalizeUsernameCacheKey,
   usernameEqualsIgnoreCase,
 } from "@/lib/db/usernameLookup";
@@ -32,7 +34,7 @@ export interface UserEmbedStats {
 }
 
 async function fetchUserEmbedStats(username: string, sortBy: EmbedSortBy): Promise<UserEmbedStats | null> {
-  const [result] = await db
+  const matchingUsers = await db
     .select({
       id: users.id,
       username: users.username,
@@ -46,7 +48,8 @@ async function fetchUserEmbedStats(username: string, sortBy: EmbedSortBy): Promi
     .from(users)
     .leftJoin(submissions, eq(submissions.userId, users.id))
     .where(usernameEqualsIgnoreCase(username))
-    .limit(1);
+    .limit(USERNAME_LOOKUP_LIMIT);
+  const result = getSingleUsernameMatch(matchingUsers, username);
 
   if (!result) {
     return null;
@@ -110,11 +113,12 @@ export function getUserEmbedStats(username: string, sortBy: EmbedSortBy = "token
 }
 
 async function fetchUserEmbedContributions(username: string): Promise<EmbedContributionDay[] | null> {
-  const [user] = await db
+  const matchingUsers = await db
     .select({ id: users.id })
     .from(users)
     .where(usernameEqualsIgnoreCase(username))
-    .limit(1);
+    .limit(USERNAME_LOOKUP_LIMIT);
+  const user = getSingleUsernameMatch(matchingUsers, username);
 
   if (!user) return null;
 
