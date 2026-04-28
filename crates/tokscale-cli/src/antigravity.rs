@@ -832,7 +832,7 @@ fn process_executable_path(pid: u32) -> Option<PathBuf> {
                 }
             }
         }
-        return None;
+        None
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
