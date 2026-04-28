@@ -1,5 +1,9 @@
 import { unstable_cache } from "next/cache";
 import { db, users, submissions, dailyBreakdown } from "@/lib/db";
+import {
+  normalizeUsernameCacheKey,
+  usernameEqualsIgnoreCase,
+} from "@/lib/db/usernameLookup";
 import { eq, desc, sql, and, gte, lte } from "drizzle-orm";
 import { buildSubmissionFreshness } from "@/lib/submissionFreshness";
 import type { LeaderboardData, LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
@@ -211,7 +215,10 @@ function buildPeriodUserRank(
   sortBy: SortBy = "tokens"
 ): LeaderboardUser | null {
   const aggregatedUsers = aggregatePeriodRows(rows, sortBy);
-  const userIndex = aggregatedUsers.findIndex((user) => user.username === username);
+  const usernameCacheKey = normalizeUsernameCacheKey(username);
+  const userIndex = aggregatedUsers.findIndex(
+    (user) => normalizeUsernameCacheKey(user.username) === usernameCacheKey
+  );
 
   if (userIndex === -1) {
     return null;
@@ -497,7 +504,7 @@ async function fetchUserRank(
   const userResult = await db
     .select({ id: users.id, username: users.username, displayName: users.displayName, avatarUrl: users.avatarUrl })
     .from(users)
-    .where(eq(users.username, username))
+    .where(usernameEqualsIgnoreCase(username))
     .limit(1);
 
   if (userResult.length === 0) {
@@ -580,11 +587,13 @@ export function getUserRank(
   period: Period = "all",
   sortBy: SortBy = "tokens"
 ): Promise<LeaderboardUser | null> {
+  const usernameCacheKey = normalizeUsernameCacheKey(username);
+
   return unstable_cache(
     () => fetchUserRank(username, period, sortBy),
-    [`user-rank:${username}:${period}:${sortBy}`],
+    [`user-rank:${usernameCacheKey}:${period}:${sortBy}`],
     {
-      tags: ["leaderboard", "user-rank", `user-rank:${username}`],
+      tags: ["leaderboard", "user-rank", `user-rank:${usernameCacheKey}`],
       revalidate: 60,
     }
   )();

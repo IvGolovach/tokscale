@@ -59,6 +59,10 @@ vi.mock("@/lib/db/helpers", () => ({
   mergeTimestampMs: vi.fn(),
 }));
 
+vi.mock("@/lib/db/usernameLookup", () => ({
+  normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
+}));
+
 type ModuleExports = typeof import("../../src/app/api/submit/route");
 
 let POST: ModuleExports["POST"];

@@ -101,6 +101,12 @@ vi.mock("@/lib/db", () => ({
   dailyBreakdown: mockState.tables.dailyBreakdown,
 }));
 
+vi.mock("@/lib/db/usernameLookup", () => ({
+  normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
+  usernameEqualsIgnoreCase: (username: string) =>
+    mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
+}));
+
 vi.mock("@/lib/submissionFreshness", async () =>
   import("../../src/lib/submissionFreshness")
 );
@@ -263,5 +269,39 @@ describe("all-time leaderboard freshness queries", () => {
         isStale: false,
       },
     });
+  });
+
+  it("looks up all-time user rank usernames case-insensitively", async () => {
+    mockState.pushAwaitedResult([
+      {
+        id: "user-imlunahey",
+        username: "ImLunaHey",
+        displayName: "Luna",
+        avatarUrl: null,
+      },
+    ]);
+    mockState.pushAwaitedResult([
+      {
+        totalTokens: 1200,
+        totalCost: 12,
+        submissionCount: 1,
+        lastSubmission: "2026-03-12T09:00:00.000Z",
+        cliVersion: "1.9.0",
+        schemaVersion: 1,
+      },
+    ]);
+    mockState.pushAwaitedResult([{ count: 0 }]);
+
+    const rank = await getUserRank("imlunahey", "all", "tokens");
+    const sqlTexts = serializeSqlCalls();
+
+    expect(rank).toMatchObject({
+      rank: 1,
+      username: "ImLunaHey",
+      totalTokens: 1200,
+    });
+    expect(sqlTexts.some((text) =>
+      text.toLowerCase().includes("lower(users.username) = lower(imlunahey)")
+    )).toBe(true);
   });
 });

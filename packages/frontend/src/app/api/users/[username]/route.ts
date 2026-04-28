@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { db, users, submissions, dailyBreakdown } from "@/lib/db";
 import { eq, desc, sql, and, gte } from "drizzle-orm";
+import { usernameEqualsIgnoreCase } from "@/lib/db/usernameLookup";
 import { buildSubmissionFreshness } from "@/lib/submissionFreshness";
 
 const LEGACY_CLIENT_ALIASES: Record<string, string> = { kilocode: "kilo" };
@@ -28,7 +29,7 @@ export async function GET(_request: Request, { params }: RouteParams) {
         createdAt: users.createdAt,
       })
       .from(users)
-      .where(eq(users.username, username))
+      .where(usernameEqualsIgnoreCase(username))
       .limit(1);
 
     if (!user) {

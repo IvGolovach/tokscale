@@ -82,6 +82,10 @@ vi.mock("@/lib/db", () => ({
   },
 }));
 
+vi.mock("@/lib/db/usernameLookup", () => ({
+  normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
+}));
+
 type ModuleExports = typeof import("../../src/app/api/settings/submitted-data/route");
 
 let DELETE: ModuleExports["DELETE"];
@@ -120,7 +124,7 @@ describe("DELETE /api/settings/submitted-data", () => {
   it("deletes submitted data and revalidates public caches", async () => {
     mockState.getSession.mockResolvedValue({
       id: "user-1",
-      username: "alice",
+      username: "Alice",
       displayName: "Alice",
       avatarUrl: null,
       isAdmin: false,
@@ -153,9 +157,9 @@ describe("DELETE /api/settings/submitted-data", () => {
     expect(mockState.revalidateTag).toHaveBeenNthCalledWith(7, "embed-user:alice:cost", "max");
     expect(mockState.revalidatePath).toHaveBeenNthCalledWith(1, "/leaderboard");
     expect(mockState.revalidatePath).toHaveBeenNthCalledWith(2, "/profile");
-    expect(mockState.revalidatePath).toHaveBeenNthCalledWith(3, "/u/alice");
-    expect(mockState.revalidatePath).toHaveBeenNthCalledWith(4, "/api/users/alice");
-    expect(mockState.revalidatePath).toHaveBeenNthCalledWith(5, "/api/embed/alice/svg");
+    expect(mockState.revalidatePath).toHaveBeenNthCalledWith(3, "/u/Alice");
+    expect(mockState.revalidatePath).toHaveBeenNthCalledWith(4, "/api/users/Alice");
+    expect(mockState.revalidatePath).toHaveBeenNthCalledWith(5, "/api/embed/Alice/svg");
   });
 
   it("returns success and still revalidates caches when no submitted data exists", async () => {

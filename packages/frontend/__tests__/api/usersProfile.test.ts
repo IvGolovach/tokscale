@@ -48,9 +48,11 @@ const mockState = vi.hoisted(() => {
   const and = vi.fn(() => "and");
   const gte = vi.fn(() => "gte");
   const sql = Object.assign(
-    () => ({
+    vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
+      strings: Array.from(strings),
+      values,
       as: () => ({}),
-    }),
+    })),
     {
       raw: vi.fn(),
     }
@@ -93,6 +95,7 @@ const mockState = vi.hoisted(() => {
       desc.mockClear();
       and.mockClear();
       gte.mockClear();
+      sql.mockClear();
       sql.raw.mockClear();
     },
     pushSelectResult(rows: Array<Record<string, unknown>>) {
@@ -111,6 +114,12 @@ vi.mock("@/lib/db", () => ({
   dailyBreakdown: mockState.tables.dailyBreakdown,
 }));
 
+vi.mock("@/lib/db/usernameLookup", () => ({
+  normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
+  usernameEqualsIgnoreCase: (username: string) =>
+    mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
+}));
+
 vi.mock("@/lib/submissionFreshness", async () =>
   import("../../src/lib/submissionFreshness")
 );
@@ -127,6 +136,18 @@ type ModuleExports = typeof import("../../src/app/api/users/[username]/route");
 
 let GET: ModuleExports["GET"];
 
+function serializeSqlCalls(): string[] {
+  return mockState.sql.mock.calls.map((call) => {
+    const [strings, ...values] = call as [TemplateStringsArray, ...unknown[]];
+    const textParts = Array.from(strings);
+
+    return textParts.reduce((text, part, index) => {
+      const nextValue = index < values.length ? String(values[index]) : "";
+      return `${text}${part}${nextValue}`;
+    }, "");
+  });
+}
+
 beforeAll(async () => {
   const routeModule = await import("../../src/app/api/users/[username]/route");
   GET = routeModule.GET;
@@ -141,6 +162,48 @@ afterEach(() => {
 });
 
 describe("GET /api/users/[username]", () => {
+  it("looks up usernames case-insensitively and returns the canonical username", async () => {
+    mockState.pushSelectResult([
+      {
+        id: "user-imlunahey",
+        username: "ImLunaHey",
+        displayName: "Luna",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 0,
+        totalCost: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 0,
+        earliestDate: null,
+        latestDate: null,
+      },
+    ]);
+    mockState.pushSelectResult([]);
+    mockState.pushSelectResult([]);
+    mockState.pushExecuteResult([]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/imlunahey"),
+      { params: Promise.resolve({ username: "imlunahey" }) }
+    );
+    const body = await response.json();
+    const sqlTexts = serializeSqlCalls();
+
+    expect(response.status).toBe(200);
+    expect(body.user.username).toBe("ImLunaHey");
+    expect(sqlTexts.some((text) =>
+      text.toLowerCase().includes("lower(users.username) = lower(imlunahey)")
+    )).toBe(true);
+  });
+
   it("returns submission freshness metadata for the latest submission", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-11T12:00:00.000Z"));

@@ -16,6 +16,7 @@ import {
   mergeTimestampMs,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
+import { normalizeUsernameCacheKey } from "@/lib/db/usernameLookup";
 
 function normalizeSubmissionData(data: unknown): void {
   if (!data || typeof data !== "object") return;
@@ -423,10 +424,12 @@ export async function POST(request: Request) {
     });
 
     try {
+      const usernameCacheKey = normalizeUsernameCacheKey(tokenRecord.username);
+
       revalidateTag("leaderboard", "max");
-      revalidateTag(`user:${tokenRecord.username}`, "max");
+      revalidateTag(`user:${usernameCacheKey}`, "max");
       revalidateTag("user-rank", "max");
-      revalidateTag(`user-rank:${tokenRecord.username}`, "max");
+      revalidateTag(`user-rank:${usernameCacheKey}`, "max");
     } catch (e) {
       console.error("Cache invalidation failed:", e);
     }

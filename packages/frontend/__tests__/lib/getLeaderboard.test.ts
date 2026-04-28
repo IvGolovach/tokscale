@@ -35,9 +35,11 @@ const mockState = vi.hoisted(() => {
   const gte = vi.fn(() => "gte");
   const lte = vi.fn(() => "lte");
   const sql = Object.assign(
-    () => ({
+    vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => ({
+      strings: Array.from(strings),
+      values,
       as: () => ({}),
-    }),
+    })),
     {
       raw: vi.fn(),
     }
@@ -81,6 +83,7 @@ const mockState = vi.hoisted(() => {
       and.mockClear();
       gte.mockClear();
       lte.mockClear();
+      sql.mockClear();
       sql.raw.mockClear();
     },
     setPeriodRows(rows: Array<Record<string, unknown>>) {
@@ -99,6 +102,12 @@ vi.mock("@/lib/db", () => ({
   users: mockState.tables.users,
   submissions: mockState.tables.submissions,
   dailyBreakdown: mockState.tables.dailyBreakdown,
+}));
+
+vi.mock("@/lib/db/usernameLookup", () => ({
+  normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
+  usernameEqualsIgnoreCase: (username: string) =>
+    mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
 }));
 
 vi.mock("@/lib/submissionFreshness", async () =>
@@ -292,6 +301,21 @@ describe("period leaderboard data", () => {
         schemaVersion: 1,
         isStale: false,
       },
+    });
+  });
+
+  it("matches period user rank usernames case-insensitively", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-07T18:45:00Z"));
+    mockState.setPeriodRows(rows);
+
+    const rank = await getUserRank("ALICE", "week", "tokens");
+
+    expect(rank).toMatchObject({
+      rank: 2,
+      username: "alice",
+      totalTokens: 250,
+      totalCost: 3,
     });
   });
 });

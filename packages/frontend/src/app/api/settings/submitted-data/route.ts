@@ -4,6 +4,7 @@ import { eq } from "drizzle-orm";
 import { getSession } from "@/lib/auth/session";
 import { authenticatePersonalToken } from "@/lib/auth/personalTokens";
 import { db, submissions } from "@/lib/db";
+import { normalizeUsernameCacheKey } from "@/lib/db/usernameLookup";
 
 async function resolveUser(request: Request): Promise<{ id: string; username: string } | null> {
   const authHeader = request.headers.get("Authorization");
@@ -36,13 +37,15 @@ export async function DELETE(request: Request) {
       .returning({ id: submissions.id });
 
     try {
+      const usernameCacheKey = normalizeUsernameCacheKey(user.username);
+
       revalidateTag("leaderboard", "max");
-      revalidateTag(`user:${user.username}`, "max");
+      revalidateTag(`user:${usernameCacheKey}`, "max");
       revalidateTag("user-rank", "max");
-      revalidateTag(`user-rank:${user.username}`, "max");
-      revalidateTag(`embed-user:${user.username}`, "max");
-      revalidateTag(`embed-user:${user.username}:tokens`, "max");
-      revalidateTag(`embed-user:${user.username}:cost`, "max");
+      revalidateTag(`user-rank:${usernameCacheKey}`, "max");
+      revalidateTag(`embed-user:${usernameCacheKey}`, "max");
+      revalidateTag(`embed-user:${usernameCacheKey}:tokens`, "max");
+      revalidateTag(`embed-user:${usernameCacheKey}:cost`, "max");
 
       revalidatePath("/leaderboard");
       revalidatePath("/profile");
