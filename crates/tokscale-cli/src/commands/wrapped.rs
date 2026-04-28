@@ -1550,6 +1550,10 @@ fn format_model_name(model: &str) -> String {
 
     cleaned = strip_date_suffix(cleaned);
 
+    if let Some(display) = format_gpt_5_series_model_name(&cleaned, &suffix) {
+        return display;
+    }
+
     let normalized = cleaned
         .to_lowercase()
         .chars()
@@ -1702,6 +1706,49 @@ fn format_model_name(model: &str) -> String {
     }
 }
 
+fn format_gpt_5_series_model_name(model: &str, suffix: &str) -> Option<String> {
+    let lower = model.to_lowercase();
+    let model_part = lower
+        .rsplit(['/', ':'])
+        .find(|part| !part.is_empty())
+        .unwrap_or(&lower);
+
+    let mut parts = model_part.split(['-', '_']).filter(|part| !part.is_empty());
+
+    if parts.next()? != "gpt" {
+        return None;
+    }
+
+    let version = parts.next()?;
+    if version != "5" && !version.starts_with("5.") {
+        return None;
+    }
+
+    let mut display = format!("GPT-{}", version);
+    for part in parts {
+        if part.starts_with("20") && part.chars().all(|ch| ch.is_ascii_digit()) {
+            break;
+        }
+
+        match part {
+            "pro" => display.push_str(" Pro"),
+            "mini" => display.push_str(" Mini"),
+            "nano" => display.push_str(" Nano"),
+            "codex" => display.push_str(" Codex"),
+            "max" => display.push_str(" Max"),
+            "spark" => display.push_str(" Spark"),
+            "chat" => display.push_str(" Chat"),
+            "preview" => display.push_str(" Preview"),
+            "latest" => display.push_str(" Latest"),
+            _ if part.chars().all(|ch| ch.is_ascii_digit()) => break,
+            _ => {}
+        }
+    }
+
+    display.push_str(suffix);
+    Some(display)
+}
+
 fn exact_model_display_name(model: &str) -> Option<&'static str> {
     match model {
         "claude-sonnet-4-20250514" => Some("Claude Sonnet 4"),
@@ -1731,6 +1778,8 @@ fn split_quality_suffix(model: &str) -> (String, String) {
     let lower = model.to_lowercase();
 
     for (needle, label) in [
+        ("-xhigh", " XHigh"),
+        ("_xhigh", " XHigh"),
         ("-high", " High"),
         ("_high", " High"),
         ("-medium", " Medium"),
@@ -2025,6 +2074,14 @@ mod tests {
     }
 
     #[test]
+    fn test_split_quality_suffix_xhigh() {
+        assert_eq!(
+            split_quality_suffix("model-xhigh"),
+            ("model".to_string(), " XHigh".to_string())
+        );
+    }
+
+    #[test]
     fn test_split_quality_suffix_medium() {
         assert_eq!(
             split_quality_suffix("model-medium"),
@@ -2104,6 +2161,12 @@ mod tests {
         assert_eq!(format_model_name("gpt-4o"), "GPT-4o");
         assert_eq!(format_model_name("gpt-4o-mini"), "GPT-4o Mini");
         assert_eq!(format_model_name("gpt-5"), "GPT-5");
+        assert_eq!(format_model_name("gpt-5.5"), "GPT-5.5");
+        assert_eq!(
+            format_model_name("openai/gpt-5.5-pro-20260423"),
+            "GPT-5.5 Pro"
+        );
+        assert_eq!(format_model_name("gpt-5.5-xhigh"), "GPT-5.5 XHigh");
     }
 
     #[test]

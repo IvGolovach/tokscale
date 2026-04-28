@@ -50,7 +50,10 @@ const RESELLER_PROVIDER_PREFIXES: &[&str] = &[
 const FUZZY_BLOCKLIST: &[&str] = &["auto", "mini", "chat", "base"];
 
 const MAX_LOOKUP_CACHE_ENTRIES: usize = 512;
-const TIERED_PRICING_THRESHOLD_TOKENS: f64 = 200_000.0;
+const TIERED_PRICING_THRESHOLD_128K_TOKENS: f64 = 128_000.0;
+const TIERED_PRICING_THRESHOLD_200K_TOKENS: f64 = 200_000.0;
+const TIERED_PRICING_THRESHOLD_256K_TOKENS: f64 = 256_000.0;
+const TIERED_PRICING_THRESHOLD_272K_TOKENS: f64 = 272_000.0;
 
 const MIN_FUZZY_MATCH_LEN: usize = 5;
 
@@ -754,16 +757,31 @@ pub fn compute_cost(
     reasoning: i64,
 ) -> f64 {
     let safe_price = |opt: Option<f64>| opt.filter(|v| is_valid_price_value(*v)).unwrap_or(0.0);
-    let tiered_cost = |tokens: f64, base: Option<f64>, above_200k: Option<f64>| {
+    let tiered_cost = |tokens: f64, base: Option<f64>, tiers: &[(f64, Option<f64>)]| {
         let base_price = safe_price(base);
-        let above_price = above_200k.filter(|v| is_valid_price_value(*v));
-        if tokens > TIERED_PRICING_THRESHOLD_TOKENS {
-            if let Some(above_price) = above_price {
-                return TIERED_PRICING_THRESHOLD_TOKENS * base_price
-                    + (tokens - TIERED_PRICING_THRESHOLD_TOKENS) * above_price;
+        let mut cost = 0.0;
+        let mut lower_bound = 0.0;
+        let mut active_price = base_price;
+
+        for (threshold, tier_price) in tiers {
+            let Some(tier_price) = tier_price.filter(|v| is_valid_price_value(*v)) else {
+                continue;
+            };
+
+            if !threshold.is_finite() || *threshold <= lower_bound {
+                continue;
             }
+
+            if tokens <= *threshold {
+                return cost + (tokens - lower_bound).max(0.0) * active_price;
+            }
+
+            cost += (*threshold - lower_bound) * active_price;
+            lower_bound = *threshold;
+            active_price = tier_price;
         }
-        tokens * base_price
+
+        cost + (tokens - lower_bound).max(0.0) * active_price
     };
 
     let input_clamped = input.max(0) as f64;
@@ -774,22 +792,68 @@ pub fn compute_cost(
     let input_cost = tiered_cost(
         input_clamped,
         pricing.input_cost_per_token,
-        pricing.input_cost_per_token_above_200k_tokens,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                pricing.input_cost_per_token_above_128k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.input_cost_per_token_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                pricing.input_cost_per_token_above_256k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                pricing.input_cost_per_token_above_272k_tokens,
+            ),
+        ],
     );
     let output_cost = tiered_cost(
         output_clamped,
         pricing.output_cost_per_token,
-        pricing.output_cost_per_token_above_200k_tokens,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_128K_TOKENS,
+                pricing.output_cost_per_token_above_128k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.output_cost_per_token_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_256K_TOKENS,
+                pricing.output_cost_per_token_above_256k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                pricing.output_cost_per_token_above_272k_tokens,
+            ),
+        ],
     );
     let cache_read_cost = tiered_cost(
         cache_read_clamped,
         pricing.cache_read_input_token_cost,
-        pricing.cache_read_input_token_cost_above_200k_tokens,
+        &[
+            (
+                TIERED_PRICING_THRESHOLD_200K_TOKENS,
+                pricing.cache_read_input_token_cost_above_200k_tokens,
+            ),
+            (
+                TIERED_PRICING_THRESHOLD_272K_TOKENS,
+                pricing.cache_read_input_token_cost_above_272k_tokens,
+            ),
+        ],
     );
     let cache_write_cost = tiered_cost(
         cache_write_clamped,
         pricing.cache_creation_input_token_cost,
-        pricing.cache_creation_input_token_cost_above_200k_tokens,
+        &[(
+            TIERED_PRICING_THRESHOLD_200K_TOKENS,
+            pricing.cache_creation_input_token_cost_above_200k_tokens,
+        )],
     );
 
     input_cost + output_cost + cache_read_cost + cache_write_cost
@@ -986,9 +1050,16 @@ fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
         pricing.output_cost_per_token,
         pricing.cache_read_input_token_cost,
         pricing.cache_creation_input_token_cost,
+        pricing.input_cost_per_token_above_128k_tokens,
         pricing.input_cost_per_token_above_200k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
         pricing.output_cost_per_token_above_200k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
         pricing.cache_read_input_token_cost_above_200k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
         pricing.cache_creation_input_token_cost_above_200k_tokens,
     ]
     .into_iter()
@@ -997,9 +1068,16 @@ fn has_any_usable_pricing(pricing: &ModelPricing) -> bool {
 
 fn has_any_valid_above_tier_value(pricing: &ModelPricing) -> bool {
     [
+        pricing.input_cost_per_token_above_128k_tokens,
         pricing.input_cost_per_token_above_200k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
         pricing.output_cost_per_token_above_200k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
         pricing.cache_read_input_token_cost_above_200k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
         pricing.cache_creation_input_token_cost_above_200k_tokens,
     ]
     .into_iter()
@@ -1011,11 +1089,35 @@ fn has_meaningful_tier_support(pricing: &ModelPricing) -> bool {
     [
         (
             pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_128k_tokens,
+        ),
+        (
+            pricing.input_cost_per_token,
             pricing.input_cost_per_token_above_200k_tokens,
+        ),
+        (
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_256k_tokens,
+        ),
+        (
+            pricing.input_cost_per_token,
+            pricing.input_cost_per_token_above_272k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_128k_tokens,
         ),
         (
             pricing.output_cost_per_token,
             pricing.output_cost_per_token_above_200k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_256k_tokens,
+        ),
+        (
+            pricing.output_cost_per_token,
+            pricing.output_cost_per_token_above_272k_tokens,
         ),
     ]
     .into_iter()
@@ -1409,6 +1511,19 @@ mod tests {
                 input_cost_per_token: Some(0.00000175),
                 output_cost_per_token: Some(0.000014),
                 cache_read_input_token_cost: Some(1.75e-7),
+                cache_creation_input_token_cost: None,
+                ..Default::default()
+            },
+        );
+        m.insert(
+            "gpt-5.5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000005),
+                input_cost_per_token_above_272k_tokens: Some(0.000010),
+                output_cost_per_token: Some(0.000030),
+                output_cost_per_token_above_272k_tokens: Some(0.000045),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_272k_tokens: Some(0.000001),
                 cache_creation_input_token_cost: None,
                 ..Default::default()
             },
@@ -2108,6 +2223,14 @@ mod tests {
     }
 
     #[test]
+    fn test_exact_match_gpt_5_5_litellm() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.5").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.5");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
     fn test_exact_match_openrouter() {
         let lookup = create_lookup();
         let result = lookup.lookup("z-ai/glm-4.7").unwrap();
@@ -2152,6 +2275,14 @@ mod tests {
         let lookup = create_lookup();
         let result = lookup.lookup("gpt-5.2-xhigh").unwrap();
         assert_eq!(result.matched_key, "gpt-5.2");
+        assert_eq!(result.source, "LiteLLM");
+    }
+
+    #[test]
+    fn test_tier_suffix_xhigh_gpt_5_5() {
+        let lookup = create_lookup();
+        let result = lookup.lookup("gpt-5.5-xhigh").unwrap();
+        assert_eq!(result.matched_key, "gpt-5.5");
         assert_eq!(result.source, "LiteLLM");
     }
 
@@ -2692,6 +2823,49 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_cost_tiered_above_272k_splits_gpt_5_5_tokens() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000005,
+                "input_cost_per_token_above_272k_tokens": 0.000010,
+                "output_cost_per_token": 0.000030,
+                "output_cost_per_token_above_272k_tokens": 0.000045,
+                "cache_read_input_token_cost": 0.0000005,
+                "cache_read_input_token_cost_above_272k_tokens": 0.000001
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 272_001, 272_001, 272_001, 0, 0);
+        let expected = (272_000.0 * 0.000005 + 1.0 * 0.000010)
+            + (272_000.0 * 0.000030 + 1.0 * 0.000045)
+            + (272_000.0 * 0.0000005 + 1.0 * 0.000001);
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_compute_cost_tiered_uses_multiple_thresholds_in_order() {
+        let pricing: ModelPricing = serde_json::from_str(
+            r#"{
+                "input_cost_per_token": 0.000001,
+                "input_cost_per_token_above_128k_tokens": 0.000002,
+                "input_cost_per_token_above_256k_tokens": 0.000003,
+                "input_cost_per_token_above_272k_tokens": 0.000004
+            }"#,
+        )
+        .unwrap();
+
+        let cost = compute_cost(&pricing, 300_000, 0, 0, 0, 0);
+        let expected = (128_000.0 * 0.000001)
+            + (128_000.0 * 0.000002)
+            + (16_000.0 * 0.000003)
+            + (28_000.0 * 0.000004);
+
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_compute_cost_tiered_is_applied_per_bucket() {
         let pricing: ModelPricing = serde_json::from_str(
             r#"{
@@ -3064,6 +3238,7 @@ mod tests {
                 cache_read_input_token_cost_above_200k_tokens: Some(0.000002),
                 cache_creation_input_token_cost: Some(0.000003),
                 cache_creation_input_token_cost_above_200k_tokens: Some(0.000004),
+                ..Default::default()
             },
         );
 
@@ -3165,6 +3340,7 @@ mod tests {
                 cache_read_input_token_cost_above_200k_tokens: Some(0.0000002),
                 cache_creation_input_token_cost: Some(0.0000003),
                 cache_creation_input_token_cost_above_200k_tokens: Some(0.0000004),
+                ..Default::default()
             },
         );
 

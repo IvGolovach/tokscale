@@ -1293,7 +1293,7 @@ Pricing includes:
 - Cache read tokens (discounted)
 - Cache write tokens
 - Reasoning tokens (for models like o1)
-- Tiered pricing (above 200k tokens)
+- Model-specific tiered pricing (for example, above 200k or 272k tokens)
 
 ## Contributing
 
