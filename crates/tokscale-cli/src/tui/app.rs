@@ -529,8 +529,10 @@ impl App {
     pub fn handle_resize(&mut self, width: u16, height: u16) {
         self.terminal_width = width;
         self.terminal_height = height;
-        // Ensure at least 1 visible item to prevent division/slice issues
-        self.max_visible_items = (height.saturating_sub(10) as usize).max(1);
+    }
+
+    pub(crate) fn set_max_visible_items(&mut self, max_visible_items: usize) {
+        self.max_visible_items = max_visible_items.max(1);
         self.clamp_selection();
     }
 
@@ -1731,6 +1733,22 @@ mod tests {
         assert_eq!(app.scroll_offset, 0);
     }
 
+    #[test]
+    fn test_overview_scroll_keeps_rendered_capacity_after_resize() {
+        let mut app = make_app_with_models(33);
+        app.current_tab = Tab::Overview;
+        app.set_max_visible_items(9);
+
+        for _ in 0..32 {
+            app.move_selection_down();
+            app.handle_resize(120, 40);
+            app.set_max_visible_items(9);
+        }
+
+        assert_eq!(app.selected_index, 32);
+        assert_eq!(app.scroll_offset, 24);
+    }
+
     // ── handle_key_event: theme ─────────────────────────────────────
 
     #[test]
@@ -1943,7 +1961,7 @@ mod tests {
         app.handle_resize(120, 40);
         assert_eq!(app.terminal_width, 120);
         assert_eq!(app.terminal_height, 40);
-        assert_eq!(app.max_visible_items, 30);
+        assert_eq!(app.max_visible_items, 20);
     }
 
     #[test]
@@ -1952,18 +1970,34 @@ mod tests {
         app.handle_resize(40, 12);
         assert_eq!(app.terminal_width, 40);
         assert_eq!(app.terminal_height, 12);
-        assert_eq!(app.max_visible_items, 2);
+        assert_eq!(app.max_visible_items, 20);
     }
 
     #[test]
-    fn test_handle_resize_clamps_selection() {
+    fn test_handle_resize_preserves_rendered_capacity() {
         let mut app = make_app_with_models(5);
         app.selected_index = 4;
-        app.scroll_offset = 3;
-        app.max_visible_items = 20;
+        app.scroll_offset = 2;
+        app.max_visible_items = 3;
 
         app.handle_resize(80, 24);
-        assert!(app.selected_index <= 4);
+
+        assert_eq!(app.max_visible_items, 3);
+        assert_eq!(app.selected_index, 4);
+        assert_eq!(app.scroll_offset, 2);
+    }
+
+    #[test]
+    fn test_set_max_visible_items_clamps_scroll_offset() {
+        let mut app = make_app_with_models(10);
+        app.selected_index = 9;
+        app.scroll_offset = 9;
+
+        app.set_max_visible_items(3);
+
+        assert_eq!(app.max_visible_items, 3);
+        assert_eq!(app.selected_index, 9);
+        assert_eq!(app.scroll_offset, 7);
     }
 
     // ── on_tick ─────────────────────────────────────────────────────

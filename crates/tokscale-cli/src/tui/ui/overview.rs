@@ -66,7 +66,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let list_area_height = chunks[2].height.saturating_sub(2);
     let items_per_page = ((list_area_height / 2) as usize).max(1);
-    app.max_visible_items = items_per_page;
+    app.set_max_visible_items(items_per_page);
 
     render_chart(frame, app, chunks[0]);
     render_legend(frame, app, chunks[1]);
