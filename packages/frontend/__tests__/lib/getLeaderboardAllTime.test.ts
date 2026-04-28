@@ -121,7 +121,7 @@ vi.mock("@/lib/db/usernameLookup", () => {
     },
     normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
     usernameEqualsIgnoreCase: (username: string) =>
-      mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
+      mockState.sql`lower(${mockState.tables.users.username}) = ${username.toLowerCase()}`,
   };
 });
 
@@ -320,7 +320,7 @@ describe("all-time leaderboard freshness queries", () => {
     });
     expect(mockState.limitCalls[0]).toBe(2);
     expect(sqlTexts.some((text) =>
-      text.toLowerCase().includes("lower(users.username) = lower(imlunahey)")
+      text.toLowerCase().includes("lower(users.username) = imlunahey")
     )).toBe(true);
   });
 

@@ -1,5 +1,6 @@
 import { sql } from "drizzle-orm";
 import { users } from "./schema";
+import { usernameLowerExpression } from "./usernameIndex";
 
 export const USERNAME_LOOKUP_LIMIT = 2;
 
@@ -11,7 +12,7 @@ export class AmbiguousUsernameError extends Error {
 }
 
 export function usernameEqualsIgnoreCase(username: string) {
-  return sql`LOWER(${users.username}) = LOWER(${username})`;
+  return sql`${usernameLowerExpression(users.username)} = ${normalizeUsernameCacheKey(username)}`;
 }
 
 export function normalizeUsernameCacheKey(username: string): string {

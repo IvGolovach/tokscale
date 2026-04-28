@@ -26,6 +26,10 @@ import {
   getSingleUsernameMatch,
   usernameEqualsIgnoreCase,
 } from "../../src/lib/db/usernameLookup";
+import {
+  USERS_USERNAME_LOWER_UNIQUE_INDEX,
+  usernameLowerExpression,
+} from "../../src/lib/db/usernameIndex";
 
 beforeEach(() => {
   mockState.reset();
@@ -35,15 +39,30 @@ describe("username lookup helpers", () => {
   it("builds an exact case-insensitive username condition", () => {
     usernameEqualsIgnoreCase("ImLunaHey");
 
-    const [strings, column, username] = mockState.sql.mock.calls[0] as [
+    const [expressionStrings, column] = mockState.sql.mock.calls[0] as [
+      TemplateStringsArray,
+      unknown,
+    ];
+    const [conditionStrings, indexedExpression, username] = mockState.sql.mock.calls[1] as [
       TemplateStringsArray,
       unknown,
       string,
     ];
 
-    expect(Array.from(strings)).toEqual(["LOWER(", ") = LOWER(", ")"]);
+    expect(Array.from(expressionStrings)).toEqual(["lower(", ")"]);
     expect(column).toBeDefined();
-    expect(username).toBe("ImLunaHey");
+    expect(Array.from(conditionStrings)).toEqual(["", " = ", ""]);
+    expect(indexedExpression).toBe(mockState.sql.mock.results[0].value);
+    expect(username).toBe("imlunahey");
+  });
+
+  it("uses the same lower expression helper that backs the unique index", () => {
+    usernameLowerExpression({} as never);
+
+    const [strings] = mockState.sql.mock.calls[0] as [TemplateStringsArray, unknown];
+
+    expect(USERS_USERNAME_LOWER_UNIQUE_INDEX).toBe("users_username_lower_unique");
+    expect(Array.from(strings)).toEqual(["lower(", ")"]);
   });
 
   it("normalizes username cache keys with ASCII case folding", () => {

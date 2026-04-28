@@ -118,7 +118,7 @@ vi.mock("@/lib/db/usernameLookup", () => {
     },
     normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
     usernameEqualsIgnoreCase: (username: string) =>
-      mockState.sql`LOWER(${mockState.tables.users.username}) = LOWER(${username})`,
+      mockState.sql`lower(${mockState.tables.users.username}) = ${username.toLowerCase()}`,
   };
 });
 
