@@ -92,6 +92,12 @@ struct OpenCodeSqliteFingerprint {
     agent: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct OpenCodeSqliteDedupState {
+    has_embedded_message_id: bool,
+    has_workspace_conflict: bool,
+}
+
 fn workspace_from_root(root: Option<&str>) -> (Option<String>, Option<String>) {
     let workspace_key = root.and_then(normalize_workspace_key);
     let workspace_label = workspace_key.as_deref().and_then(workspace_label_from_key);
@@ -101,6 +107,26 @@ fn workspace_from_root(root: Option<&str>) -> (Option<String>, Option<String>) {
 fn set_workspace_from_root(message: &mut UnifiedMessage, root: Option<&str>) {
     let (workspace_key, workspace_label) = workspace_from_root(root);
     message.set_workspace(workspace_key, workspace_label);
+}
+
+fn merge_duplicate_workspace(
+    message: &mut UnifiedMessage,
+    state: &mut OpenCodeSqliteDedupState,
+    root: Option<&str>,
+) {
+    if state.has_workspace_conflict {
+        return;
+    }
+
+    let (candidate_key, candidate_label) = workspace_from_root(root);
+    match (message.workspace_key.as_deref(), candidate_key) {
+        (None, Some(key)) => message.set_workspace(Some(key), candidate_label),
+        (Some(existing), Some(candidate)) if existing != candidate => {
+            state.has_workspace_conflict = true;
+            message.set_workspace(None, None);
+        }
+        _ => {}
+    }
 }
 
 pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
@@ -164,6 +190,7 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         LEFT JOIN session s ON s.id = m.session_id
         WHERE json_extract(m.data, '$.role') = 'assistant'
           AND json_extract(m.data, '$.tokens') IS NOT NULL
+        ORDER BY m.id, m.session_id
     "#;
 
     let legacy_query = r#"
@@ -171,6 +198,7 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         FROM message m
         WHERE json_extract(m.data, '$.role') = 'assistant'
           AND json_extract(m.data, '$.tokens') IS NOT NULL
+        ORDER BY m.id, m.session_id
     "#;
 
     let mut stmt = match conn
@@ -194,7 +222,7 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
 
     let mut messages: Vec<UnifiedMessage> = Vec::new();
     let mut fingerprint_indices: HashMap<OpenCodeSqliteFingerprint, usize> = HashMap::new();
-    let mut dedup_key_has_embedded_message_id: Vec<bool> = Vec::new();
+    let mut dedup_states: Vec<OpenCodeSqliteDedupState> = Vec::new();
 
     for row_result in rows {
         let (row_id, session_id, data_json, row_workspace_root) = match row_result {
@@ -276,14 +304,19 @@ pub fn parse_opencode_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
         set_workspace_from_root(&mut unified, workspace_root);
 
         if let Some(index) = fingerprint_indices.get(&fingerprint).copied() {
-            if message_id.is_some() && !dedup_key_has_embedded_message_id[index] {
-                dedup_key_has_embedded_message_id[index] = true;
+            let dedup_state = &mut dedup_states[index];
+            if message_id.is_some() && !dedup_state.has_embedded_message_id {
+                dedup_state.has_embedded_message_id = true;
                 messages[index].dedup_key = unified.dedup_key;
             }
+            merge_duplicate_workspace(&mut messages[index], dedup_state, workspace_root);
             continue;
         }
 
-        dedup_key_has_embedded_message_id.push(message_id.is_some());
+        dedup_states.push(OpenCodeSqliteDedupState {
+            has_embedded_message_id: message_id.is_some(),
+            has_workspace_conflict: false,
+        });
         fingerprint_indices.insert(fingerprint, messages.len());
         messages.push(unified);
     }
@@ -780,6 +813,64 @@ mod tests {
             messages[0].workspace_label.as_deref(),
             Some("opencode-sqlite-repo")
         );
+    }
+
+    #[test]
+    fn test_parse_opencode_sqlite_duplicate_workspace_conflict_is_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_opencode.db");
+
+        let conn = create_opencode_sqlite_db(&db_path);
+        conn.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY,
+                directory TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory) VALUES (?1, ?2)",
+            rusqlite::params!["ses_root", "/Users/alice/root-workspace"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory) VALUES (?1, ?2)",
+            rusqlite::params!["ses_fork", "/Users/alice/fork-workspace"],
+        )
+        .unwrap();
+
+        let data_json = r#"{
+            "role": "assistant",
+            "modelID": "claude-sonnet-4",
+            "providerID": "anthropic",
+            "cost": 0.05,
+            "tokens": {
+                "input": 1000,
+                "output": 500,
+                "reasoning": 0,
+                "cache": { "read": 200, "write": 50 }
+            },
+            "time": { "created": 1700000000000.0, "completed": 1700000000500.0 },
+            "mode": "build"
+        }"#;
+
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["z_root_copy", "ses_root", data_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["a_fork_copy", "ses_fork", data_json],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_opencode_sqlite(&db_path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].workspace_key, None);
+        assert_eq!(messages[0].workspace_label, None);
+        assert_eq!(messages[0].tokens.input, 1000);
     }
 
     /// SQLite prefers the embedded message id when present so JSON/SQLite overlap keeps deduplicating.
