@@ -1397,9 +1397,11 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let previous_home = env::var_os("HOME");
         let previous_override = env::var_os("TOKSCALE_CONFIG_DIR");
+        let previous_xdg_config_home = env::var_os("XDG_CONFIG_HOME");
         unsafe {
             env::set_var("HOME", temp_dir.path());
             env::remove_var("TOKSCALE_CONFIG_DIR");
+            env::set_var("XDG_CONFIG_HOME", temp_dir.path().join(".xdg-config"));
         }
 
         let legacy_path = temp_dir.path().join(".cache/tokscale/tui-data-cache.json");
@@ -1440,6 +1442,10 @@ mod tests {
         match previous_override {
             Some(value) => unsafe { env::set_var("TOKSCALE_CONFIG_DIR", value) },
             None => unsafe { env::remove_var("TOKSCALE_CONFIG_DIR") },
+        }
+        match previous_xdg_config_home {
+            Some(value) => unsafe { env::set_var("XDG_CONFIG_HOME", value) },
+            None => unsafe { env::remove_var("XDG_CONFIG_HOME") },
         }
     }
 
