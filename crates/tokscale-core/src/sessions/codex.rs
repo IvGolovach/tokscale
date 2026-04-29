@@ -6,7 +6,7 @@
 use super::utils::{
     extract_i64, extract_string, file_modified_timestamp_ms, parse_timestamp_value,
 };
-use super::UnifiedMessage;
+use super::{normalize_workspace_key, workspace_label_from_key, UnifiedMessage};
 use crate::TokenBreakdown;
 use serde::Deserialize;
 use serde_json::Value;
@@ -31,6 +31,8 @@ pub struct CodexPayload {
     pub model_info: Option<CodexModelInfo>,
     pub info: Option<CodexInfo>,
     pub source: Option<String>,
+    /// Current working directory from session_meta.
+    pub cwd: Option<String>,
     /// Provider identity from session_meta (e.g. "openai", "azure")
     pub model_provider: Option<String>,
     /// Agent name from session_meta
@@ -152,6 +154,8 @@ pub(crate) struct CodexParseState {
     pub session_is_headless: bool,
     pub session_provider: Option<String>,
     pub session_agent: Option<String>,
+    pub session_workspace_key: Option<String>,
+    pub session_workspace_label: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -215,6 +219,13 @@ fn parse_codex_reader<R: BufRead>(
                     }
                     if let Some(ref nickname) = payload.agent_nickname {
                         state.session_agent = Some(nickname.clone());
+                    }
+                    if let Some(ref cwd) = payload.cwd {
+                        state.session_workspace_key = normalize_workspace_key(cwd);
+                        state.session_workspace_label = state
+                            .session_workspace_key
+                            .as_deref()
+                            .and_then(workspace_label_from_key);
                     }
                 }
                 // Extract model from turn_context
@@ -322,7 +333,7 @@ fn parse_codex_reader<R: BufRead>(
 
                     let provider = state.session_provider.as_deref().unwrap_or("openai");
 
-                    messages.push(UnifiedMessage::new_with_agent(
+                    let mut message = UnifiedMessage::new_with_agent(
                         "codex",
                         model,
                         provider,
@@ -331,7 +342,12 @@ fn parse_codex_reader<R: BufRead>(
                         tokens,
                         0.0,
                         agent,
-                    ));
+                    );
+                    message.set_workspace(
+                        state.session_workspace_key.clone(),
+                        state.session_workspace_label.clone(),
+                    );
+                    messages.push(message);
                     if parsed_timestamp.is_none() {
                         fallback_timestamp_indices.push(messages.len() - 1);
                     }
@@ -349,7 +365,7 @@ fn parse_codex_reader<R: BufRead>(
             continue;
         }
 
-        if let Some((msg, used_fallback_timestamp)) = parse_codex_headless_line(
+        if let Some((mut msg, used_fallback_timestamp)) = parse_codex_headless_line(
             trimmed,
             session_id,
             &mut state.current_model,
@@ -358,6 +374,10 @@ fn parse_codex_reader<R: BufRead>(
             &state.session_agent,
             state.session_is_headless,
         ) {
+            msg.set_workspace(
+                state.session_workspace_key.clone(),
+                state.session_workspace_label.clone(),
+            );
             messages.push(msg);
             if used_fallback_timestamp {
                 fallback_timestamp_indices.push(messages.len() - 1);
@@ -661,7 +681,7 @@ mod tests {
     #[test]
     fn test_incremental_parse_matches_full_parse_for_appended_lines() {
         let file = create_test_file(concat!(
-            r#"{"type":"session_meta","payload":{"source":"chat","model_provider":"openai","agent_nickname":"builder"}}"#,
+            r#"{"type":"session_meta","payload":{"source":"chat","model_provider":"openai","agent_nickname":"builder","cwd":"/Users/alice/codex-demo"}}"#,
             "\n",
             r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
             "\n",
@@ -673,6 +693,14 @@ mod tests {
         let initial = parse_codex_file_incremental(file.path(), 0, CodexParseState::default());
         assert_eq!(initial.messages.len(), 1);
         assert_eq!(initial.consumed_offset, initial_size);
+        assert_eq!(
+            initial.messages[0].workspace_key.as_deref(),
+            Some("/Users/alice/codex-demo")
+        );
+        assert_eq!(
+            initial.messages[0].workspace_label.as_deref(),
+            Some("codex-demo")
+        );
 
         let appended = concat!(
             r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":15,"cached_input_tokens":3,"output_tokens":5},"last_token_usage":{"input_tokens":5,"cached_input_tokens":1,"output_tokens":2}}}}"#,
@@ -697,6 +725,17 @@ mod tests {
 
         let full = parse_codex_file(file.path());
         assert_eq!(combined, full);
+        assert_eq!(
+            combined
+                .iter()
+                .map(|msg| msg.workspace_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("/Users/alice/codex-demo"),
+                Some("/Users/alice/codex-demo"),
+                Some("/Users/alice/codex-demo")
+            ]
+        );
     }
 
     #[test]
@@ -1063,6 +1102,24 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "azure");
         assert_eq!(messages[0].agent.as_deref(), Some("my-agent"));
+    }
+
+    #[test]
+    fn test_session_meta_cwd_sets_workspace_metadata() {
+        let line1 = r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"source":"interactive","cwd":"/Users/alice/demo-repo"}}"#;
+        let line2 = r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#;
+        let line3 = r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3,"reasoning_output_tokens":1}}}}"#;
+        let content = format!("{}\n{}\n{}", line1, line2, line3);
+        let file = create_test_file(&content);
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].workspace_key.as_deref(),
+            Some("/Users/alice/demo-repo")
+        );
+        assert_eq!(messages[0].workspace_label.as_deref(), Some("demo-repo"));
     }
 
     #[test]

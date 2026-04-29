@@ -217,6 +217,58 @@ fn create_codex_fixture_dir() -> TempDir {
     tmp
 }
 
+fn create_codex_workspace_fixture_dir() -> TempDir {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let base = tmp.path();
+    prime_pricing_cache(base);
+
+    let sessions_dir = base.join(".codex/sessions");
+    fs::create_dir_all(&sessions_dir).unwrap();
+    fs::write(
+        sessions_dir.join("workspace-session.jsonl"),
+        concat!(
+            r#"{"type":"session_meta","payload":{"source":"chat","cwd":"/Users/alice/codex-workspace"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"model":"gpt-5.4"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+            "\n"
+        ),
+    )
+    .unwrap();
+
+    tmp
+}
+
+fn create_opencode_workspace_fixture_dir() -> TempDir {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let base = tmp.path();
+    prime_pricing_cache(base);
+
+    let session = base.join(".local/share/opencode/storage/message/workspace-session");
+    fs::create_dir_all(&session).unwrap();
+
+    let msg = r#"{
+        "id": "workspace_msg",
+        "sessionID": "workspace-session",
+        "role": "assistant",
+        "modelID": "claude-sonnet-4-20250514",
+        "providerID": "anthropic",
+        "cost": 0.05,
+        "tokens": {
+            "input": 1000,
+            "output": 500,
+            "reasoning": 0,
+            "cache": { "read": 200, "write": 50 }
+        },
+        "time": { "created": 1718452800000.0 },
+        "path": { "root": "/Users/alice/opencode-workspace" }
+    }"#;
+    fs::write(session.join("workspace_msg.json"), msg).unwrap();
+
+    tmp
+}
+
 fn create_conflicting_opencode_fixture_dir() -> TempDir {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let base = tmp.path();
@@ -1369,6 +1421,56 @@ fn test_models_group_by_workspace_model_surfaces_workspace_fields_for_qwen() {
         "demo-workspace"
     );
     assert_eq!(entries[0]["model"].as_str().unwrap(), "qwen3.5-plus");
+}
+
+#[test]
+fn test_models_group_by_workspace_model_surfaces_workspace_fields_for_codex() {
+    let tmp = create_codex_workspace_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args(["models", "--json", "--codex", "--no-spinner"])
+        .args(["--group-by", "workspace,model"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["groupBy"].as_str().unwrap(), "workspace,model");
+
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["workspaceKey"].as_str().unwrap(),
+        "/Users/alice/codex-workspace"
+    );
+    assert_eq!(
+        entries[0]["workspaceLabel"].as_str().unwrap(),
+        "codex-workspace"
+    );
+    assert_eq!(entries[0]["model"].as_str().unwrap(), "gpt-5.4");
+}
+
+#[test]
+fn test_models_group_by_workspace_model_surfaces_workspace_fields_for_opencode() {
+    let tmp = create_opencode_workspace_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args(["models", "--json", "--opencode", "--no-spinner"])
+        .args(["--group-by", "workspace,model"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["groupBy"].as_str().unwrap(), "workspace,model");
+
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0]["workspaceKey"].as_str().unwrap(),
+        "/Users/alice/opencode-workspace"
+    );
+    assert_eq!(
+        entries[0]["workspaceLabel"].as_str().unwrap(),
+        "opencode-workspace"
+    );
+    assert_eq!(entries[0]["model"].as_str().unwrap(), "claude-sonnet-4");
 }
 
 // ── Pricing command tests ──────────────────────────────────────────────────
