@@ -16,7 +16,7 @@ import {
   mergeTimestampMs,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
-import { normalizeUsernameCacheKey } from "@/lib/db/usernameLookup";
+import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
 
 function normalizeSubmissionData(data: unknown): void {
   if (!data || typeof data !== "object") return;
@@ -430,6 +430,7 @@ export async function POST(request: Request) {
       revalidateTag(`user:${usernameCacheKey}`, "max");
       revalidateTag("user-rank", "max");
       revalidateTag(`user-rank:${usernameCacheKey}`, "max");
+      revalidateUsernamePaths(tokenRecord.username);
     } catch (e) {
       console.error("Cache invalidation failed:", e);
     }
