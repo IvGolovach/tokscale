@@ -180,7 +180,7 @@ afterEach(() => {
 });
 
 describe("GET /api/users/[username]", () => {
-  it("looks up usernames case-insensitively and returns the canonical username", async () => {
+  it("redirects mixed-case requests to the canonical username path", async () => {
     mockState.pushSelectResult([
       {
         id: "user-imlunahey",
@@ -212,15 +212,52 @@ describe("GET /api/users/[username]", () => {
       new Request("http://localhost:3000/api/users/imlunahey"),
       { params: Promise.resolve({ username: "imlunahey" }) }
     );
-    const body = await response.json();
     const sqlTexts = serializeSqlCalls();
 
-    expect(response.status).toBe(200);
-    expect(body.user.username).toBe("ImLunaHey");
+    expect(response.status).toBe(308);
+    expect(response.headers.get("location")).toBe("http://localhost:3000/api/users/ImLunaHey");
     expect(mockState.limitCalls[0]).toBe(2);
     expect(sqlTexts.some((text) =>
       text.toLowerCase().includes("lower(users.username) = imlunahey")
     )).toBe(true);
+  });
+
+  it("returns the profile payload when the request already uses the canonical username", async () => {
+    mockState.pushSelectResult([
+      {
+        id: "user-imlunahey",
+        username: "ImLunaHey",
+        displayName: "Luna",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 0,
+        totalCost: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 0,
+        earliestDate: null,
+        latestDate: null,
+      },
+    ]);
+    mockState.pushSelectResult([]);
+    mockState.pushSelectResult([]);
+    mockState.pushExecuteResult([]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/ImLunaHey"),
+      { params: Promise.resolve({ username: "ImLunaHey" }) }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.user.username).toBe("ImLunaHey");
   });
 
   it("rejects ambiguous case-insensitive username matches", async () => {

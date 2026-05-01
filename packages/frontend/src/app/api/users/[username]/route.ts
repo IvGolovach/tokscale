@@ -42,6 +42,10 @@ export async function GET(_request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: "User not found" }, { status: 404 });
     }
 
+    if (username !== user.username) {
+      return NextResponse.redirect(new URL(`/api/users/${user.username}`, _request.url), 308);
+    }
+
     const oneYearAgo = new Date();
     oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
 
