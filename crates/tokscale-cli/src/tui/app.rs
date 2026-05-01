@@ -526,6 +526,12 @@ impl App {
         }
     }
 
+    /// Cache the latest terminal dimensions. `max_visible_items` is
+    /// intentionally not updated here: each tab's renderer owns its own
+    /// visible-item capacity and pushes the rendered count via
+    /// [`Self::set_max_visible_items`] (which clamps selection and scroll
+    /// state). Between resize and the next render, scroll math runs
+    /// against the previous tab's capacity for one frame and self-corrects.
     pub fn handle_resize(&mut self, width: u16, height: u16) {
         self.terminal_width = width;
         self.terminal_height = height;
