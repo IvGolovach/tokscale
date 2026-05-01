@@ -816,6 +816,48 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_opencode_sqlite_legacy_fallback_uses_path_root_when_session_table_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_opencode.db");
+
+        let conn = create_opencode_sqlite_db(&db_path);
+
+        let data_json = r#"{
+            "role": "assistant",
+            "modelID": "claude-sonnet-4",
+            "providerID": "anthropic",
+            "cost": 0.05,
+            "tokens": {
+                "input": 1000,
+                "output": 500,
+                "reasoning": 0,
+                "cache": { "read": 200, "write": 50 }
+            },
+            "time": { "created": 1700000000000.0 },
+            "path": { "root": "/Users/alice/legacy-fallback-repo" }
+        }"#;
+
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["msg_sqlite_legacy_workspace", "ses_001", data_json],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_opencode_sqlite(&db_path);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].workspace_key.as_deref(),
+            Some("/Users/alice/legacy-fallback-repo")
+        );
+        assert_eq!(
+            messages[0].workspace_label.as_deref(),
+            Some("legacy-fallback-repo")
+        );
+        assert_eq!(messages[0].tokens.input, 1000);
+    }
+
+    #[test]
     fn test_parse_opencode_sqlite_duplicate_workspace_conflict_is_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test_opencode.db");
