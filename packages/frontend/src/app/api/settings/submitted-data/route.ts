@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { getSession } from "@/lib/auth/session";
 import { authenticatePersonalToken } from "@/lib/auth/personalTokens";
 import { db, submissions } from "@/lib/db";
-import { normalizeUsernameCacheKey } from "@/lib/db/usernameLookup";
+import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
 
 async function resolveUser(request: Request): Promise<{ id: string; username: string } | null> {
   const authHeader = request.headers.get("Authorization");
@@ -49,9 +49,7 @@ export async function DELETE(request: Request) {
 
       revalidatePath("/leaderboard");
       revalidatePath("/profile");
-      revalidatePath(`/u/${user.username}`);
-      revalidatePath(`/api/users/${user.username}`);
-      revalidatePath(`/api/embed/${user.username}/svg`);
+      revalidateUsernamePaths(user.username);
     } catch (cacheError) {
       console.error("Cache invalidation failed after deletion:", cacheError);
     }
