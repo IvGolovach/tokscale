@@ -833,6 +833,13 @@ pub fn compute_cost(
             ),
         ],
     );
+    // Cache-read tiers stay limited to the 200k and 272k thresholds
+    // because upstream LiteLLM does not currently declare 128k or 256k
+    // cache-read pricing for any model. If upstream begins emitting
+    // those keys, also add matching fields to `ModelPricing`,
+    // `has_any_usable_pricing`, `has_any_valid_above_tier_value`, and
+    // `has_meaningful_tier_support`; otherwise tier walks will silently
+    // undercost long-context cache reads on those models.
     let cache_read_cost = tiered_cost(
         cache_read_clamped,
         pricing.cache_read_input_token_cost,
