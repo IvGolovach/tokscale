@@ -2,6 +2,7 @@ mod antigravity;
 mod auth;
 mod commands;
 mod cursor;
+mod device;
 mod paths;
 mod trae;
 mod tui;
@@ -3621,14 +3622,27 @@ struct TsExportMeta {
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+struct TsSubmitDevice {
+    id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct TsTokenContributionData {
     meta: TsExportMeta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    device: Option<TsSubmitDevice>,
     summary: TsDataSummary,
     years: Vec<TsYearSummary>,
     contributions: Vec<TsDailyContribution>,
 }
 
-fn to_ts_token_contribution_data(graph: &tokscale_core::GraphResult) -> TsTokenContributionData {
+fn to_ts_token_contribution_data(
+    graph: &tokscale_core::GraphResult,
+    device: Option<&device::SubmitDevice>,
+) -> TsTokenContributionData {
     TsTokenContributionData {
         meta: TsExportMeta {
             generated_at: graph.meta.generated_at.clone(),
@@ -3638,6 +3652,10 @@ fn to_ts_token_contribution_data(graph: &tokscale_core::GraphResult) -> TsTokenC
                 end: graph.meta.date_range_end.clone(),
             },
         },
+        device: device.map(|d| TsSubmitDevice {
+            id: d.id.clone(),
+            name: d.name.clone(),
+        }),
         summary: TsDataSummary {
             total_tokens: graph.summary.total_tokens,
             total_cost: graph.summary.total_cost,
@@ -4082,7 +4100,7 @@ fn run_graph_command(
         .map_err(|e| anyhow::anyhow!(e))?;
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
-    let output_data = to_ts_token_contribution_data(&graph_result);
+    let output_data = to_ts_token_contribution_data(&graph_result, None);
     let json_output = serde_json::to_string_pretty(&output_data)?;
 
     if let Some(output_path) = output {
@@ -4335,7 +4353,8 @@ fn run_submit_command(
 
     let api_url = auth::get_api_base_url();
 
-    let submit_payload = to_ts_token_contribution_data(&graph_result);
+    let submit_device = device::resolve_submit_device()?;
+    let submit_payload = to_ts_token_contribution_data(&graph_result, Some(&submit_device));
 
     let response = rt.block_on(async {
         reqwest::Client::new()
@@ -6139,6 +6158,29 @@ mod tests {
         assert_eq!(graph.summary.clients, original_summary.clients);
         assert_eq!(graph.summary.models, original_summary.models);
         assert_eq!(graph.years.len(), original_years.len());
+    }
+
+    #[test]
+    fn test_submit_payload_includes_device_when_provided() {
+        let graph = graph_result_with_contributions(vec![daily_contribution(
+            "2026-12-31",
+            20,
+            2.50,
+            "codex",
+            "model-b",
+        )]);
+        let device = device::SubmitDevice {
+            id: "dev_test".to_string(),
+            name: Some("Test device".to_string()),
+        };
+
+        let payload = to_ts_token_contribution_data(&graph, Some(&device));
+
+        assert_eq!(payload.device.as_ref().unwrap().id, "dev_test");
+        assert_eq!(
+            payload.device.as_ref().unwrap().name.as_deref(),
+            Some("Test device")
+        );
     }
 
     #[test]

@@ -44,6 +44,9 @@ function createMockSubmissionData(overrides: Partial<{
     },
   ];
 
+  const contributionTokenTotal = (client: { tokens: { input: number; output: number; cacheRead: number; cacheWrite: number } }) =>
+    client.tokens.input + client.tokens.output + client.tokens.cacheRead + client.tokens.cacheWrite;
+
   return {
     meta: {
       generatedAt: new Date().toISOString(),
@@ -55,7 +58,7 @@ function createMockSubmissionData(overrides: Partial<{
     },
     summary: {
       totalTokens: defaultContributions.reduce((sum, d) => 
-        sum + d.clients.reduce((s, client) => s + client.tokens.input + client.tokens.output, 0), 0
+        sum + d.clients.reduce((s, client) => s + contributionTokenTotal(client), 0), 0
       ),
       totalCost: defaultContributions.reduce((sum, d) => 
         sum + d.clients.reduce((s, client) => s + client.cost, 0), 0
@@ -71,7 +74,7 @@ function createMockSubmissionData(overrides: Partial<{
     contributions: defaultContributions.map(d => ({
       date: d.date,
       totals: {
-        tokens: d.clients.reduce((s, client) => s + client.tokens.input + client.tokens.output, 0),
+        tokens: d.clients.reduce((s, client) => s + contributionTokenTotal(client), 0),
         cost: d.clients.reduce((s, client) => s + client.cost, 0),
         messages: d.clients.reduce((s, client) => s + client.messages, 0),
       },
@@ -86,7 +89,7 @@ function createMockSubmissionData(overrides: Partial<{
       clients: d.clients.map(client => ({
         client: client.client as ClientType,
         modelId: client.modelId,
-        tokens: client.tokens,
+        tokens: { ...client.tokens, reasoning: 0 },
         cost: client.cost,
         messages: client.messages,
       })),
@@ -168,6 +171,58 @@ function createValidationPayload(overrides: Partial<{
 }
 
 describe('POST /api/submit - Client-Level Merge', () => {
+  describe('Device-Aware Payloads', () => {
+    it('accepts a stable random submit device id', () => {
+      const payload = {
+        ...createMockSubmissionData({ clients: ['claude'] }),
+        device: {
+          id: 'dev_018f4b6f9c2d4f2d8a2f4b6f9c2d4f2d',
+          name: 'Work laptop',
+        },
+      };
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+      expect(result.data?.device).toEqual({
+        id: 'dev_018f4b6f9c2d4f2d8a2f4b6f9c2d4f2d',
+        name: 'Work laptop',
+      });
+    });
+
+    it('keeps no-device legacy payloads valid', () => {
+      const result = validateSubmission(createMockSubmissionData({ clients: ['claude'] }));
+
+      expect(result.valid).toBe(true);
+      expect(result.data?.device).toBeUndefined();
+    });
+
+    it('includes the submit device id in the submission hash', () => {
+      const base = createMockSubmissionData({ clients: ['claude'] });
+      const laptop = validateSubmission({
+        ...base,
+        device: { id: 'dev_laptop' },
+      }).data!;
+      const desktop = validateSubmission({
+        ...base,
+        device: { id: 'dev_desktop' },
+      }).data!;
+
+      expect(generateSubmissionHash(laptop)).not.toBe(generateSubmissionHash(desktop));
+    });
+
+    it('rejects blank submit device ids', () => {
+      const result = validateSubmission({
+        ...createMockSubmissionData({ clients: ['claude'] }),
+        device: { id: '   ' },
+      });
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.some((error) => error.includes('device.id'))).toBe(true);
+    });
+  });
+
   describe('First Submission (Create Mode)', () => {
     it('should create new submission with all clients', () => {
       const data = createMockSubmissionData({ clients: ['claude', 'cursor'] });

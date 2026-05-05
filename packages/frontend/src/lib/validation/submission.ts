@@ -111,6 +111,11 @@ const ExportMetaSchema = z.object({
   }),
 });
 
+const SubmitDeviceSchema = z.object({
+  id: z.string().trim().min(1).max(96).regex(/^[A-Za-z0-9._:-]+$/),
+  name: z.string().trim().min(1).max(120).optional(),
+});
+
 const LEGACY_CLIENT_ALIASES: Record<string, string> = {
   kilocode: "kilo",
 };
@@ -176,6 +181,7 @@ function normalizeLegacySources(data: unknown): unknown {
 
 const SubmissionDataSchema = z.preprocess(normalizeLegacySources, z.object({
   meta: ExportMetaSchema,
+  device: SubmitDeviceSchema.optional(),
   summary: DataSummarySchema,
   years: z.array(YearSummarySchema),
   contributions: z.array(DailyContributionSchema),
@@ -474,6 +480,10 @@ export function generateSubmissionHash(data: SubmissionData): string {
     meta: {
       dateRange: data.meta.dateRange,
     },
+    // Which durable device bucket is being replaced. Legacy no-device payloads
+    // omit this key entirely (JSON.stringify skips undefined), preserving prior
+    // hash behavior for clients that don't send device metadata.
+    deviceId: data.device?.id,
     summary: {
       totalTokens: data.summary.totalTokens,
       totalCost: data.summary.totalCost,
