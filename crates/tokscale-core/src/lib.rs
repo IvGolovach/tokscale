@@ -813,8 +813,14 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             )
         })
         .collect();
+    let mut codex_seen: HashSet<String> = HashSet::new();
     for (path, outcome) in codex_outcomes {
-        all_messages.extend(outcome.messages);
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut codex_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         } else if outcome.invalidate_cache {
@@ -1756,7 +1762,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     counts.set(ClientId::Claude, claude_count);
     messages.extend(claude_msgs);
 
-    let codex_msgs: Vec<ParsedMessage> = scan_result
+    let codex_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Codex)
         .par_iter()
         .flat_map(|path| {
@@ -1765,10 +1771,16 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                 .into_iter()
                 .map(|mut msg| {
                     apply_headless_agent(&mut msg, is_headless);
-                    unified_to_parsed(&msg)
+                    msg
                 })
                 .collect::<Vec<_>>()
         })
+        .collect();
+    let mut codex_seen: HashSet<String> = HashSet::new();
+    let codex_msgs: Vec<ParsedMessage> = codex_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut codex_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let codex_count = codex_msgs.len() as i32;
     counts.set(ClientId::Codex, codex_count);
@@ -2081,6 +2093,13 @@ fn unified_to_parsed(msg: &UnifiedMessage) -> ParsedMessage {
         message_count: msg.message_count,
         agent: msg.agent.clone(),
     }
+}
+
+fn should_keep_deduped_message(seen_keys: &mut HashSet<String>, message: &UnifiedMessage) -> bool {
+    message
+        .dedup_key
+        .as_ref()
+        .is_none_or(|key| seen_keys.insert(key.clone()))
 }
 
 fn summed_parsed_message_count(messages: &[ParsedMessage]) -> i32 {
@@ -3174,6 +3193,140 @@ mod tests {
             assert_eq!(parsed.messages.len(), 3);
             assert_eq!(parsed.messages.iter().map(|m| m.input).sum::<i64>(), 600);
             assert_eq!(parsed.messages.iter().map(|m| m.output).sum::<i64>(), 250);
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    fn write_codex_forked_history_fixture(source_home: &std::path::Path) {
+        let codex_dir = source_home.join(".codex/sessions");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join("parent.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-04-30T10:00:00Z","type":"session_meta","payload":{"id":"parent-session","source":"interactive","model_provider":"openai","cwd":"/Users/alice/root"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-04-30T10:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-04-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            codex_dir.join("fork.jsonl"),
+            concat!(
+                r#"{"timestamp":"2026-04-30T10:01:00Z","type":"session_meta","payload":{"id":"fork-session","forked_from_id":"parent-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}},"model_provider":"openai","cwd":"/Users/alice/root-worktree"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-04-30T10:01:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-04-30T10:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30},"last_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":30}}}}"#,
+                "\n",
+                r#"{"timestamp":"2026-04-30T10:01:03Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":110,"cached_input_tokens":22,"output_tokens":33},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_with_pricing_codex_deduplicates_forked_history() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            write_codex_forked_history_fixture(source_home.path());
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["codex".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 2);
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                88
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.cache_read)
+                    .sum::<i64>(),
+                22
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.output)
+                    .sum::<i64>(),
+                33
+            );
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_codex_counts_deduplicated_forked_history() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            write_codex_forked_history_fixture(source_home.path());
+
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["codex".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+            })
+            .unwrap();
+
+            assert_eq!(parsed.counts.get(ClientId::Codex), 2);
+            assert_eq!(parsed.messages.len(), 2);
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.input)
+                    .sum::<i64>(),
+                88
+            );
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.cache_read)
+                    .sum::<i64>(),
+                22
+            );
+            assert_eq!(
+                parsed
+                    .messages
+                    .iter()
+                    .map(|message| message.output)
+                    .sum::<i64>(),
+                33
+            );
         }
 
         match original_home {

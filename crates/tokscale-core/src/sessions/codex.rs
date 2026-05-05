@@ -24,13 +24,15 @@ pub struct CodexEntry {
 
 #[derive(Debug, Deserialize)]
 pub struct CodexPayload {
+    pub id: Option<String>,
+    pub forked_from_id: Option<String>,
     #[serde(rename = "type")]
     pub payload_type: Option<String>,
     pub model: Option<String>,
     pub model_name: Option<String>,
     pub model_info: Option<CodexModelInfo>,
     pub info: Option<CodexInfo>,
-    pub source: Option<String>,
+    pub source: Option<Value>,
     /// Current working directory from session_meta.
     pub cwd: Option<String>,
     /// Provider identity from session_meta (e.g. "openai", "azure")
@@ -152,6 +154,8 @@ pub(crate) struct CodexParseState {
     pub current_model: Option<String>,
     pub previous_totals: Option<CodexTotals>,
     pub session_is_headless: bool,
+    pub session_id_from_meta: Option<String>,
+    pub session_forked_from_id: Option<String>,
     pub session_provider: Option<String>,
     pub session_agent: Option<String>,
     pub session_workspace_key: Option<String>,
@@ -271,8 +275,14 @@ fn parse_codex_reader<R: BufRead>(
                 }
 
                 if entry.entry_type == "session_meta" {
-                    if payload.source.as_deref() == Some("exec") {
+                    if codex_source_is_exec(payload.source.as_ref()) {
                         state.session_is_headless = true;
+                    }
+                    if let Some(ref id) = payload.id {
+                        state.session_id_from_meta = Some(id.clone());
+                    }
+                    if let Some(ref forked_from_id) = payload.forked_from_id {
+                        state.session_forked_from_id = Some(forked_from_id.clone());
                     }
                     if let Some(ref provider) = payload.model_provider {
                         state.session_provider = Some(provider.clone());
@@ -405,6 +415,11 @@ fn parse_codex_reader<R: BufRead>(
                         0.0,
                         agent,
                     );
+                    if parsed_timestamp.is_some() {
+                        if let Some(model) = model.as_deref() {
+                            set_codex_dedup_key(&mut message, model);
+                        }
+                    }
                     message.set_workspace(
                         state.session_workspace_key.clone(),
                         state.session_workspace_label.clone(),
@@ -494,6 +509,30 @@ fn parse_codex_reader<R: BufRead>(
     }
 }
 
+fn codex_source_is_exec(source: Option<&Value>) -> bool {
+    source.and_then(Value::as_str) == Some("exec")
+}
+
+fn codex_token_count_dedup_key(message: &UnifiedMessage, model: &str) -> String {
+    format!(
+        "codex:token_count:{}:{}:{}:{}:{}:{}:{}:{}",
+        message.timestamp,
+        message.provider_id,
+        model,
+        message.tokens.input,
+        message.tokens.output,
+        message.tokens.cache_read,
+        message.tokens.cache_write,
+        message.tokens.reasoning
+    )
+}
+
+fn set_codex_dedup_key(message: &mut UnifiedMessage, model: &str) {
+    if message.dedup_key.is_none() {
+        message.dedup_key = Some(codex_token_count_dedup_key(message, model));
+    }
+}
+
 fn flush_pending_model_messages(
     pending_model_messages: &mut Vec<(UnifiedMessage, bool)>,
     messages: &mut Vec<UnifiedMessage>,
@@ -501,6 +540,9 @@ fn flush_pending_model_messages(
     model: &str,
 ) {
     for (mut message, used_fallback_timestamp) in pending_model_messages.drain(..) {
+        if !used_fallback_timestamp {
+            set_codex_dedup_key(&mut message, model);
+        }
         message.model_id = model.to_string();
         messages.push(message);
         if used_fallback_timestamp {
@@ -1325,6 +1367,29 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].provider_id, "azure");
         assert_eq!(messages[0].agent.as_deref(), Some("my-agent"));
+    }
+
+    #[test]
+    fn test_session_meta_object_source_keeps_provider_agent_and_workspace() {
+        let file = create_test_file(concat!(
+            r#"{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"fork-session","forked_from_id":"parent-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}},"model_provider":"openai","agent_nickname":"worker","cwd":"/Users/alice/codex-fork"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:01Z","type":"turn_context","payload":{"model":"gpt-5.2"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-01-01T00:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3},"last_token_usage":{"input_tokens":10,"cached_input_tokens":2,"output_tokens":3}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].provider_id, "openai");
+        assert_eq!(messages[0].agent.as_deref(), Some("worker"));
+        assert_eq!(
+            messages[0].workspace_key.as_deref(),
+            Some("/Users/alice/codex-fork")
+        );
+        assert!(messages[0].dedup_key.is_some());
     }
 
     #[test]
