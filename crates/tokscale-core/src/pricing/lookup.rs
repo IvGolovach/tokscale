@@ -9,6 +9,7 @@ const PROVIDER_PREFIXES: &[&str] = &[
     "google/",
     "meta-llama/",
     "mistralai/",
+    "minimax/",
     "deepseek/",
     "qwen/",
     "cohere/",
@@ -24,6 +25,7 @@ const ORIGINAL_PROVIDER_PREFIXES: &[&str] = &[
     "google/",
     "meta-llama/",
     "mistralai/",
+    "minimax/",
     "deepseek/",
     "z-ai/",
     "qwen/",
@@ -3575,6 +3577,24 @@ mod tests {
             .lookup_with_provider("mistral-large", Some("mistral"))
             .unwrap();
         assert_eq!(result.matched_key, "mistralai/mistral-large");
+    }
+
+    #[test]
+    fn test_provider_hint_minimax_matches_minimax_keys() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "minimax/minimax-m2.1".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.002),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let result = lookup
+            .lookup_with_provider("MiniMax-M2.1", Some("minimax"))
+            .unwrap();
+        assert_eq!(result.matched_key, "minimax/minimax-m2.1");
     }
 
     #[test]

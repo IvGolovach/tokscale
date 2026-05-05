@@ -4537,6 +4537,66 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_pricing_if_available_prices_claude_code_gpt_5_3_codex() {
+        let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
+
+        let mut msg = UnifiedMessage::new(
+            "claude",
+            "gpt-5.3-codex",
+            "openai",
+            "session-1",
+            1_776_000_000_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 100_000,
+                cache_read: 50_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        let expected = 1.75 + 1.4 + 0.00875;
+        assert!((msg.cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_prices_claude_code_minimax_model() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "minimax/minimax-m2.1".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.01),
+                output_cost_per_token: Some(0.02),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+
+        let mut msg = UnifiedMessage::new(
+            "claude",
+            "MiniMax-M2.1",
+            "minimax",
+            "session-1",
+            1_776_000_000_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.2);
+    }
+
+    #[test]
     fn test_select_local_parse_pricing_prefers_fresh_service_for_new_models() {
         let mut fresh_litellm = HashMap::new();
         fresh_litellm.insert(
