@@ -41,7 +41,11 @@ export async function POST(request: Request, { params }: RouteParams) {
 
     const { token } = await params;
     const accepted = await acceptGroupInvite(token, session);
-    await revalidateGroupCaches(accepted.group.id, accepted.group.slug);
+    try {
+      await revalidateGroupCaches(accepted.group.id, accepted.group.slug);
+    } catch (cacheError) {
+      console.error("Accept group invite cache invalidation failed:", cacheError);
+    }
 
     return NextResponse.json(accepted);
   } catch (error) {

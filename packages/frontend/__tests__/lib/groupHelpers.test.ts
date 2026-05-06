@@ -10,6 +10,8 @@ import {
 describe("group helpers", () => {
   it("creates URL-safe group slugs with reserved fallback handling", () => {
     expect(slugifyGroupName("  AI Usage Team!!  ")).toBe("ai-usage-team");
+    expect(slugifyGroupName("foo_bar")).toBe("foo-bar");
+    expect(slugifyGroupName("foo_bar")).not.toBe(slugifyGroupName("foobar"));
     expect(slugifyGroupName("")).toMatch(/^group-[a-z0-9]+$/);
     expect(slugifyGroupName("join")).toMatch(/^join-[a-z0-9]+$/);
   });

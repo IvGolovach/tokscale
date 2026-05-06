@@ -488,9 +488,16 @@ export default function GroupDetailClient({
 
   async function copyInvite() {
     if (!inviteUrl) return;
-    await navigator.clipboard.writeText(inviteUrl);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1600);
+
+    try {
+      setInviteError(null);
+      await navigator.clipboard.writeText(inviteUrl);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+      setInviteError("Could not copy invite link.");
+    }
   }
 
   async function leaveGroup() {

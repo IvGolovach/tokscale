@@ -483,17 +483,26 @@ export async function POST(request: Request) {
       };
     });
 
+    const usernameCacheKey = normalizeUsernameCacheKey(tokenRecord.username);
     try {
-      const usernameCacheKey = normalizeUsernameCacheKey(tokenRecord.username);
-
       revalidateTag("leaderboard", "max");
       revalidateTag(`user:${usernameCacheKey}`, "max");
       revalidateTag("user-rank", "max");
       revalidateTag(`user-rank:${usernameCacheKey}`, "max");
+    } catch (e) {
+      console.error("Public cache invalidation failed:", e);
+    }
+
+    try {
       await revalidateUserGroupLeaderboards(tokenRecord.userId);
+    } catch (e) {
+      console.error("Group leaderboard cache invalidation failed:", e);
+    }
+
+    try {
       revalidateUsernamePaths(tokenRecord.username);
     } catch (e) {
-      console.error("Cache invalidation failed:", e);
+      console.error("Username path revalidation failed:", e);
     }
 
     return NextResponse.json({

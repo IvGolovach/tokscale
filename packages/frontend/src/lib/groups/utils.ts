@@ -34,8 +34,8 @@ export function slugifyGroupName(name: string, options: SlugOptions = {}): strin
   const rawBase = name
     .toLowerCase()
     .trim()
-    .replace(/[^a-z0-9\s-]/g, "")
     .replace(/[\s_]+/g, "-")
+    .replace(/[^a-z0-9-]/g, "")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
 

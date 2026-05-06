@@ -50,7 +50,7 @@ beforeEach(() => {
 });
 
 describe("GET /api/groups/[slug]/leaderboard", () => {
-  it("requires membership before returning private group leaderboard data", async () => {
+  it("hides private group leaderboard data from non-members", async () => {
     mockState.getGroupBySlug.mockResolvedValue({
       id: "group-1",
       slug: "team",
@@ -71,7 +71,7 @@ describe("GET /api/groups/[slug]/leaderboard", () => {
       { params: Promise.resolve({ slug: "team" }) }
     );
 
-    expect(response.status).toBe(403);
+    expect(response.status).toBe(404);
     expect(mockState.getGroupLeaderboardData).not.toHaveBeenCalled();
   });
 

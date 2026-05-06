@@ -20,12 +20,7 @@ async function resolveGroupAccess(request: Request, slug: string) {
   const membership = session ? await getGroupMembership(group.id, session.id) : null;
 
   if (!group.isPublic && !membership) {
-    return {
-      response: NextResponse.json(
-        { error: session ? "Forbidden" : "Not authenticated" },
-        { status: session ? 403 : 401 }
-      ),
-    };
+    return { response: NextResponse.json({ error: "Group not found" }, { status: 404 }) };
   }
 
   return { group, session, membership };
@@ -83,7 +78,12 @@ export async function DELETE(request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: "Use the leave endpoint to remove yourself" }, { status: 400 });
     }
 
-    if (!(await canManageGroupMember(group.id, session.id, userId))) {
+    const membership = await getGroupMembership(group.id, session.id);
+    if (!group.isPublic && !membership) {
+      return NextResponse.json({ error: "Group not found" }, { status: 404 });
+    }
+
+    if (!membership || !(await canManageGroupMember(group.id, session.id, userId))) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
@@ -96,7 +96,12 @@ export async function DELETE(request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: "Member not found" }, { status: 404 });
     }
 
-    await revalidateGroupCaches(group.id, group.slug);
+    try {
+      await revalidateGroupCaches(group.id, group.slug);
+    } catch (cacheError) {
+      console.error("Remove group member cache invalidation failed:", cacheError);
+    }
+
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("Remove group member error:", error);

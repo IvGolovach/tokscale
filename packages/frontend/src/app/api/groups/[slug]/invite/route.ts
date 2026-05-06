@@ -2,7 +2,7 @@ import { NextResponse } from "next/server";
 import { getSessionFromRequest } from "@/lib/auth/requestSession";
 import { revalidateGroupCaches } from "@/lib/groups/cache";
 import { createGroupInvite, GroupInviteError } from "@/lib/groups/invites";
-import { requireGroupRole } from "@/lib/groups/permissions";
+import { getGroupMembership } from "@/lib/groups/permissions";
 import { getGroupBySlug } from "@/lib/groups/queries";
 import { isGroupRole } from "@/lib/groups/utils";
 import type { GroupRole } from "@/lib/db";
@@ -23,8 +23,12 @@ export async function POST(
       return NextResponse.json({ error: "Group not found" }, { status: 404 });
     }
 
-    const membership = await requireGroupRole(group.id, session.id, "admin");
-    if (!membership) {
+    const membership = await getGroupMembership(group.id, session.id);
+    if (!group.isPublic && !membership) {
+      return NextResponse.json({ error: "Group not found" }, { status: 404 });
+    }
+
+    if (!membership || membership.role === "member") {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
@@ -47,7 +51,11 @@ export async function POST(
       invitedUsername,
     });
 
-    await revalidateGroupCaches(group.id, group.slug);
+    try {
+      await revalidateGroupCaches(group.id, group.slug);
+    } catch (cacheError) {
+      console.error("Create group invite cache invalidation failed:", cacheError);
+    }
 
     return NextResponse.json(
       {

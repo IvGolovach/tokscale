@@ -163,29 +163,39 @@ export async function acceptGroupInvite(token: string, session: SessionUser) {
     throw new GroupInviteError("forbidden", "This invite is not for your GitHub username");
   }
 
-  await db.transaction(async (tx) => {
-    const existingMember = await tx
-      .select({ id: groupMembers.id })
-      .from(groupMembers)
-      .where(and(eq(groupMembers.groupId, group.id), eq(groupMembers.userId, session.id)))
-      .limit(1);
+  const acceptedAt = new Date();
 
-    if (existingMember.length === 0) {
-      await tx.insert(groupMembers).values({
+  await db.transaction(async (tx) => {
+    const claimed = await tx
+      .update(groupInvites)
+      .set({
+        status: "accepted",
+        acceptedAt,
+      })
+      .where(
+        and(
+          eq(groupInvites.id, invite.id),
+          eq(groupInvites.status, "pending"),
+          gt(groupInvites.expiresAt, acceptedAt)
+        )
+      )
+      .returning({ id: groupInvites.id });
+
+    if (claimed.length === 0) {
+      throw new GroupInviteError("not_found", "Invalid or expired invite");
+    }
+
+    await tx
+      .insert(groupMembers)
+      .values({
         groupId: group.id,
         userId: session.id,
         role: invite.role,
         invitedBy: invite.invitedBy,
-      });
-    }
-
-    await tx
-      .update(groupInvites)
-      .set({
-        status: "accepted",
-        acceptedAt: new Date(),
       })
-      .where(eq(groupInvites.id, invite.id));
+      .onConflictDoNothing({
+        target: [groupMembers.groupId, groupMembers.userId],
+      });
   });
 
   return {

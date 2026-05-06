@@ -164,6 +164,9 @@ describe("DELETE /api/settings/submitted-data", () => {
       isAdmin: false,
     });
     mockState.setDeletedRows([{ id: "submission-1" }]);
+    mockState.revalidateUserGroupLeaderboards.mockRejectedValueOnce(
+      new Error("group cache unavailable")
+    );
 
     const response = await DELETE(createRequest());
 
@@ -185,6 +188,7 @@ describe("DELETE /api/settings/submitted-data", () => {
       right: "user-1",
     });
     expect(mockState.revalidateTag).toHaveBeenCalledTimes(7);
+    expect(mockState.revalidateUserGroupLeaderboards).toHaveBeenCalledWith("user-1");
     expect(mockState.revalidateUsernamePaths).toHaveBeenCalledTimes(1);
     expect(mockState.revalidateUsernamePaths).toHaveBeenCalledWith("Alice");
     expect(mockState.revalidatePath).toHaveBeenCalledTimes(8);

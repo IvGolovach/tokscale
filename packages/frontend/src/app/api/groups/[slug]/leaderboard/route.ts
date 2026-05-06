@@ -29,12 +29,12 @@ export async function GET(
     if (!group.isPublic) {
       const session = await getSessionFromRequest(request);
       if (!session) {
-        return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
+        return NextResponse.json({ error: "Group not found" }, { status: 404 });
       }
 
       const membership = await getGroupMembership(group.id, session.id);
       if (!membership) {
-        return NextResponse.json({ error: "Not a member of this group" }, { status: 403 });
+        return NextResponse.json({ error: "Group not found" }, { status: 404 });
       }
     }
 

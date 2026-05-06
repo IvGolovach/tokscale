@@ -42,6 +42,10 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       getGroupMembership(group.id, userId),
     ]);
 
+    if (!group.isPublic && !actor) {
+      return NextResponse.json({ error: "Group not found" }, { status: 404 });
+    }
+
     if (
       !actor ||
       !target ||
@@ -65,7 +69,12 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: "Member not found" }, { status: 404 });
     }
 
-    await revalidateGroupCaches(group.id, group.slug);
+    try {
+      await revalidateGroupCaches(group.id, group.slug);
+    } catch (cacheError) {
+      console.error("Update group member role cache invalidation failed:", cacheError);
+    }
+
     return NextResponse.json(updated);
   } catch (error) {
     console.error("Update group member role error:", error);

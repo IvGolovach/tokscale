@@ -4,7 +4,7 @@ import { eq } from "drizzle-orm";
 import { db, groups } from "@/lib/db";
 import { getSessionFromRequest } from "@/lib/auth/requestSession";
 import { revalidateGroupCaches } from "@/lib/groups/cache";
-import { getGroupMembership, requireGroupRole } from "@/lib/groups/permissions";
+import { getGroupMembership } from "@/lib/groups/permissions";
 import { getGroupBySlug, getGroupMemberCount } from "@/lib/groups/queries";
 import { generateUniqueGroupSlug } from "@/lib/groups/slugs";
 
@@ -16,22 +16,41 @@ function parseString(value: unknown): string | null {
   return typeof value === "string" ? value.trim() : null;
 }
 
+function parseNullableStringField(
+  value: unknown,
+  fieldName: string
+): { value: string | null } | { response: NextResponse } {
+  if (value === null) {
+    return { value: null };
+  }
+
+  if (typeof value === "string") {
+    return { value: value.trim() };
+  }
+
+  return {
+    response: NextResponse.json(
+      { error: `${fieldName} must be a string or null` },
+      { status: 400 }
+    ),
+  };
+}
+
+function groupNotFoundResponse() {
+  return NextResponse.json({ error: "Group not found" }, { status: 404 });
+}
+
 async function authorizeGroupRead(request: Request, slug: string) {
   const group = await getGroupBySlug(slug);
   if (!group) {
-    return { response: NextResponse.json({ error: "Group not found" }, { status: 404 }) };
+    return { response: groupNotFoundResponse() };
   }
 
   const session = await getSessionFromRequest(request);
   const membership = session ? await getGroupMembership(group.id, session.id) : null;
 
   if (!group.isPublic && !membership) {
-    return {
-      response: NextResponse.json(
-        { error: session ? "Forbidden" : "Not authenticated" },
-        { status: session ? 403 : 401 }
-      ),
-    };
+    return { response: groupNotFoundResponse() };
   }
 
   return { group, session, membership };
@@ -68,11 +87,14 @@ export async function PATCH(request: Request, { params }: RouteParams) {
     const { slug } = await params;
     const group = await getGroupBySlug(slug);
     if (!group) {
-      return NextResponse.json({ error: "Group not found" }, { status: 404 });
+      return groupNotFoundResponse();
     }
 
-    const membership = await requireGroupRole(group.id, session.id, "admin");
-    if (!membership) {
+    const membership = await getGroupMembership(group.id, session.id);
+    if (!group.isPublic && !membership) {
+      return groupNotFoundResponse();
+    }
+    if (!membership || membership.role === "member") {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
     }
 
@@ -107,10 +129,18 @@ export async function PATCH(request: Request, { params }: RouteParams) {
     }
 
     if (body.description !== undefined) {
-      updateData.description = parseString(body.description);
+      const description = parseNullableStringField(body.description, "description");
+      if ("response" in description) {
+        return description.response;
+      }
+      updateData.description = description.value;
     }
     if (body.avatarUrl !== undefined) {
-      updateData.avatarUrl = parseString(body.avatarUrl);
+      const avatarUrl = parseNullableStringField(body.avatarUrl, "avatarUrl");
+      if ("response" in avatarUrl) {
+        return avatarUrl.response;
+      }
+      updateData.avatarUrl = avatarUrl.value;
     }
     if (typeof body.isPublic === "boolean") {
       updateData.isPublic = body.isPublic;
@@ -122,9 +152,18 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       .where(eq(groups.id, group.id))
       .returning();
 
-    await revalidateGroupCaches(group.id, updated?.slug ?? group.slug);
+    try {
+      await revalidateGroupCaches(group.id, updated?.slug ?? group.slug);
+    } catch (cacheError) {
+      console.error("Update group cache invalidation failed:", cacheError);
+    }
+
     if (updated?.slug && updated.slug !== group.slug) {
-      revalidatePath(`/groups/${group.slug}`);
+      try {
+        revalidatePath(`/groups/${group.slug}`);
+      } catch (cacheError) {
+        console.error("Old group path revalidation failed:", cacheError);
+      }
     }
 
     return NextResponse.json(updated);
@@ -144,10 +183,13 @@ export async function DELETE(request: Request, { params }: RouteParams) {
     const { slug } = await params;
     const group = await getGroupBySlug(slug);
     if (!group) {
-      return NextResponse.json({ error: "Group not found" }, { status: 404 });
+      return groupNotFoundResponse();
     }
 
     const membership = await getGroupMembership(group.id, session.id);
+    if (!group.isPublic && !membership) {
+      return groupNotFoundResponse();
+    }
     if (!membership || membership.role !== "owner") {
       return NextResponse.json({ error: "Only the owner can delete this group" }, { status: 403 });
     }
@@ -161,7 +203,12 @@ export async function DELETE(request: Request, { params }: RouteParams) {
       return NextResponse.json({ error: "Group not found" }, { status: 404 });
     }
 
-    await revalidateGroupCaches(group.id, group.slug);
+    try {
+      await revalidateGroupCaches(group.id, group.slug);
+    } catch (cacheError) {
+      console.error("Delete group cache invalidation failed:", cacheError);
+    }
+
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("Delete group error:", error);

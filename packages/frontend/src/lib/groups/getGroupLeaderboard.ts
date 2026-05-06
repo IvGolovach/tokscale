@@ -1,5 +1,5 @@
 import { unstable_cache } from "next/cache";
-import { and, desc, eq, gte, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, lte, sql } from "drizzle-orm";
 import { db, dailyBreakdown, groupMembers, submissions, users } from "@/lib/db";
 import { buildSubmissionFreshness } from "@/lib/submissionFreshness";
 import type { LeaderboardUser, Period, SortBy } from "@/lib/leaderboard/types";
@@ -257,9 +257,12 @@ async function fetchPeriodRows(
 }
 
 async function fetchAllTimeRows(groupId: string, sortBy: SortBy): Promise<GroupLeaderboardUser[]> {
-  const orderByColumn = sortBy === "cost"
+  const primaryOrderByColumn = sortBy === "cost"
     ? sql`SUM(CAST(${submissions.totalCost} AS DECIMAL(12,4)))`
     : sql`SUM(${submissions.totalTokens})`;
+  const secondaryOrderByColumn = sortBy === "cost"
+    ? sql`SUM(${submissions.totalTokens})`
+    : sql`SUM(CAST(${submissions.totalCost} AS DECIMAL(12,4)))`;
 
   const rows = await db
     .select({
@@ -275,12 +278,12 @@ async function fetchAllTimeRows(groupId: string, sortBy: SortBy): Promise<GroupL
       cliVersion: sql<string | null>`(
         SELECT s2.cli_version FROM submissions s2
         WHERE s2.user_id = ${users.id}
-        ORDER BY s2.updated_at DESC LIMIT 1
+        ORDER BY s2.updated_at DESC, s2.id DESC LIMIT 1
       )`.as("cli_version"),
       schemaVersion: sql<number>`COALESCE((
         SELECT s2.schema_version FROM submissions s2
         WHERE s2.user_id = ${users.id}
-        ORDER BY s2.updated_at DESC LIMIT 1
+        ORDER BY s2.updated_at DESC, s2.id DESC LIMIT 1
       ), 0)`.as("schema_version"),
     })
     .from(submissions)
@@ -293,7 +296,12 @@ async function fetchAllTimeRows(groupId: string, sortBy: SortBy): Promise<GroupL
       )
     )
     .groupBy(users.id, users.username, users.displayName, users.avatarUrl, groupMembers.role)
-    .orderBy(desc(orderByColumn));
+    .orderBy(
+      desc(primaryOrderByColumn),
+      desc(secondaryOrderByColumn),
+      asc(users.username),
+      asc(users.id)
+    );
 
   return (rows as GroupLeaderboardDbRow[]).map((row, index) => ({
     rank: index + 1,

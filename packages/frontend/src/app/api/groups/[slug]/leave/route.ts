@@ -38,7 +38,12 @@ export async function POST(
       .delete(groupMembers)
       .where(and(eq(groupMembers.groupId, group.id), eq(groupMembers.userId, session.id)));
 
-    await revalidateGroupCaches(group.id, group.slug);
+    try {
+      await revalidateGroupCaches(group.id, group.slug);
+    } catch (cacheError) {
+      console.error("Leave group cache invalidation failed:", cacheError);
+    }
+
     return NextResponse.json({ success: true });
   } catch (error) {
     console.error("Leave group error:", error);
