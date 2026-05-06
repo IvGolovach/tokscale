@@ -8,11 +8,7 @@ import {
   usernameEqualsIgnoreCase,
 } from "@/lib/db/usernameLookup";
 import { buildSubmissionFreshness } from "@/lib/submissionFreshness";
-
-const LEGACY_CLIENT_ALIASES: Record<string, string> = { kilocode: "kilo" };
-function normalizeClientId(id: string): string {
-  return LEGACY_CLIENT_ALIASES[id] ?? id;
-}
+import { normalizeClientId } from "@/lib/clientRegistry";
 
 export const revalidate = 60; // ISR: revalidate every 60 seconds
 

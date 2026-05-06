@@ -1,4 +1,5 @@
-export type ClientType = "opencode" | "claude" | "codex" | "copilot" | "gemini" | "cursor" | "amp" | "codebuff" | "droid" | "openclaw" | "hermes" | "pi" | "kimi" | "qwen" | "roocode" | "kilocode" | "kilo" | "mux" | "crush" | "goose" | "antigravity" | "kiro" | "zed" | "synthetic";
+import type { ClientType } from "./clientRegistry";
+export type { ClientType } from "./clientRegistry";
 
 export interface TokenBreakdown {
   input: number;

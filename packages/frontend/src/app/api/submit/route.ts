@@ -9,6 +9,7 @@ import {
 } from "@/lib/validation/submission";
 import { authenticatePersonalToken } from "@/lib/auth/personalTokens";
 import { getBearerToken } from "../../../lib/auth/bearerToken";
+import { normalizeClientId } from "../../../lib/clientRegistry";
 import {
   mergeClientBreakdowns,
   recalculateDayTotals,
@@ -365,7 +366,7 @@ export async function POST(request: Request) {
       for (const day of allDays) {
         if (day.sourceBreakdown) {
           for (const [rawClientName, clientData] of Object.entries(day.sourceBreakdown)) {
-            const clientName = rawClientName === "kilocode" ? "kilo" : rawClientName;
+            const clientName = normalizeClientId(rawClientName);
             allClients.add(clientName);
             const cd = clientData as ClientBreakdownData;
             if (cd.models) {

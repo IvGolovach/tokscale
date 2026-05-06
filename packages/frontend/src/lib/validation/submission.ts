@@ -6,6 +6,10 @@
  */
 
 import { z } from "zod";
+import {
+  CLIENT_IDS,
+  LEGACY_CLIENT_ALIASES,
+} from "../clientRegistry";
 
 // ============================================================================
 // SCHEMAS
@@ -19,32 +23,7 @@ const TokenBreakdownSchema = z.object({
   reasoning: z.number().int().min(0),
 });
 
-const SUPPORTED_SOURCES = [
-  "opencode",
-  "claude",
-  "codex",
-  "copilot",
-  "gemini",
-  "cursor",
-  "amp",
-  "codebuff",
-  "droid",
-  "openclaw",
-  "hermes",
-  "pi",
-  "kimi",
-  "qwen",
-  "roocode",
-  "kilo",
-  "mux",
-  "crush",
-  "goose",
-  "antigravity",
-  "kiro",
-  "zed",
-  "synthetic",
-] as const;
-const SourceSchema = z.enum(SUPPORTED_SOURCES);
+const SourceSchema = z.enum(CLIENT_IDS);
 
 const ClientContributionSchema = z.object({
   client: SourceSchema,
@@ -98,13 +77,9 @@ const ExportMetaSchema = z.object({
   }),
 });
 
-const LEGACY_CLIENT_ALIASES: Record<string, string> = {
-  kilocode: "kilo",
-};
-
 function normalizeLegacyClientId(id: unknown): unknown {
   if (typeof id === "string" && id in LEGACY_CLIENT_ALIASES) {
-    return LEGACY_CLIENT_ALIASES[id];
+    return LEGACY_CLIENT_ALIASES[id as keyof typeof LEGACY_CLIENT_ALIASES];
   }
   return id;
 }
