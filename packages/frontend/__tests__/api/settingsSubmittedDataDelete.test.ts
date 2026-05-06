@@ -5,6 +5,7 @@ const mockState = vi.hoisted(() => {
   const authenticatePersonalToken = vi.fn();
   const revalidateTag = vi.fn();
   const revalidatePath = vi.fn();
+  const revalidateUserGroupLeaderboards = vi.fn();
   const revalidateUsernamePaths = vi.fn((username: string) => {
     const lower = username.toLowerCase();
     const variants = username === lower ? [username] : [username, lower];
@@ -56,6 +57,7 @@ const mockState = vi.hoisted(() => {
     authenticatePersonalToken,
     revalidateTag,
     revalidatePath,
+    revalidateUserGroupLeaderboards,
     revalidateUsernamePaths,
     eq,
     db,
@@ -66,6 +68,7 @@ const mockState = vi.hoisted(() => {
       authenticatePersonalToken.mockReset();
       revalidateTag.mockReset();
       revalidatePath.mockReset();
+      revalidateUserGroupLeaderboards.mockReset();
       revalidateUsernamePaths.mockReset();
       eq.mockClear();
       db.delete.mockClear();
@@ -110,6 +113,10 @@ vi.mock("@/lib/db", () => ({
 vi.mock("@/lib/db/usernameLookup", () => ({
   normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
   revalidateUsernamePaths: mockState.revalidateUsernamePaths,
+}));
+
+vi.mock("@/lib/groups/cache", () => ({
+  revalidateUserGroupLeaderboards: mockState.revalidateUserGroupLeaderboards,
 }));
 
 type ModuleExports = typeof import("../../src/app/api/settings/submitted-data/route");

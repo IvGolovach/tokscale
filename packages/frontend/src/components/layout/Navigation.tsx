@@ -629,6 +629,10 @@ function UserMenu({ user, onSignOut }: { user: User; onSignOut: () => void }) {
               <MenuIconSlot><PersonIcon /></MenuIconSlot>
               Your Profile
             </MenuItem>
+            <MenuItem href="/groups" onClick={handleClose}>
+              <MenuIconSlot><PersonIcon /></MenuIconSlot>
+              Groups
+            </MenuItem>
             <MenuItem href="/settings" onClick={handleClose}>
               <MenuIconSlot><GearIcon /></MenuIconSlot>
               Settings
@@ -694,6 +698,9 @@ export function Navigation() {
           <NavItemLink href="/leaderboard" $isActive={pathname === "/leaderboard"}>
             Leaderboard
           </NavItemLink>
+          <NavItemLink href="/groups" $isActive={pathname.startsWith("/groups")}>
+            Groups
+          </NavItemLink>
           <NavItemLink href="/profile" $isActive={pathname === "/profile" || pathname.startsWith("/u/")}>
             Profile
           </NavItemLink>
@@ -738,6 +745,9 @@ export function Navigation() {
           <DropdownNavLink href="/leaderboard" $isActive={pathname === "/leaderboard"} onClick={closeMobileMenu}>
             Leaderboard
           </DropdownNavLink>
+          <DropdownNavLink href="/groups" $isActive={pathname.startsWith("/groups")} onClick={closeMobileMenu}>
+            Groups
+          </DropdownNavLink>
           <DropdownNavLink href="/profile" $isActive={pathname === "/profile" || pathname.startsWith("/u/")} onClick={closeMobileMenu}>
             Profile
           </DropdownNavLink>
@@ -771,6 +781,10 @@ export function Navigation() {
               <DropdownUserAction href={`/u/${user.username}`} onClick={closeMobileMenu}>
                 <PersonIcon size={16} />
                 Your Profile
+              </DropdownUserAction>
+              <DropdownUserAction href="/groups" onClick={closeMobileMenu}>
+                <PersonIcon size={16} />
+                Groups
               </DropdownUserAction>
               <DropdownUserAction href="/settings" onClick={closeMobileMenu}>
                 <GearIcon size={16} />

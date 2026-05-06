@@ -64,6 +64,13 @@
       "when": 1778112000000,
       "tag": "0008_add_time_metrics_to_submissions",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1778198400000,
+      "tag": "0009_add_groups",
+      "breakpoints": true
     }
   ]
 }

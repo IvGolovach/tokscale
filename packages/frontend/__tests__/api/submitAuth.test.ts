@@ -6,6 +6,7 @@ const mockState = vi.hoisted(() => {
   const generateSubmissionHash = vi.fn(() => "submission-hash");
   const revalidateTag = vi.fn();
   const revalidateUsernamePaths = vi.fn();
+  const revalidateUserGroupLeaderboards = vi.fn();
   const mergeClientBreakdowns = vi.fn();
   const recalculateDayTotals = vi.fn();
   const buildModelBreakdown = vi.fn();
@@ -22,6 +23,7 @@ const mockState = vi.hoisted(() => {
     generateSubmissionHash,
     revalidateTag,
     revalidateUsernamePaths,
+    revalidateUserGroupLeaderboards,
     mergeClientBreakdowns,
     recalculateDayTotals,
     buildModelBreakdown,
@@ -34,6 +36,7 @@ const mockState = vi.hoisted(() => {
       generateSubmissionHash.mockClear();
       revalidateTag.mockClear();
       revalidateUsernamePaths.mockReset();
+      revalidateUserGroupLeaderboards.mockReset();
       mergeClientBreakdowns.mockReset();
       recalculateDayTotals.mockReset();
       buildModelBreakdown.mockReset();
@@ -113,6 +116,10 @@ vi.mock("@/lib/db/helpers", () => ({
 vi.mock("@/lib/db/usernameLookup", () => ({
   normalizeUsernameCacheKey: (username: string) => username.toLowerCase(),
   revalidateUsernamePaths: mockState.revalidateUsernamePaths,
+}));
+
+vi.mock("@/lib/groups/cache", () => ({
+  revalidateUserGroupLeaderboards: mockState.revalidateUserGroupLeaderboards,
 }));
 
 type ModuleExports = typeof import("../../src/app/api/submit/route");

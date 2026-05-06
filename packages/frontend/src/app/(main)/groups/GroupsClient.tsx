@@ -1,0 +1,283 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useState } from "react";
+import styled from "styled-components";
+
+type GroupRole = "owner" | "admin" | "member";
+
+interface SessionUser {
+  id: string;
+  username: string;
+  displayName: string | null;
+  avatarUrl: string | null;
+}
+
+interface GroupCardData {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  avatarUrl: string | null;
+  isPublic: boolean;
+  memberCount: number;
+  role?: GroupRole;
+}
+
+interface GroupsClientProps {
+  currentUser: SessionUser | null;
+  initialPublicGroups: GroupCardData[];
+  initialMyGroups: GroupCardData[];
+}
+
+type ActiveTab = "public" | "mine";
+
+const PageHeader = styled.section`
+  margin: 32px 0 24px;
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+
+  @media (max-width: 640px) {
+    flex-direction: column;
+  }
+`;
+
+const Title = styled.h1`
+  margin: 0 0 8px;
+  font-size: 30px;
+  font-weight: 700;
+  color: var(--color-fg-default);
+`;
+
+const Description = styled.p`
+  margin: 0;
+  max-width: 680px;
+  color: var(--color-fg-muted);
+  line-height: 1.6;
+`;
+
+const PrimaryLink = styled(Link)`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 16px;
+  border-radius: 8px;
+  border: 1px solid var(--color-primary);
+  background: var(--color-primary);
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  white-space: nowrap;
+`;
+
+const Tabs = styled.div`
+  display: inline-flex;
+  padding: 4px;
+  margin-bottom: 16px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 8px;
+  background: var(--color-bg-subtle);
+`;
+
+const TabButton = styled.button<{ $active: boolean }>`
+  min-height: 32px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 6px;
+  background: ${({ $active }) => ($active ? "var(--color-bg-default)" : "transparent")};
+  color: ${({ $active }) => ($active ? "var(--color-fg-default)" : "var(--color-fg-muted)")};
+  font-weight: 600;
+  cursor: pointer;
+`;
+
+const Grid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+`;
+
+const Card = styled(Link)`
+  display: flex;
+  flex-direction: column;
+  min-height: 150px;
+  padding: 16px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 8px;
+  background: var(--color-bg-default);
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.15s, background 0.15s;
+
+  &:hover {
+    border-color: var(--color-primary);
+    background: var(--color-bg-subtle);
+  }
+`;
+
+const CardTop = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 12px;
+`;
+
+const Avatar = styled.div<{ $image?: string | null }>`
+  width: 42px;
+  height: 42px;
+  border-radius: 8px;
+  flex: 0 0 auto;
+  border: 1px solid var(--color-border-default);
+  background:
+    ${({ $image }) => $image ? `url(${$image}) center/cover` : "linear-gradient(135deg, #0073ff, #13a10e)"};
+`;
+
+const CardTitle = styled.h2`
+  margin: 0;
+  font-size: 16px;
+  color: var(--color-fg-default);
+`;
+
+const Meta = styled.div`
+  margin-top: 3px;
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  color: var(--color-fg-muted);
+  font-size: 12px;
+`;
+
+const BodyText = styled.p`
+  margin: 0;
+  color: var(--color-fg-muted);
+  line-height: 1.5;
+  font-size: 14px;
+`;
+
+const EmptyState = styled.div`
+  padding: 28px;
+  border: 1px solid var(--color-border-default);
+  border-radius: 8px;
+  background: var(--color-bg-default);
+  color: var(--color-fg-muted);
+`;
+
+const ErrorText = styled.p`
+  color: var(--color-danger-fg, #f85149);
+`;
+
+function GroupCard({ group }: { group: GroupCardData }) {
+  return (
+    <Card href={`/groups/${group.slug}`}>
+      <CardTop>
+        <Avatar $image={group.avatarUrl} />
+        <div>
+          <CardTitle>{group.name}</CardTitle>
+          <Meta>
+            <span>{group.isPublic ? "Public" : "Private"}</span>
+            <span>{group.memberCount} members</span>
+            {group.role && <span>{group.role}</span>}
+          </Meta>
+        </div>
+      </CardTop>
+      <BodyText>{group.description || "A scoped Tokscale leaderboard."}</BodyText>
+    </Card>
+  );
+}
+
+export default function GroupsClient({
+  currentUser,
+  initialPublicGroups,
+  initialMyGroups,
+}: GroupsClientProps) {
+  const [activeTab, setActiveTab] = useState<ActiveTab>(currentUser ? "mine" : "public");
+  const [publicGroups, setPublicGroups] = useState(initialPublicGroups);
+  const [myGroups, setMyGroups] = useState(initialMyGroups);
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const loadGroups = useCallback((tab: ActiveTab, signal?: AbortSignal) => {
+    const url = tab === "mine" ? "/api/groups?my=true" : "/api/groups";
+    setIsLoading(true);
+    setError(null);
+
+    fetch(url, { signal })
+      .then((response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return response.json();
+      })
+      .then((payload) => {
+        if (!Array.isArray(payload.groups)) {
+          throw new Error("Invalid response");
+        }
+        if (tab === "mine") {
+          setMyGroups(payload.groups);
+        } else {
+          setPublicGroups(payload.groups);
+        }
+      })
+      .catch((err) => {
+        if (err.name !== "AbortError") {
+          setError(err.message || "Failed to load groups");
+        }
+      })
+      .finally(() => {
+        if (!signal?.aborted) {
+          setIsLoading(false);
+        }
+      });
+  }, []);
+
+  const groups = activeTab === "mine" ? myGroups : publicGroups;
+  const handleTabChange = (tab: ActiveTab) => {
+    setActiveTab(tab);
+    loadGroups(tab);
+  };
+
+  return (
+    <>
+      <PageHeader>
+        <div>
+          <Title>Groups</Title>
+          <Description>
+            Create private or public leaderboards for teams, friends, and workspaces without changing the global Tokscale rankings.
+          </Description>
+        </div>
+        {currentUser ? (
+          <PrimaryLink href="/groups/new">New group</PrimaryLink>
+        ) : (
+          <PrimaryLink href="/api/auth/github?returnTo=/groups">Sign in</PrimaryLink>
+        )}
+      </PageHeader>
+
+      <Tabs aria-label="Group filters">
+        <TabButton $active={activeTab === "public"} onClick={() => handleTabChange("public")}>
+          Public
+        </TabButton>
+        <TabButton $active={activeTab === "mine"} onClick={() => handleTabChange("mine")} disabled={!currentUser}>
+          My groups
+        </TabButton>
+      </Tabs>
+
+      {error && <ErrorText>{error}</ErrorText>}
+      {isLoading ? (
+        <EmptyState>Loading groups...</EmptyState>
+      ) : groups.length === 0 ? (
+        <EmptyState>
+          {activeTab === "mine"
+            ? "You are not in any groups yet."
+            : "No public groups yet."}
+        </EmptyState>
+      ) : (
+        <Grid>
+          {groups.map((group) => (
+            <GroupCard key={group.id} group={group} />
+          ))}
+        </Grid>
+      )}
+    </>
+  );
+}

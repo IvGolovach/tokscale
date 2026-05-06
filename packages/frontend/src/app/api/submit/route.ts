@@ -18,6 +18,7 @@ import {
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
 import { normalizeUsernameCacheKey, revalidateUsernamePaths } from "@/lib/db/usernameLookup";
+import { revalidateUserGroupLeaderboards } from "@/lib/groups/cache";
 
 const LEGACY_SUBMIT_DEVICE_KEY = "legacy-default";
 const LEGACY_SUBMIT_DEVICE_NAME = "Legacy submissions";
@@ -489,6 +490,7 @@ export async function POST(request: Request) {
       revalidateTag(`user:${usernameCacheKey}`, "max");
       revalidateTag("user-rank", "max");
       revalidateTag(`user-rank:${usernameCacheKey}`, "max");
+      await revalidateUserGroupLeaderboards(tokenRecord.userId);
       revalidateUsernamePaths(tokenRecord.username);
     } catch (e) {
       console.error("Cache invalidation failed:", e);
