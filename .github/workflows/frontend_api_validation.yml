@@ -37,4 +37,5 @@ jobs:
         run: bun install --frozen-lockfile
 
       - name: Run frontend/API tests
-        run: bun x vitest run packages/frontend/__tests__/api/*.test.ts packages/frontend/__tests__/lib/*.test.ts
+        working-directory: packages/frontend
+        run: bun x vitest run __tests__/api/*.test.ts __tests__/lib/*.test.ts
