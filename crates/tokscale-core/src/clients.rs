@@ -711,7 +711,9 @@ mod tests {
     #[test]
     fn test_zed_data_dir_path() {
         assert_eq!(
-            ClientId::Zed.data().resolve_path("/tmp/home"),
+            ClientId::Zed
+                .data()
+                .resolve_path_with_env_strategy("/tmp/home", false),
             "/tmp/home/.local/share/zed/threads/threads.db"
         );
     }
