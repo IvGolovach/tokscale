@@ -4448,6 +4448,50 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_pricing_if_available_keeps_scoped_fireworks_cost_without_exact_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "fireworks_ai/accounts/fireworks/models/deepseek-r1-0528-distill-qwen3-8b".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.0000002),
+                output_cost_per_token: Some(0.0000002),
+                ..Default::default()
+            },
+        );
+
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "deepseek/deepseek-v4-pro".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                output_cost_per_token: Some(0.000002),
+                ..Default::default()
+            },
+        );
+
+        let pricing = pricing::PricingService::new(litellm, openrouter);
+        let mut msg = UnifiedMessage::new(
+            "opencode",
+            "accounts/fireworks/models/deepseek-v4-pro",
+            "fireworks",
+            "session-1",
+            1_733_011_200_000,
+            TokenBreakdown {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.123,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        assert_eq!(msg.cost, 0.123);
+    }
+
+    #[test]
     fn test_apply_pricing_if_available_prefers_provider_specific_exact_match_over_plain_exact() {
         let mut litellm = HashMap::new();
         litellm.insert(

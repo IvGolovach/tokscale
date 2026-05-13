@@ -381,6 +381,49 @@ fn write_pricing_cache(base: &Path, timestamp: u64) {
     }
 }
 
+fn write_fireworks_pricing_cache(base: &Path) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_secs();
+    let litellm = serde_json::json!({
+        "timestamp": now,
+        "data": {
+            "fireworks_ai/accounts/fireworks/models/deepseek-r1-0528-distill-qwen3-8b": {
+                "input_cost_per_token": 0.0000002,
+                "output_cost_per_token": 0.0000002
+            }
+        }
+    });
+    let openrouter = serde_json::json!({
+        "timestamp": now,
+        "data": {
+            "deepseek/deepseek-v4-pro": {
+                "input_cost_per_token": 0.000001,
+                "output_cost_per_token": 0.000002
+            }
+        }
+    });
+
+    for dir in [
+        base.join(".config/tokscale/cache"),
+        base.join("Library/Caches/tokscale"),
+        base.join(".cache/tokscale"),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("pricing-litellm.json"),
+            serde_json::to_vec(&litellm).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("pricing-openrouter.json"),
+            serde_json::to_vec(&openrouter).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 fn write_fake_credentials(base: &Path) {
     let creds_dir = base.join(".config/tokscale");
     fs::create_dir_all(&creds_dir).unwrap();
@@ -1535,6 +1578,32 @@ fn test_pricing_command_invalid_provider() {
     ])
     .assert()
     .failure();
+}
+
+#[test]
+fn test_pricing_command_does_not_fuzzy_match_provider_scoped_fireworks_model() {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    write_fireworks_pricing_cache(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "pricing",
+            "accounts/fireworks/models/deepseek-v4-pro",
+            "--no-spinner",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Model not found: accounts/fireworks/models/deepseek-v4-pro"),
+        "expected a not-found message, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("deepseek-r1-0528-distill-qwen3-8b"),
+        "provider-scoped pricing lookup must not report the wrong Fireworks match: {stdout}"
+    );
 }
 
 // ── Clients command tests ──────────────────────────────────────────────────
