@@ -239,18 +239,20 @@ impl App {
         let has_data = !data.models.is_empty();
         let dialog_stack = DialogStack::new(theme.clone());
         let dialog_needs_reload = Rc::new(RefCell::new(false));
+        let current_tab = config.initial_tab.unwrap_or(Tab::Overview);
+        let (sort_field, sort_direction) = Self::default_sort_for_tab(current_tab);
 
         let mut app = Self {
             should_quit: false,
-            current_tab: config.initial_tab.unwrap_or(Tab::Overview),
+            current_tab,
             theme,
             settings,
             data,
             data_loader,
             enabled_clients: Rc::new(RefCell::new(enabled_clients)),
             group_by: Rc::new(RefCell::new(tokscale_core::GroupBy::Model)),
-            sort_field: SortField::Cost,
-            sort_direction: SortDirection::Descending,
+            sort_field,
+            sort_direction,
             tab_sort_state: HashMap::new(),
             chart_granularity: ChartGranularity::default(),
             scroll_offset: 0,
@@ -576,22 +578,30 @@ impl App {
     }
 
     fn switch_tab(&mut self, target: Tab) {
-        self.tab_sort_state
-            .insert(self.current_tab, (self.sort_field, self.sort_direction));
+        self.persist_current_sort();
 
         self.current_tab = target;
 
-        let (field, dir) =
-            self.tab_sort_state
-                .get(&target)
-                .copied()
-                .unwrap_or(if target == Tab::Hourly {
-                    (SortField::Date, SortDirection::Descending)
-                } else {
-                    (SortField::Cost, SortDirection::Descending)
-                });
+        let (field, dir) = self
+            .tab_sort_state
+            .get(&target)
+            .copied()
+            .unwrap_or_else(|| Self::default_sort_for_tab(target));
         self.sort_field = field;
         self.sort_direction = dir;
+    }
+
+    fn default_sort_for_tab(tab: Tab) -> (SortField, SortDirection) {
+        if tab == Tab::Hourly {
+            (SortField::Date, SortDirection::Descending)
+        } else {
+            (SortField::Cost, SortDirection::Descending)
+        }
+    }
+
+    fn persist_current_sort(&mut self) {
+        self.tab_sort_state
+            .insert(self.current_tab, (self.sort_field, self.sort_direction));
     }
 
     fn move_selection_up(&mut self) {
@@ -727,6 +737,7 @@ impl App {
             self.sort_field = field;
             self.sort_direction = SortDirection::Descending;
         }
+        self.persist_current_sort();
         self.reset_selection();
         self.set_status(&format!(
             "Sorted by {:?} {:?}",
@@ -1626,6 +1637,26 @@ mod tests {
     }
 
     #[test]
+    fn test_initial_hourly_tab_uses_hourly_sort_default() {
+        let config = TuiConfig {
+            theme: "blue".to_string(),
+            refresh: 0,
+            sessions_path: None,
+            clients: None,
+            since: None,
+            until: None,
+            year: None,
+            initial_tab: Some(Tab::Hourly),
+        };
+
+        let app = App::new_with_cached_data(config, None).unwrap();
+
+        assert_eq!(app.current_tab, Tab::Hourly);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+    }
+
+    #[test]
     fn test_switch_tab_preserves_user_sort() {
         let mut app = make_app();
         app.switch_tab(Tab::Models);
@@ -1639,6 +1670,24 @@ mod tests {
 
         app.switch_tab(Tab::Models);
         assert_eq!(app.sort_field, SortField::Tokens);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+    }
+
+    #[test]
+    fn test_switch_tab_preserves_daily_sort_after_hourly_roundtrip() {
+        let mut app = make_app();
+
+        app.switch_tab(Tab::Daily);
+        app.set_sort(SortField::Date);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.switch_tab(Tab::Hourly);
+        assert_eq!(app.sort_field, SortField::Date);
+        assert_eq!(app.sort_direction, SortDirection::Descending);
+
+        app.switch_tab(Tab::Daily);
+        assert_eq!(app.sort_field, SortField::Date);
         assert_eq!(app.sort_direction, SortDirection::Descending);
     }
 
