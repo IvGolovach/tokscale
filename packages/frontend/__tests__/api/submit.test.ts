@@ -1,6 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import type { ClientType } from "../../src/lib/types";
-import { validateSubmission } from "../../src/lib/validation/submission";
+import {
+  generateSubmissionHash,
+  validateSubmission,
+} from "../../src/lib/validation/submission";
 
 /**
  * Test suite for POST /api/submit - Client-Level Merge
@@ -88,6 +91,79 @@ function createMockSubmissionData(overrides: Partial<{
         messages: client.messages,
       })),
     })),
+  };
+}
+
+function createValidationPayload(overrides: Partial<{
+  date: string;
+  generatedAt: string;
+  totalTokens: number;
+  totalCost: number;
+  messages: number;
+  tokenBreakdown: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning: number;
+  };
+  clientCost: number;
+  clientMessages: number;
+}> = {}) {
+  const date = overrides.date ?? "2024-12-01";
+  const tokenBreakdown = overrides.tokenBreakdown ?? {
+    input: overrides.totalTokens ?? 1000,
+    output: 0,
+    cacheRead: 0,
+    cacheWrite: 0,
+    reasoning: 0,
+  };
+  const totalTokens = overrides.totalTokens ?? (
+    tokenBreakdown.input +
+    tokenBreakdown.output +
+    tokenBreakdown.cacheRead +
+    tokenBreakdown.cacheWrite +
+    tokenBreakdown.reasoning
+  );
+  const totalCost = overrides.totalCost ?? 1.5;
+  const messages = overrides.messages ?? 5;
+
+  return {
+    meta: {
+      generatedAt: overrides.generatedAt ?? "2024-12-02T00:00:00.000Z",
+      version: "2.1.1",
+      dateRange: { start: date, end: date },
+    },
+    summary: {
+      totalTokens,
+      totalCost,
+      totalDays: 1,
+      activeDays: totalTokens > 0 ? 1 : 0,
+      averagePerDay: totalCost,
+      maxCostInSingleDay: totalCost,
+      clients: ["claude" as const],
+      models: ["claude-sonnet-4-20250514"],
+    },
+    years: [{
+      year: date.slice(0, 4),
+      totalTokens,
+      totalCost,
+      range: { start: date, end: date },
+    }],
+    contributions: [{
+      date,
+      totals: { tokens: totalTokens, cost: totalCost, messages },
+      intensity: 2 as const,
+      tokenBreakdown,
+      clients: [{
+        client: "claude" as const,
+        modelId: "claude-sonnet-4-20250514",
+        providerId: "anthropic",
+        tokens: tokenBreakdown,
+        cost: overrides.clientCost ?? totalCost,
+        messages: overrides.clientMessages ?? messages,
+      }],
+    }],
   };
 }
 
@@ -227,6 +303,116 @@ describe('POST /api/submit - Client-Level Merge', () => {
 
       expect(result.valid).toBe(true);
       expect(result.errors).toHaveLength(0);
+    });
+  });
+
+  describe("Submission validation guardrails", () => {
+    it("rejects one-day fabricated token totals above the submission cap", () => {
+      const payload = createValidationPayload({
+        totalTokens: 1_000_000_000_000,
+        tokenBreakdown: {
+          input: 1_000_000_000_000,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+        },
+      });
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.join("\n")).toContain("Daily token total exceeds");
+    });
+
+    it("rejects submitted cost that is implausible for the reported tokens", () => {
+      const payload = createValidationPayload({
+        totalTokens: 5,
+        totalCost: 1_000_000_000,
+        tokenBreakdown: {
+          input: 5,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+        },
+      });
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.join("\n")).toContain("Cost per million tokens exceeds");
+    });
+
+    it("rejects submitted cost without corresponding tokens", () => {
+      const payload = createValidationPayload({
+        totalTokens: 0,
+        totalCost: 25,
+        tokenBreakdown: {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+        },
+      });
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.join("\n")).toContain("Cost submitted without tokens");
+    });
+
+    it("rejects day cost totals that do not match client costs", () => {
+      const payload = createValidationPayload({
+        totalTokens: 1000,
+        totalCost: 100,
+        clientCost: 1,
+      });
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.join("\n")).toContain("client cost");
+    });
+
+    it("hashes content changes while ignoring generatedAt churn", () => {
+      const lowerPayload = createValidationPayload({
+        generatedAt: "2024-12-02T00:00:00.000Z",
+        totalTokens: 1000,
+        totalCost: 1,
+      });
+      const samePayloadNewGeneratedAt = createValidationPayload({
+        generatedAt: "2024-12-03T00:00:00.000Z",
+        totalTokens: 1000,
+        totalCost: 1,
+      });
+      const higherPayload = createValidationPayload({
+        generatedAt: "2024-12-02T00:00:00.000Z",
+        totalTokens: 2000,
+        totalCost: 2,
+        tokenBreakdown: {
+          input: 2000,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+        },
+      });
+
+      const lowerResult = validateSubmission(lowerPayload);
+      const sameResult = validateSubmission(samePayloadNewGeneratedAt);
+      const higherResult = validateSubmission(higherPayload);
+
+      expect(lowerResult.valid).toBe(true);
+      expect(sameResult.valid).toBe(true);
+      expect(higherResult.valid).toBe(true);
+      expect(generateSubmissionHash(lowerResult.data!)).toBe(
+        generateSubmissionHash(sameResult.data!)
+      );
+      expect(generateSubmissionHash(lowerResult.data!)).not.toBe(
+        generateSubmissionHash(higherResult.data!)
+      );
     });
   });
 

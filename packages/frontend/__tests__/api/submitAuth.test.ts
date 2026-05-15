@@ -195,6 +195,8 @@ describe("POST /api/submit auth path", () => {
     });
     expect(mockState.validateSubmission).toHaveBeenCalledTimes(1);
     expect(mockState.db.transaction).not.toHaveBeenCalled();
+    expect(mockState.revalidateTag).not.toHaveBeenCalled();
+    expect(mockState.revalidateUsernamePaths).not.toHaveBeenCalled();
     expect(await response.json()).toEqual({
       error: "Validation failed",
       details: ["bad payload"],
