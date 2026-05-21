@@ -222,7 +222,7 @@ impl App {
             .theme
             .parse()
             .unwrap_or_else(|_| settings.theme_name());
-        let theme = Theme::from_name(theme_name);
+        let theme = Theme::from_name_for_current_terminal(theme_name);
 
         let enabled_clients: HashSet<ClientFilter> = if let Some(ref cli_clients) = config.clients {
             // CLI-provided filter list. Each entry is the canonical
@@ -876,7 +876,7 @@ impl App {
 
     fn cycle_theme(&mut self) {
         let new_theme = self.theme.name.next();
-        self.theme = Theme::from_name(new_theme);
+        self.theme = Theme::from_name_for_current_terminal(new_theme);
         self.dialog_stack.set_theme(self.theme.clone());
         self.settings.set_theme(new_theme);
         if let Err(e) = self.settings.save() {
