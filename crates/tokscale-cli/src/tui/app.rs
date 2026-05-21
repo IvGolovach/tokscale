@@ -157,6 +157,14 @@ pub enum ClickAction {
     GraphCell { week: usize, day: usize },
 }
 
+struct MinutelySortCache {
+    sort_field: SortField,
+    sort_direction: SortDirection,
+    data_version: u64,
+    data_len: usize,
+    indices: Vec<usize>,
+}
+
 pub struct App {
     pub should_quit: bool,
     pub current_tab: Tab,
@@ -213,6 +221,8 @@ pub struct App {
     pub hourly_view_mode: HourlyViewMode,
 
     pub model_shade_map: HashMap<String, Color>,
+    data_version: u64,
+    minutely_sort_cache: RefCell<Option<MinutelySortCache>>,
 }
 
 impl App {
@@ -312,6 +322,8 @@ impl App {
             dialog_needs_reload,
             hourly_view_mode: HourlyViewMode::default(),
             model_shade_map: HashMap::new(),
+            data_version: 0,
+            minutely_sort_cache: RefCell::new(None),
         };
         app.build_model_shade_map();
         Ok(app)
@@ -324,8 +336,10 @@ impl App {
 
     pub fn update_data(&mut self, data: UsageData) {
         self.data = data;
+        self.data_version = self.data_version.saturating_add(1);
         self.last_refresh = Instant::now();
         self.build_model_shade_map();
+        self.minutely_sort_cache.borrow_mut().take();
 
         // Exit Daily-detail mode if the refresh dropped the day we were
         // viewing; otherwise `get_sorted_daily_detail_rows()` would return
@@ -1321,38 +1335,82 @@ impl App {
     }
 
     pub fn get_sorted_minutely(&self) -> Vec<&MinutelyUsage> {
-        let mut minutely: Vec<&MinutelyUsage> = self.data.minutely.iter().collect();
+        let sort_field = self.sort_field;
+        let sort_direction = self.sort_direction;
+        let data_version = self.data_version;
+        let data_len = self.data.minutely.len();
 
-        match (self.sort_field, self.sort_direction) {
-            (SortField::Cost, SortDirection::Descending) => minutely.sort_by(|a, b| {
-                b.cost
-                    .total_cmp(&a.cost)
-                    .then_with(|| a.datetime.cmp(&b.datetime))
-            }),
-            (SortField::Cost, SortDirection::Ascending) => minutely.sort_by(|a, b| {
-                a.cost
-                    .total_cmp(&b.cost)
-                    .then_with(|| a.datetime.cmp(&b.datetime))
-            }),
-            (SortField::Tokens, SortDirection::Descending) => minutely.sort_by(|a, b| {
-                b.tokens
-                    .total()
-                    .cmp(&a.tokens.total())
-                    .then_with(|| a.datetime.cmp(&b.datetime))
-            }),
-            (SortField::Tokens, SortDirection::Ascending) => minutely.sort_by(|a, b| {
-                a.tokens
-                    .total()
-                    .cmp(&b.tokens.total())
-                    .then_with(|| a.datetime.cmp(&b.datetime))
-            }),
-            (SortField::Date, SortDirection::Descending) => {
-                minutely.sort_by_key(|b| std::cmp::Reverse(b.datetime))
+        let cached_indices = {
+            let cache = self.minutely_sort_cache.borrow();
+            cache
+                .as_ref()
+                .filter(|cache| {
+                    cache.sort_field == sort_field
+                        && cache.sort_direction == sort_direction
+                        && cache.data_version == data_version
+                        && cache.data_len == data_len
+                })
+                .map(|cache| cache.indices.clone())
+        };
+
+        let indices = if let Some(indices) = cached_indices {
+            indices
+        } else {
+            let mut indices: Vec<usize> = (0..data_len).collect();
+
+            match (sort_field, sort_direction) {
+                (SortField::Cost, SortDirection::Descending) => indices.sort_by(|a, b| {
+                    let a = &self.data.minutely[*a];
+                    let b = &self.data.minutely[*b];
+                    b.cost
+                        .total_cmp(&a.cost)
+                        .then_with(|| a.datetime.cmp(&b.datetime))
+                }),
+                (SortField::Cost, SortDirection::Ascending) => indices.sort_by(|a, b| {
+                    let a = &self.data.minutely[*a];
+                    let b = &self.data.minutely[*b];
+                    a.cost
+                        .total_cmp(&b.cost)
+                        .then_with(|| a.datetime.cmp(&b.datetime))
+                }),
+                (SortField::Tokens, SortDirection::Descending) => indices.sort_by(|a, b| {
+                    let a = &self.data.minutely[*a];
+                    let b = &self.data.minutely[*b];
+                    b.tokens
+                        .total()
+                        .cmp(&a.tokens.total())
+                        .then_with(|| a.datetime.cmp(&b.datetime))
+                }),
+                (SortField::Tokens, SortDirection::Ascending) => indices.sort_by(|a, b| {
+                    let a = &self.data.minutely[*a];
+                    let b = &self.data.minutely[*b];
+                    a.tokens
+                        .total()
+                        .cmp(&b.tokens.total())
+                        .then_with(|| a.datetime.cmp(&b.datetime))
+                }),
+                (SortField::Date, SortDirection::Descending) => indices
+                    .sort_by_key(|index| std::cmp::Reverse(self.data.minutely[*index].datetime)),
+                (SortField::Date, SortDirection::Ascending) => {
+                    indices.sort_by_key(|index| self.data.minutely[*index].datetime)
+                }
             }
-            (SortField::Date, SortDirection::Ascending) => minutely.sort_by_key(|a| a.datetime),
-        }
 
-        minutely
+            *self.minutely_sort_cache.borrow_mut() = Some(MinutelySortCache {
+                sort_field,
+                sort_direction,
+                data_version,
+                data_len,
+                indices: indices.clone(),
+            });
+
+            indices
+        };
+
+        indices
+            .into_iter()
+            .map(|index| &self.data.minutely[index])
+            .collect()
     }
 
     pub fn is_narrow(&self) -> bool {
@@ -1369,8 +1427,8 @@ mod tests {
     use super::super::ui::widgets::get_provider_shade;
     use super::*;
     use crate::tui::data::{DailyModelInfo, DailySourceInfo, ModelUsage, TokenBreakdown};
-    use chrono::NaiveDate;
-    use std::collections::BTreeMap;
+    use chrono::{NaiveDate, NaiveDateTime};
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn test_tab_all() {
@@ -1743,6 +1801,122 @@ mod tests {
         }
     }
 
+    fn minutely_usage(datetime: &str, input_tokens: u64, cost: f64) -> MinutelyUsage {
+        MinutelyUsage {
+            datetime: NaiveDateTime::parse_from_str(datetime, "%Y-%m-%d %H:%M:%S").unwrap(),
+            tokens: TokenBreakdown {
+                input: input_tokens,
+                output: 0,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            cost,
+            clients: BTreeSet::new(),
+            models: BTreeMap::new(),
+            message_count: 1,
+            turn_count: 1,
+        }
+    }
+
+    #[test]
+    fn test_get_sorted_minutely_reuses_cached_order_for_same_sort() {
+        let mut app = make_app();
+        app.data.minutely = vec![
+            minutely_usage("2026-05-20 10:00:00", 10, 1.0),
+            minutely_usage("2026-05-20 10:01:00", 20, 9.0),
+        ];
+
+        let first = app
+            .get_sorted_minutely()
+            .iter()
+            .map(|entry| entry.datetime)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first,
+            vec![
+                NaiveDateTime::parse_from_str("2026-05-20 10:01:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+                NaiveDateTime::parse_from_str("2026-05-20 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+            ]
+        );
+
+        app.data.minutely.swap(0, 1);
+
+        let second = app
+            .get_sorted_minutely()
+            .iter()
+            .map(|entry| entry.datetime)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            second,
+            vec![
+                NaiveDateTime::parse_from_str("2026-05-20 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+                NaiveDateTime::parse_from_str("2026-05-20 10:01:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+            ],
+            "unchanged data should reuse the cached sorted index order"
+        );
+    }
+
+    #[test]
+    fn test_get_sorted_minutely_invalidates_cache_when_sort_changes() {
+        let mut app = make_app();
+        app.data.minutely = vec![
+            minutely_usage("2026-05-20 10:00:00", 10, 1.0),
+            minutely_usage("2026-05-20 10:01:00", 20, 9.0),
+        ];
+        let _ = app.get_sorted_minutely();
+
+        app.data.minutely.swap(0, 1);
+        app.set_sort(SortField::Date);
+
+        let sorted = app
+            .get_sorted_minutely()
+            .iter()
+            .map(|entry| entry.datetime)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sorted,
+            vec![
+                NaiveDateTime::parse_from_str("2026-05-20 10:01:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+                NaiveDateTime::parse_from_str("2026-05-20 10:00:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+            ],
+            "changing sort key should rebuild the minutely sorted cache"
+        );
+    }
+
+    #[test]
+    fn test_get_sorted_minutely_invalidates_cache_when_data_updates() {
+        let mut app = make_app();
+        app.data.minutely = vec![
+            minutely_usage("2026-05-20 10:00:00", 10, 1.0),
+            minutely_usage("2026-05-20 10:01:00", 20, 9.0),
+        ];
+        let _ = app.get_sorted_minutely();
+
+        let refreshed = UsageData {
+            minutely: vec![
+                minutely_usage("2026-05-20 10:02:00", 30, 2.0),
+                minutely_usage("2026-05-20 10:03:00", 40, 12.0),
+            ],
+            ..Default::default()
+        };
+        app.update_data(refreshed);
+
+        let sorted = app
+            .get_sorted_minutely()
+            .iter()
+            .map(|entry| entry.datetime)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sorted,
+            vec![
+                NaiveDateTime::parse_from_str("2026-05-20 10:03:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+                NaiveDateTime::parse_from_str("2026-05-20 10:02:00", "%Y-%m-%d %H:%M:%S").unwrap(),
+            ],
+            "update_data should clear stale minutely sorted cache entries"
+        );
+    }
+
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
@@ -2062,11 +2236,13 @@ mod tests {
         app.handle_key_event(key(KeyCode::Enter));
         assert!(app.is_daily_detail_active());
 
-        let mut refreshed = UsageData::default();
-        refreshed.daily = vec![
-            daily_usage("2026-05-10", 1.0, vec![("old-model", "anthropic", 1.0)]),
-            daily_usage("2026-05-18", 3.0, vec![("other-model", "google", 3.0)]),
-        ];
+        let refreshed = UsageData {
+            daily: vec![
+                daily_usage("2026-05-10", 1.0, vec![("old-model", "anthropic", 1.0)]),
+                daily_usage("2026-05-18", 3.0, vec![("other-model", "google", 3.0)]),
+            ],
+            ..Default::default()
+        };
         app.update_data(refreshed);
 
         assert!(
@@ -2097,15 +2273,17 @@ mod tests {
         app.handle_key_event(key(KeyCode::Enter));
         assert!(app.is_daily_detail_active());
 
-        let mut refreshed = UsageData::default();
-        refreshed.daily = vec![
-            daily_usage("2026-05-10", 1.0, vec![("old-model", "anthropic", 1.0)]),
-            daily_usage(
-                "2026-05-17",
-                9.0,
-                vec![("target-a", "openai", 7.0), ("target-b", "anthropic", 2.0)],
-            ),
-        ];
+        let refreshed = UsageData {
+            daily: vec![
+                daily_usage("2026-05-10", 1.0, vec![("old-model", "anthropic", 1.0)]),
+                daily_usage(
+                    "2026-05-17",
+                    9.0,
+                    vec![("target-a", "openai", 7.0), ("target-b", "anthropic", 2.0)],
+                ),
+            ],
+            ..Default::default()
+        };
         app.update_data(refreshed);
 
         assert!(app.is_daily_detail_active());
