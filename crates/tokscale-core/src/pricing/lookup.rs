@@ -3283,6 +3283,54 @@ mod tests {
         assert!((cost - expected).abs() < 1e-12);
     }
 
+    #[test]
+    fn test_anthropic_prefixed_sonnet_variant_uses_canonical_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-sonnet-4-6".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.000003),
+                output_cost_per_token: Some(0.000015),
+                cache_read_input_token_cost: Some(0.0000003),
+                cache_creation_input_token_cost: Some(0.00000375),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-4-6-sonnet").unwrap();
+        assert_eq!(resolved.source, "LiteLLM");
+        assert_eq!(resolved.matched_key, "claude-sonnet-4-6");
+
+        let cost = lookup.calculate_cost("anthropic/claude-4-6-sonnet", 100, 20, 10, 5, 0);
+        let expected = 100.0 * 0.000003 + 20.0 * 0.000015 + 10.0 * 0.0000003 + 5.0 * 0.00000375;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_anthropic_prefixed_haiku_variant_uses_canonical_pricing() {
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "claude-haiku-4-5".into(),
+            ModelPricing {
+                input_cost_per_token: Some(0.0000008),
+                output_cost_per_token: Some(0.000004),
+                cache_read_input_token_cost: Some(0.00000008),
+                cache_creation_input_token_cost: Some(0.000001),
+                ..Default::default()
+            },
+        );
+
+        let lookup = PricingLookup::new(litellm, HashMap::new(), HashMap::new());
+        let resolved = lookup.lookup("anthropic/claude-4-5-haiku").unwrap();
+        assert_eq!(resolved.source, "LiteLLM");
+        assert_eq!(resolved.matched_key, "claude-haiku-4-5");
+
+        let cost = lookup.calculate_cost("anthropic/claude-4-5-haiku", 100, 20, 10, 5, 0);
+        let expected = 100.0 * 0.0000008 + 20.0 * 0.000004 + 10.0 * 0.00000008 + 5.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
     /// Regression test for #336: subscription-based resellers (e.g. Perplexity) with
     /// all-None pricing should not shadow valid entries during provider-aware lookup.
     /// `perplexity/anthropic/claude-opus-4-6` matches provider hint "anthropic" via

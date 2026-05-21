@@ -82,7 +82,28 @@ pub fn normalize_model_for_grouping(model_id: &str) -> String {
         name = result;
     }
 
+    if let Some(canonical) = normalize_anthropic_prefixed_claude_model(&name) {
+        name = canonical;
+    }
+
     name
+}
+
+fn normalize_anthropic_prefixed_claude_model(model_id: &str) -> Option<String> {
+    let rest = model_id.strip_prefix("anthropic/claude-")?;
+    let mut parts = rest.split('-');
+    let major = parts.next()?;
+    let minor = parts.next()?;
+    let family = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if !matches!(family, "opus" | "sonnet" | "haiku") {
+        return None;
+    }
+
+    Some(format!("claude-{family}-{major}-{minor}"))
 }
 
 fn retain_for_requested_clients(
@@ -2380,6 +2401,18 @@ mod tests {
             normalize_model_for_grouping("claude-opus-4.6"),
             "claude-opus-4-6"
         );
+        assert_eq!(
+            normalize_model_for_grouping("anthropic/claude-4-6-sonnet"),
+            "claude-sonnet-4-6"
+        );
+        assert_eq!(
+            normalize_model_for_grouping("anthropic/claude-4-5-haiku"),
+            "claude-haiku-4-5"
+        );
+        assert_eq!(
+            normalize_model_for_grouping("anthropic/claude-4-6-opus"),
+            "claude-opus-4-6"
+        );
 
         assert_eq!(normalize_model_for_grouping("gpt-5.2"), "gpt-5.2");
         assert_eq!(normalize_model_for_grouping("gpt-5.4(xhigh)"), "gpt-5.4");
@@ -2536,6 +2569,40 @@ mod tests {
         assert_eq!(entries[0].cost, 4.0);
         assert_eq!(entries[0].message_count, 2);
         assert_eq!(entries[0].merged_clients.as_deref(), Some("claude, qwen"));
+    }
+
+    #[test]
+    fn test_model_grouping_merges_anthropic_prefixed_claude_variant_with_canonical_model() {
+        let entries = aggregate_model_usage_entries(
+            vec![
+                make_workspace_message(
+                    "claude",
+                    "anthropic/claude-4-6-sonnet",
+                    "anthropic",
+                    "session-1",
+                    1.25,
+                    Some("/repo-a"),
+                    Some("repo-a"),
+                ),
+                make_workspace_message(
+                    "claude",
+                    "claude-sonnet-4-6",
+                    "anthropic",
+                    "session-2",
+                    2.75,
+                    Some("/repo-b"),
+                    Some("repo-b"),
+                ),
+            ],
+            &GroupBy::ClientModel,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model, "claude-sonnet-4-6");
+        assert_eq!(entries[0].input, 20);
+        assert_eq!(entries[0].output, 10);
+        assert_eq!(entries[0].cost, 4.0);
+        assert_eq!(entries[0].message_count, 2);
     }
 
     #[test]
