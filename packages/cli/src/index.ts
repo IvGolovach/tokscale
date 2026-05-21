@@ -169,21 +169,6 @@ function isSelfReference(p: string): boolean {
 let binary = searchPaths.find((p) => existsSync(p) && !isSelfReference(p));
 
 if (!binary) {
-  try {
-    const whichCmd = process.platform === "win32" ? "where" : "which";
-    const found = execSync(`${whichCmd} ${binaryName}`, {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    })
-      .trim()
-      .split("\n")[0];
-    if (found && existsSync(found) && !isSelfReference(found)) {
-      binary = found;
-    }
-  } catch {}
-}
-
-if (!binary) {
   console.error("Error: tokscale binary not found");
   console.error("Build from source: cargo build --release -p tokscale-cli");
   if (targetPackage) {
