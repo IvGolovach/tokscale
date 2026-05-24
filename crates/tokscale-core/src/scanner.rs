@@ -120,6 +120,35 @@ impl ScanResult {
 
         result
     }
+
+    /// Return every Hermes SQLite database that should be parsed.
+    ///
+    /// Hermes has a default `state.db` path plus optional profile databases
+    /// discovered through `scanner.extraScanPaths.hermes`. The generic
+    /// `files` bucket carries the extra profile DBs, so this helper gives
+    /// callers a single deduped view without changing older `hermes_db`
+    /// consumers that only expect the default path.
+    pub fn hermes_db_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+
+        let mut push = |path: &Path| {
+            let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if seen.insert(key) {
+                paths.push(path.to_path_buf());
+            }
+        };
+
+        if let Some(path) = &self.hermes_db {
+            push(path);
+        }
+
+        for path in self.get(ClientId::Hermes) {
+            push(path);
+        }
+
+        paths
+    }
 }
 
 pub fn headless_roots_with_env_strategy(home_dir: &str, use_env_roots: bool) -> Vec<PathBuf> {
@@ -233,6 +262,7 @@ pub fn scan_directory(root: &str, pattern: &str) -> Vec<PathBuf> {
                 "ui_messages.json" => file_name == "ui_messages.json",
                 "session-usage.json" => file_name == "session-usage.json",
                 "chat-messages.json" => file_name == "chat-messages.json",
+                "state.db" => file_name == "state.db",
                 _ => false,
             }
         })
@@ -453,12 +483,13 @@ fn discover_crush_dbs(home_dir: &str, use_env_roots: bool) -> Vec<CrushDbSource>
 
 fn supports_extra_dir_scanning(client_id: ClientId) -> bool {
     // Kilo CLI currently loads a single SQLite DB via `scan_result.kilo_db`
-    // Kilo CLI and Hermes use SQLite database paths, Roo/KiloCode require local + remote
-    // and server task roots, and Crush discovers SQLite DBs via the project
-    // registry rather than scanned file paths.
+    // Roo/KiloCode require local + remote and server task roots, and Crush
+    // discovers SQLite DBs via the project registry rather than scanned file
+    // paths. Hermes profile databases are named `state.db`, so they can use
+    // `extraScanPaths` once `scan_directory` knows that exact filename.
     !matches!(
         client_id,
-        ClientId::Kilo | ClientId::Crush | ClientId::Hermes | ClientId::Goose | ClientId::Zed
+        ClientId::Kilo | ClientId::Crush | ClientId::Goose | ClientId::Zed
     )
 }
 
@@ -1730,6 +1761,78 @@ mod tests {
         );
 
         assert_eq!(result.get(ClientId::Codex).len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_merges_hermes_extra_profile_db() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let default_dir = home.join(".hermes");
+        fs::create_dir_all(&default_dir).unwrap();
+        let default_db = default_dir.join("state.db");
+        File::create(&default_db).unwrap();
+
+        let profile_dir = home.join(".hermes/profiles/director_planning");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "hermes": [
+                    profile_dir,
+                    profile_db
+                ]
+            }
+        }))
+        .unwrap();
+
+        let result = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &settings,
+        );
+
+        assert_eq!(result.hermes_db.as_ref(), Some(&default_db));
+        assert_eq!(result.hermes_db_paths(), vec![default_db, profile_db]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_scan_all_clients_with_scanner_settings_respects_hermes_client_filter() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+
+        let profile_dir = home.join(".hermes/profiles/director_planning");
+        fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        File::create(&profile_db).unwrap();
+
+        let settings: ScannerSettings = serde_json::from_value(serde_json::json!({
+            "extraScanPaths": {
+                "hermes": [profile_dir]
+            }
+        }))
+        .unwrap();
+
+        let claude_only = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            true,
+            &settings,
+        );
+        assert!(claude_only.hermes_db_paths().is_empty());
+
+        let hermes_only = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            true,
+            &settings,
+        );
+        assert_eq!(hermes_only.hermes_db_paths(), vec![profile_db]);
     }
 
     #[test]

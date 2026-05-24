@@ -1816,6 +1816,50 @@ fn test_clients_json_includes_settings_extra_paths() {
 }
 
 #[test]
+fn test_clients_json_includes_hermes_settings_extra_profile_path() {
+    let tmp = create_empty_fixture_dir();
+    let hermes_profile = tmp.path().join(".hermes/profiles/director_planning");
+    fs::create_dir_all(&hermes_profile).unwrap();
+    let hermes_profile_json = serde_json::to_string(&hermes_profile).unwrap();
+    write_settings_json(
+        tmp.path(),
+        &format!(
+            r#"{{
+            "scanner": {{
+                "extraScanPaths": {{
+                    "hermes": [{hermes_profile_json}]
+                }}
+            }}
+        }}"#
+        ),
+    );
+
+    let output = cmd_with_home(tmp.path())
+        .args(["clients", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let hermes = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "hermes")
+        .unwrap();
+
+    assert_eq!(
+        hermes["extraPaths"][0]["path"],
+        serde_json::json!(hermes_profile)
+    );
+    assert_eq!(
+        hermes["extraPaths"][0]["source"],
+        serde_json::json!("settings")
+    );
+    assert_eq!(hermes["extraPaths"][0]["exists"], true);
+}
+
+#[test]
 fn test_clients_command_includes_settings_extra_paths_text() {
     let tmp = create_empty_fixture_dir();
     write_settings_json(

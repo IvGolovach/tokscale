@@ -1176,17 +1176,14 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         all_messages.extend(kilo_messages);
     }
 
-    if let Some(db_path) = &scan_result.hermes_db {
-        let hermes_messages: Vec<UnifiedMessage> = sessions::hermes::parse_hermes_sqlite(db_path)
-            .into_iter()
-            .map(|mut msg| {
-                if msg.cost <= 0.0 {
-                    apply_pricing_if_available(&mut msg, pricing);
-                }
-                msg
-            })
-            .collect();
-        all_messages.extend(hermes_messages);
+    let mut hermes_seen: HashSet<String> = HashSet::new();
+    for db_path in scan_result.hermes_db_paths() {
+        let hermes_messages = parse_hermes_sqlite_with_pricing(&db_path, pricing);
+        all_messages.extend(
+            hermes_messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
+        );
     }
 
     if let Some(db_path) = &scan_result.goose_db {
@@ -1910,6 +1907,21 @@ fn apply_pricing_if_available(
     }
 }
 
+fn parse_hermes_sqlite_with_pricing(
+    db_path: &Path,
+    pricing: Option<&pricing::PricingService>,
+) -> Vec<UnifiedMessage> {
+    sessions::hermes::parse_hermes_sqlite(db_path)
+        .into_iter()
+        .map(|mut msg| {
+            if msg.cost <= 0.0 {
+                apply_pricing_if_available(&mut msg, pricing);
+            }
+            msg
+        })
+        .collect()
+}
+
 fn select_local_parse_pricing<F>(
     fresh: Result<Arc<pricing::PricingService>, String>,
     stale: F,
@@ -2278,9 +2290,13 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         0
     };
 
-    if let Some(db_path) = &scan_result.hermes_db {
-        let hermes_msgs: Vec<ParsedMessage> = sessions::hermes::parse_hermes_sqlite(db_path)
-            .into_iter()
+    let hermes_db_paths = scan_result.hermes_db_paths();
+    if !hermes_db_paths.is_empty() {
+        let mut hermes_seen: HashSet<String> = HashSet::new();
+        let hermes_msgs: Vec<ParsedMessage> = hermes_db_paths
+            .iter()
+            .flat_map(|db_path| sessions::hermes::parse_hermes_sqlite(db_path))
+            .filter(|msg| should_keep_deduped_message(&mut hermes_seen, msg))
             .map(|msg| unified_to_parsed(&msg))
             .collect();
         let count = summed_parsed_message_count(&hermes_msgs);
@@ -2626,6 +2642,56 @@ mod tests {
         )
         .unwrap();
         conn
+    }
+
+    fn create_hermes_sqlite_db(db_path: &std::path::Path) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open(db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                model TEXT,
+                started_at REAL NOT NULL,
+                message_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                billing_provider TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL
+            );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_hermes_session(
+        conn: &rusqlite::Connection,
+        id: &str,
+        model: &str,
+        message_count: i64,
+        input_tokens: i64,
+        output_tokens: i64,
+        actual_cost_usd: f64,
+    ) {
+        conn.execute(
+            "INSERT INTO sessions (
+                id, source, model, started_at, message_count,
+                input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                billing_provider, estimated_cost_usd, actual_cost_usd
+            ) VALUES (?1, 'cli', ?2, 1775001102.0, ?3, ?4, ?5, 0, 0, 0, 'anthropic', NULL, ?6)",
+            rusqlite::params![
+                id,
+                model,
+                message_count,
+                input_tokens,
+                output_tokens,
+                actual_cost_usd
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -5526,6 +5592,126 @@ mod tests {
         assert_eq!(parsed_with_settings.messages.len(), 1);
         assert_eq!(parsed_with_settings.messages[0].client, "opencode");
         assert_eq!(parsed_with_settings.messages[0].model_id, "claude-sonnet-4");
+    }
+
+    #[test]
+    fn test_parse_local_clients_honors_scanner_extra_scan_paths_for_hermes_profile_db() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &conn,
+            "hermes-extra-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(conn);
+
+        let parsed_default = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+        assert_eq!(parsed_default.counts.get(ClientId::Hermes), 0);
+        assert!(parsed_default.messages.is_empty());
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_dir]);
+        let parsed_with_settings = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(parsed_with_settings.counts.get(ClientId::Hermes), 2);
+        assert_eq!(parsed_with_settings.messages.len(), 1);
+        assert_eq!(parsed_with_settings.messages[0].client, "hermes");
+        assert_eq!(
+            parsed_with_settings.messages[0].agent.as_deref(),
+            Some("Hermes Agent")
+        );
+        assert_eq!(
+            parsed_with_settings.messages[0].session_id,
+            "hermes-extra-session"
+        );
+        assert_eq!(parsed_with_settings.messages[0].model_id, "claude-sonnet-4");
+        assert_eq!(parsed_with_settings.messages[0].input, 100);
+        assert_eq!(parsed_with_settings.messages[0].output, 25);
+    }
+
+    #[test]
+    fn test_parse_local_clients_dedups_hermes_sessions_across_default_and_extra_dbs() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+
+        let default_dir = temp_dir.path().join(".hermes");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        let default_db = default_dir.join("state.db");
+        let default_conn = create_hermes_sqlite_db(&default_db);
+        insert_hermes_session(
+            &default_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            2,
+            100,
+            25,
+            0.07,
+        );
+        drop(default_conn);
+
+        let profile_dir = temp_dir.path().join(".hermes/profiles/director_planning");
+        std::fs::create_dir_all(&profile_dir).unwrap();
+        let profile_db = profile_dir.join("state.db");
+        let profile_conn = create_hermes_sqlite_db(&profile_db);
+        insert_hermes_session(
+            &profile_conn,
+            "shared-hermes-session",
+            "claude-sonnet-4",
+            9,
+            999,
+            999,
+            9.99,
+        );
+        drop(profile_conn);
+
+        let mut extra_scan_paths = std::collections::BTreeMap::new();
+        extra_scan_paths.insert("hermes".to_string(), vec![profile_db]);
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(temp_dir.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["hermes".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings {
+                extra_scan_paths,
+                ..Default::default()
+            },
+        })
+        .unwrap();
+
+        assert_eq!(parsed.counts.get(ClientId::Hermes), 2);
+        assert_eq!(parsed.messages.len(), 1);
+        assert_eq!(parsed.messages[0].session_id, "shared-hermes-session");
+        assert_eq!(parsed.messages[0].input, 100);
+        assert_eq!(parsed.messages[0].output, 25);
     }
 
     #[test]
