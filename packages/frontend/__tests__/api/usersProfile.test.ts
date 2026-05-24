@@ -346,6 +346,134 @@ describe("GET /api/users/[username]", () => {
     expect(body.models).toEqual(["claude-3-7-sonnet"]);
   });
 
+  it("aggregates same-date rows from multiple submitted devices into one profile contribution", async () => {
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 150,
+        totalCost: 1.5,
+        inputTokens: 100,
+        outputTokens: 50,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 2,
+        earliestDate: "2026-04-30",
+        latestDate: "2026-04-30",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        sourcesUsed: ["codex", "claude"],
+        modelsUsed: ["gpt-5.5", "claude-sonnet-4"],
+        updatedAt: new Date("2026-04-30T10:00:00.000Z"),
+        cliVersion: "2.0.0",
+        schemaVersion: 2,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        date: "2026-04-30",
+        timestampMs: 1_776_000_000_000,
+        tokens: 100,
+        cost: "1.0000",
+        inputTokens: 70,
+        outputTokens: 30,
+        sourceBreakdown: {
+          codex: {
+            tokens: 100,
+            cost: 1,
+            input: 70,
+            output: 30,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            messages: 2,
+            models: {
+              "gpt-5.5": {
+                tokens: 100,
+                cost: 1,
+                input: 70,
+                output: 30,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0,
+                messages: 2,
+              },
+            },
+          },
+        },
+      },
+      {
+        date: "2026-04-30",
+        timestampMs: 1_775_999_000_000,
+        tokens: 50,
+        cost: "0.5000",
+        inputTokens: 30,
+        outputTokens: 20,
+        sourceBreakdown: {
+          claude: {
+            tokens: 50,
+            cost: 0.5,
+            input: 30,
+            output: 20,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            messages: 1,
+            models: {
+              "claude-sonnet-4": {
+                tokens: 50,
+                cost: 0.5,
+                input: 30,
+                output: 20,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0,
+                messages: 1,
+              },
+            },
+          },
+        },
+      },
+    ]);
+    mockState.pushExecuteResult([{ rank: 1 }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.contributions).toHaveLength(1);
+    expect(body.contributions[0]).toMatchObject({
+      date: "2026-04-30",
+      timestampMs: 1_775_999_000_000,
+      totals: {
+        tokens: 150,
+        cost: 1.5,
+      },
+      tokenBreakdown: {
+        input: 100,
+        output: 50,
+      },
+    });
+    expect(body.contributions[0].clients.map((client: { client: string }) => client.client).sort()).toEqual([
+      "claude",
+      "codex",
+    ]);
+    expect(body.stats.activeDays).toBe(1);
+  });
+
   it("returns null freshness metadata when the user has no submission yet", async () => {
     mockState.pushSelectResult([
       {

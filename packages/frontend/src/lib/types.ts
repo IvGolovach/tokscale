@@ -84,11 +84,25 @@ export interface ExportMeta {
   };
 }
 
+export interface SubmitDevice {
+  id: string;
+  name?: string;
+}
+
+export interface TimeMetrics {
+  totalActiveTimeMs: number;
+  longestContinuousMs: number;
+  maxConcurrentSessions: number;
+  sessionCount: number;
+}
+
 export interface TokenContributionData {
   meta: ExportMeta;
+  device?: SubmitDevice;
   summary: DataSummary;
   years: YearSummary[];
   contributions: DailyContribution[];
+  timeMetrics?: TimeMetrics;
 }
 
 export type ColorPaletteName =
