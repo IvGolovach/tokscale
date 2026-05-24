@@ -173,6 +173,7 @@ function buildPeriodGroupLeaderboardData(
       role: row.role,
       totalTokens: row.tokens,
       totalCost: row.cost,
+      totalActiveTimeMs: null,
       submissionCount: null,
       lastSubmission: row.updatedAt,
       submissionFreshness: buildSubmissionFreshness({
@@ -312,6 +313,7 @@ async function fetchAllTimeRows(groupId: string, sortBy: SortBy): Promise<GroupL
     role: row.role,
     totalTokens: Number(row.totalTokens) || 0,
     totalCost: Number(row.totalCost) || 0,
+    totalActiveTimeMs: null,
     submissionCount: Number(row.submissionCount) || 0,
     lastSubmission: row.lastSubmission,
     submissionFreshness: buildSubmissionFreshness({

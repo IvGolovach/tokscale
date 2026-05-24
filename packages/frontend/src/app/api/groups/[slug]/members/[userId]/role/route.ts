@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne, sql } from "drizzle-orm";
 import { db, groupMembers } from "@/lib/db";
 import { getSessionFromRequest } from "@/lib/auth/requestSession";
 import { revalidateGroupCaches } from "@/lib/groups/cache";
@@ -53,6 +53,32 @@ export async function PATCH(request: Request, { params }: RouteParams) {
       !canManageGroupRole(actor.role, nextRole)
     ) {
       return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
+
+    // Demoting an owner would orphan the group if no other owners remain.
+    // The route already rejects nextRole === "owner" above, so reaching this
+    // branch with target.role === "owner" always means we're demoting.
+    if (target.role === "owner") {
+      const [{ count: otherOwnerCount }] = await db
+        .select({ count: sql<number>`COUNT(*)::int` })
+        .from(groupMembers)
+        .where(
+          and(
+            eq(groupMembers.groupId, group.id),
+            eq(groupMembers.role, "owner"),
+            ne(groupMembers.userId, userId),
+          ),
+        );
+
+      if (otherOwnerCount === 0) {
+        return NextResponse.json(
+          {
+            error:
+              "Cannot demote the last owner. Transfer ownership to another member first.",
+          },
+          { status: 400 }
+        );
+      }
     }
 
     const [updated] = await db

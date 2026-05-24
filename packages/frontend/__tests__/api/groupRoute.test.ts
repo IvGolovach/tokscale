@@ -138,9 +138,9 @@ describe("/api/groups/[slug]", () => {
       { params: Promise.resolve({ slug: "team" }) }
     );
 
-    expect(missingResponse.status).toBe(404);
-    expect(privateResponse.status).toBe(404);
-    expect(await missingResponse.json()).toEqual(await privateResponse.json());
+    expect(missingResponse!.status).toBe(404);
+    expect(privateResponse!.status).toBe(404);
+    expect(await missingResponse!.json()).toEqual(await privateResponse!.json());
     expect(mockState.getGroupMemberCount).not.toHaveBeenCalled();
   });
 
