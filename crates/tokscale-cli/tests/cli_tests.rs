@@ -1056,6 +1056,118 @@ fn test_models_with_client_filter_multiple() {
         .success();
 }
 
+fn assert_cursor_setup_warning(json: &serde_json::Value) {
+    let warnings = json["warnings"]
+        .as_array()
+        .expect("explicit Cursor report should expose setup warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains("tokscale cursor login")
+                && text.contains("cursor-cache/usage*.csv"))),
+        "warnings did not explain Cursor setup: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_models_cursor_explicit_missing_cache_reports_setup_warning_json() {
+    let tmp = create_empty_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args(["models", "--json", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_cursor_setup_warning(&json);
+}
+
+#[test]
+fn test_monthly_cursor_explicit_missing_cache_reports_setup_warning_json() {
+    let tmp = create_empty_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args(["monthly", "--json", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_cursor_setup_warning(&json);
+}
+
+#[test]
+fn test_hourly_cursor_explicit_missing_cache_reports_setup_warning_json() {
+    let tmp = create_empty_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args(["hourly", "--json", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_cursor_setup_warning(&json);
+}
+
+#[test]
+fn test_models_cursor_explicit_home_override_reports_fixture_cache_path() {
+    let tmp = create_empty_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "--home",
+            tmp.path().to_str().unwrap(),
+            "models",
+            "--json",
+            "--client",
+            "cursor",
+            "--no-spinner",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = json["warnings"]
+        .as_array()
+        .expect("explicit Cursor --home report should expose setup warnings");
+    assert!(
+        warnings.iter().any(|warning| warning
+            .as_str()
+            .is_some_and(|text| text.contains(tmp.path().to_str().unwrap())
+                && text.contains("populate that cache")
+                && text.contains("cursor-cache/usage*.csv"))),
+        "warnings did not explain Cursor --home setup: {warnings:?}"
+    );
+}
+
+#[test]
+fn test_models_cursor_explicit_missing_cache_reports_setup_warning_text() {
+    let tmp = create_empty_fixture_dir();
+    cmd_with_home(tmp.path())
+        .args(["models", "--client", "cursor", "--no-spinner"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Cursor usage requires"))
+        .stderr(predicate::str::contains("tokscale cursor login"));
+}
+
+#[test]
+fn test_models_default_missing_cursor_cache_does_not_emit_setup_warning_json() {
+    let tmp = create_empty_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args(["models", "--json", "--no-spinner"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json.get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "default all-client report should not warn about unrequested Cursor setup"
+    );
+}
+
 #[test]
 fn test_models_with_all_client_flags() {
     let tmp = create_temp_fixture_dir();

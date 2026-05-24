@@ -188,6 +188,7 @@ mod tests {
         });
     }
 
+
     #[test]
     fn daily_label_click_uses_rendered_normal_tab_position() {
         let mut app = make_app(80);

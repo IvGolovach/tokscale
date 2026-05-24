@@ -625,6 +625,12 @@ pub fn load_active_credentials() -> Option<CursorCredentials> {
     store.accounts.get(&store.active_account_id).cloned()
 }
 
+pub fn has_active_credentials_in_home(home_dir: &Path) -> bool {
+    load_credentials_store_from_home(home_dir)
+        .and_then(|store| store.accounts.get(&store.active_account_id).cloned())
+        .is_some()
+}
+
 fn is_cursor_usage_csv_filename(name: &str) -> bool {
     if name == "usage.csv" {
         return true;
@@ -642,13 +648,9 @@ fn is_cursor_usage_csv_filename(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-pub fn has_cursor_usage_cache() -> bool {
-    let home_dir = match home_dir() {
-        Ok(home_dir) => home_dir,
-        Err(_) => return false,
-    };
-    migrate_cache_dir_from_old_path_in_home(&home_dir);
-    let cache_dir = cursor_cache_dir(&home_dir);
+pub fn has_cursor_usage_cache_in_home(home_dir: &Path) -> bool {
+    migrate_cache_dir_from_old_path_in_home(home_dir);
+    let cache_dir = cursor_cache_dir(home_dir);
     if !cache_dir.exists() {
         return false;
     }
@@ -660,6 +662,14 @@ pub fn has_cursor_usage_cache() -> bool {
             .any(|name| is_cursor_usage_csv_filename(&name)),
         Err(_) => false,
     }
+}
+
+pub fn has_cursor_usage_cache() -> bool {
+    let home_dir = match home_dir() {
+        Ok(home_dir) => home_dir,
+        Err(_) => return false,
+    };
+    has_cursor_usage_cache_in_home(&home_dir)
 }
 
 fn expected_cursor_usage_cache_paths_in(home_dir: &Path) -> Vec<PathBuf> {
@@ -1068,7 +1078,7 @@ pub fn run_cursor_login(name: Option<String>) -> Result<()> {
         }
     }
 
-    print!("  Enter Cursor session token: ");
+    print!("  Enter Cursor WorkosCursorSessionToken value: ");
     std::io::stdout().flush()?;
     let token = rpassword::read_password().context("Failed to read session token")?;
     let token = token.trim().to_string();

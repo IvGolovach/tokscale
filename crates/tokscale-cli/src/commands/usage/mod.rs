@@ -9,6 +9,8 @@ mod zai;
 
 use anyhow::Result;
 
+type UsageProvider = (&'static str, fn() -> bool, fn() -> Result<UsageOutput>);
+
 // ── Shared types ──
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

@@ -269,7 +269,7 @@ enum Commands {
         #[arg(long, help = "Light terminal output (no TUI)")]
         light: bool,
     },
-    #[command(about = "Cursor IDE integration commands")]
+    #[command(about = "Cursor API cache integration commands")]
     Cursor {
         #[command(subcommand)]
         subcommand: CursorSubcommand,
@@ -305,7 +305,7 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum CursorSubcommand {
-    #[command(about = "Login to Cursor (paste your session token)")]
+    #[command(about = "Login to Cursor with a browser session token")]
     Login {
         #[arg(long, help = "Label for this Cursor account (e.g., work, personal)")]
         name: Option<String>,
@@ -329,7 +329,7 @@ enum CursorSubcommand {
         #[arg(long, help = "Output as JSON")]
         json: bool,
     },
-    #[command(about = "Sync Cursor usage into the local cache")]
+    #[command(about = "Sync Cursor API usage into cursor-cache/usage*.csv")]
     Sync {
         #[arg(long, help = "Output as JSON")]
         json: bool,
@@ -1154,6 +1154,88 @@ fn client_filter_explicitly_requests_cursor(clients: &Option<Vec<String>>) -> bo
         .is_some_and(|sources| sources.iter().any(|source| source == "cursor"))
 }
 
+#[derive(Debug)]
+struct CursorSetupState {
+    has_credentials: bool,
+    has_cache: bool,
+    cache_glob: String,
+    home_override: bool,
+}
+
+fn cursor_setup_state(home_dir: &Option<String>) -> Option<CursorSetupState> {
+    let (home_path, home_override) = match home_dir {
+        Some(home) => (PathBuf::from(home), true),
+        None => (dirs::home_dir()?, false),
+    };
+    let has_credentials = if home_override {
+        cursor::has_active_credentials_in_home(&home_path)
+    } else {
+        cursor::is_cursor_logged_in()
+    };
+    let has_cache = cursor::has_cursor_usage_cache_in_home(&home_path);
+    let cache_glob = if home_override {
+        home_path
+            .join(".config/tokscale/cursor-cache/usage*.csv")
+            .to_string_lossy()
+            .to_string()
+    } else {
+        "~/.config/tokscale/cursor-cache/usage*.csv".to_string()
+    };
+
+    Some(CursorSetupState {
+        has_credentials,
+        has_cache,
+        cache_glob,
+        home_override,
+    })
+}
+
+fn has_cursor_usage_cache_for_report(home_dir: &Option<String>) -> bool {
+    cursor_setup_state(home_dir).is_some_and(|state| state.has_cache)
+}
+
+fn cursor_setup_warnings_for_report(
+    home_dir: &Option<String>,
+    clients: &Option<Vec<String>>,
+) -> Vec<String> {
+    if !client_filter_explicitly_requests_cursor(clients) {
+        return Vec::new();
+    }
+
+    let Some(state) = cursor_setup_state(home_dir) else {
+        return vec![
+            "Cursor usage requires Tokscale's Cursor API cache, but the home directory could not be resolved. Tokscale does not parse local ~/.cursor session data.".to_string(),
+        ];
+    };
+    if state.has_cache {
+        return Vec::new();
+    }
+
+    let action = if state.home_override {
+        "populate that cache before running a report with --home"
+    } else if state.has_credentials {
+        "run `tokscale cursor sync`"
+    } else {
+        "run `tokscale cursor login` and `tokscale cursor sync`"
+    };
+
+    vec![format!(
+        "Cursor usage requires Tokscale's Cursor API cache at `{}`; {}. Tokscale does not parse local `~/.cursor` session data.",
+        state.cache_glob, action
+    )]
+}
+
+fn emit_cursor_setup_warnings(warnings: &[String]) {
+    if warnings.is_empty() {
+        return;
+    }
+
+    use colored::Colorize;
+    for warning in warnings {
+        eprintln!("{}", format!("  Warning: {}", warning).yellow());
+    }
+}
+
 fn should_auto_sync_cursor_for_local_report(
     home_dir: &Option<String>,
     clients: &Option<Vec<String>>,
@@ -1205,7 +1287,7 @@ fn auto_sync_cursor_before_tui(
     home_dir: &Option<String>,
     clients: &Option<Vec<String>>,
 ) -> Result<()> {
-    let had_cursor_cache = cursor::has_cursor_usage_cache();
+    let had_cursor_cache = has_cursor_usage_cache_for_report(home_dir);
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(clients);
     let cursor_sync_result = auto_sync_cursor_for_local_report(home_dir, clients);
     emit_cursor_sync_warning(
@@ -1213,6 +1295,8 @@ fn auto_sync_cursor_before_tui(
         had_cursor_cache,
         explicit_cursor_filter,
     );
+    let cursor_setup_warnings = cursor_setup_warnings_for_report(home_dir, clients);
+    emit_cursor_setup_warnings(&cursor_setup_warnings);
     Ok(())
 }
 
@@ -1527,7 +1611,7 @@ fn run_models_report(
 
     let date_range = get_date_range_label(today, week, month_flag, &since, &until, &year);
 
-    let had_cursor_cache = cursor::has_cursor_usage_cache();
+    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let spinner = if no_spinner {
         None
@@ -1535,6 +1619,7 @@ fn run_models_report(
         Some(LightSpinner::start("Scanning session data..."))
     };
     let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
+    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let start = Instant::now();
     let rt = Runtime::new()?;
@@ -1562,7 +1647,6 @@ fn run_models_report(
         had_cursor_cache,
         explicit_cursor_filter,
     );
-
     let processing_time_ms = start.elapsed().as_millis();
 
     if json {
@@ -1601,6 +1685,8 @@ fn run_models_report(
             total_messages: i32,
             total_cost: f64,
             processing_time_ms: u32,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            warnings: Vec<String>,
         }
 
         let output = ModelReportJson {
@@ -1649,11 +1735,13 @@ fn run_models_report(
             total_messages: report.total_messages,
             total_cost: report.total_cost,
             processing_time_ms: report.processing_time_ms,
+            warnings: cursor_setup_warnings,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
+        emit_cursor_setup_warnings(&cursor_setup_warnings);
         let total_performance = aggregate_model_report_performance(&report.entries);
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
@@ -2295,7 +2383,7 @@ fn run_monthly_report(
 
     let date_range = get_date_range_label(today, week, month_flag, &since, &until, &year);
 
-    let had_cursor_cache = cursor::has_cursor_usage_cache();
+    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let spinner = if no_spinner {
         None
@@ -2303,6 +2391,7 @@ fn run_monthly_report(
         Some(LightSpinner::start("Scanning session data..."))
     };
     let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
+    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let start = Instant::now();
     let rt = Runtime::new()?;
@@ -2353,6 +2442,8 @@ fn run_monthly_report(
             entries: Vec<MonthlyUsageJson>,
             total_cost: f64,
             processing_time_ms: u32,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            warnings: Vec<String>,
         }
 
         let output = MonthlyReportJson {
@@ -2372,12 +2463,14 @@ fn run_monthly_report(
                 .collect(),
             total_cost: report.total_cost,
             processing_time_ms: report.processing_time_ms,
+            warnings: cursor_setup_warnings,
         };
 
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         use comfy_table::{Attribute, Cell, CellAlignment, Color, ContentArrangement, Table};
 
+        emit_cursor_setup_warnings(&cursor_setup_warnings);
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(120);
@@ -2589,7 +2682,7 @@ fn run_hourly_report(
 
     let date_range = get_date_range_label(today, week, month_flag, &since, &until, &year);
 
-    let had_cursor_cache = cursor::has_cursor_usage_cache();
+    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let spinner = if no_spinner {
         None
@@ -2597,6 +2690,7 @@ fn run_hourly_report(
         Some(LightSpinner::start("Scanning session data..."))
     };
     let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
+    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let start = Instant::now();
     let rt = Runtime::new()?;
@@ -2649,6 +2743,8 @@ fn run_hourly_report(
             entries: Vec<HourlyUsageJson>,
             total_cost: f64,
             processing_time_ms: u32,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            warnings: Vec<String>,
         }
 
         let output = HourlyReportJson {
@@ -2670,12 +2766,14 @@ fn run_hourly_report(
                 .collect(),
             total_cost: report.total_cost,
             processing_time_ms: report.processing_time_ms,
+            warnings: cursor_setup_warnings,
         };
 
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         use comfy_table::{Cell, CellAlignment, Color, ContentArrangement, Table};
 
+        emit_cursor_setup_warnings(&cursor_setup_warnings);
         let term_width = crossterm::terminal::size()
             .map(|(w, _)| w as usize)
             .unwrap_or(120);
@@ -4220,11 +4318,15 @@ fn run_time_metrics_report(
     use tokio::runtime::Runtime;
     use tokscale_core::{get_time_metrics_report, GroupBy, ReportOptions};
 
+    let had_cursor_cache = has_cursor_usage_cache_for_report(&home_dir);
+    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let spinner = if no_spinner {
         None
     } else {
         Some(LightSpinner::start("Computing time metrics..."))
     };
+    let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
+    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let rt = Runtime::new()?;
     let report = rt
@@ -4246,6 +4348,12 @@ fn run_time_metrics_report(
     if let Some(spinner) = spinner {
         spinner.stop();
     }
+    emit_cursor_sync_warning(
+        cursor_sync_result.as_ref(),
+        had_cursor_cache,
+        explicit_cursor_filter,
+    );
+    emit_cursor_setup_warnings(&cursor_setup_warnings);
 
     let m = &report.metrics;
 
@@ -4313,13 +4421,15 @@ fn run_graph_command(
         && clients
             .as_ref()
             .is_none_or(|s| s.iter().any(|src| src == "cursor"));
-    let has_cursor_cache = include_cursor && cursor::has_cursor_usage_cache();
+    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
+    let has_cursor_cache = include_cursor && has_cursor_usage_cache_for_report(&home_dir);
     let mut cursor_sync_result: Option<cursor::SyncCursorResult> = None;
 
     if include_cursor && cursor::is_cursor_logged_in() {
         let rt_sync = tokio::runtime::Runtime::new()?;
         cursor_sync_result = Some(rt_sync.block_on(async { cursor::sync_cursor_cache().await }));
     }
+    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
 
     if show_progress {
         eprintln!("  Scanning session data...");
@@ -4346,6 +4456,12 @@ fn run_graph_command(
             .await
         })
         .map_err(|e| anyhow::anyhow!(e))?;
+    emit_cursor_sync_warning(
+        cursor_sync_result.as_ref(),
+        has_cursor_cache,
+        explicit_cursor_filter,
+    );
+    emit_cursor_setup_warnings(&cursor_setup_warnings);
 
     let processing_time_ms = start.elapsed().as_millis() as u32;
     let output_data = to_ts_token_contribution_data(&graph_result, None);
@@ -4493,12 +4609,14 @@ fn run_submit_command(
 
     println!("\n  {}\n", "Tokscale - Submit Usage Data".cyan());
 
+    let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
     let clients = clients.or_else(|| Some(default_submit_clients()));
 
     let include_cursor = clients
         .as_ref()
         .is_none_or(|s| s.iter().any(|src| src == "cursor"));
-    let has_cursor_cache = cursor::has_cursor_usage_cache();
+    let report_home: Option<String> = None;
+    let has_cursor_cache = has_cursor_usage_cache_for_report(&report_home);
     if include_cursor && cursor::is_cursor_logged_in() {
         println!("{}", "  Syncing Cursor usage data...".bright_black());
         let rt_sync = Runtime::new()?;
@@ -4516,6 +4634,10 @@ fn run_submit_command(
                 );
             }
         }
+    }
+    if explicit_cursor_filter {
+        let cursor_setup_warnings = cursor_setup_warnings_for_report(&report_home, &clients);
+        emit_cursor_setup_warnings(&cursor_setup_warnings);
     }
 
     println!("{}", "  Scanning local session data...".bright_black());

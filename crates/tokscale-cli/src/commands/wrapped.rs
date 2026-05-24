@@ -169,6 +169,10 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
         .cloned()
         .collect();
     let include_cursor = clients.iter().any(|src| src == ClientId::Cursor.as_str());
+    let explicit_cursor = options
+        .clients
+        .as_ref()
+        .is_some_and(|sources| sources.iter().any(|src| src == ClientId::Cursor.as_str()));
 
     let since = format!("{}-01-01", year);
     let until = format!("{}-12-31", year);
@@ -202,6 +206,13 @@ async fn load_wrapped_data(options: &WrappedOptions) -> Result<WrappedData> {
     } else {
         false
     };
+    if explicit_cursor && !include_cursor_in_graph {
+        eprintln!(
+            "{}",
+            "  Warning: Cursor usage requires Tokscale's Cursor API cache at `~/.config/tokscale/cursor-cache/usage*.csv`; run `tokscale cursor login` and `tokscale cursor sync`. Tokscale does not parse local `~/.cursor` session data."
+                .yellow()
+        );
+    }
 
     let graph_clients = if include_cursor && !include_cursor_in_graph {
         clients
