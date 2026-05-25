@@ -7,6 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint",
+    "test": "vitest run",
+    "test:migrations": "drizzle-kit migrate && bun scripts/check-migrations.ts",
     "gallery": "bun scripts/gallery/build-gallery.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
