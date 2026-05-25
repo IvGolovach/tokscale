@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -128,6 +128,10 @@ pub fn load_scanner_settings() -> ScannerSettings {
     Settings::load().scanner
 }
 
+pub fn load_scanner_settings_for_home(home_dir: &Option<String>) -> ScannerSettings {
+    Settings::load_for_home_override(home_dir.as_deref().map(Path::new)).scanner
+}
+
 /// Returns the user's configured `defaultClients` list as raw lowercase
 /// ids. Validation against the live `ClientFilter` enum happens at the
 /// CLI boundary so this module stays independent of the CLI types.
@@ -138,7 +142,21 @@ pub fn load_default_clients() -> Vec<String> {
     Settings::load().default_clients
 }
 
+pub fn load_default_clients_for_home(home_dir: &Option<String>) -> Vec<String> {
+    Settings::load_for_home_override(home_dir.as_deref().map(Path::new)).default_clients
+}
+
 impl Settings {
+    fn normalize(mut self) -> Self {
+        self.auto_refresh_ms = self
+            .auto_refresh_ms
+            .clamp(MIN_AUTO_REFRESH_MS, MAX_AUTO_REFRESH_MS);
+        self.native_timeout_ms = self
+            .native_timeout_ms
+            .clamp(MIN_NATIVE_TIMEOUT_MS, MAX_NATIVE_TIMEOUT_MS);
+        self
+    }
+
     fn config_path() -> Result<PathBuf> {
         let config_dir = crate::paths::get_config_dir();
 
@@ -147,6 +165,14 @@ impl Settings {
         }
 
         Ok(config_dir.join("settings.json"))
+    }
+
+    fn explicit_home_config_path(home_dir: &Path) -> PathBuf {
+        home_dir.join(".config/tokscale/settings.json")
+    }
+
+    fn explicit_home_legacy_macos_path(home_dir: &Path) -> PathBuf {
+        home_dir.join("Library/Application Support/tokscale/settings.json")
     }
 
     /// Returns the legacy `~/Library/Application Support/tokscale/settings.json`
@@ -177,15 +203,21 @@ impl Settings {
         });
 
         raw.and_then(|content| serde_json::from_str(&content).ok())
-            .map(|mut s: Settings| {
-                s.auto_refresh_ms = s
-                    .auto_refresh_ms
-                    .clamp(MIN_AUTO_REFRESH_MS, MAX_AUTO_REFRESH_MS);
-                s.native_timeout_ms = s
-                    .native_timeout_ms
-                    .clamp(MIN_NATIVE_TIMEOUT_MS, MAX_NATIVE_TIMEOUT_MS);
-                s
-            })
+            .map(Settings::normalize)
+            .unwrap_or_default()
+    }
+
+    pub fn load_for_home_override(home_dir: Option<&Path>) -> Self {
+        let Some(home_dir) = home_dir else {
+            return Self::load();
+        };
+
+        let raw = fs::read_to_string(Self::explicit_home_config_path(home_dir))
+            .ok()
+            .or_else(|| fs::read_to_string(Self::explicit_home_legacy_macos_path(home_dir)).ok());
+
+        raw.and_then(|content| serde_json::from_str(&content).ok())
+            .map(Settings::normalize)
             .unwrap_or_default()
     }
 

@@ -1670,7 +1670,13 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
     });
 
     let pricing = pricing::PricingService::get_or_init().await?;
-    let all_messages = parse_all_messages_with_pricing(&home_dir, &clients, Some(&pricing));
+    let all_messages = parse_all_messages_with_pricing_with_env_strategy(
+        &home_dir,
+        &clients,
+        Some(&pricing),
+        options.use_env_roots,
+        &options.scanner_settings,
+    );
 
     let filtered = filter_messages_for_report(all_messages, &options);
 

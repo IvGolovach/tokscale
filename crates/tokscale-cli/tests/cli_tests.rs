@@ -444,6 +444,35 @@ fn write_settings_json(base: &Path, body: &str) {
     }
 }
 
+fn write_codex_token_session(dir: &Path, name: &str, model: &str, input: i64, output: i64) {
+    fs::create_dir_all(dir).unwrap();
+    let turn_context = serde_json::json!({
+        "type": "turn_context",
+        "payload": {
+            "model": model
+        }
+    });
+    let token_count = serde_json::json!({
+        "timestamp": "2026-01-01T00:00:01Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {
+                "last_token_usage": {
+                    "input_tokens": input,
+                    "cached_input_tokens": 0,
+                    "output_tokens": output
+                }
+            }
+        }
+    });
+    fs::write(
+        dir.join(name),
+        format!("{}\n{}\n", turn_context, token_count),
+    )
+    .unwrap();
+}
+
 // ── Existing tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -826,16 +855,46 @@ fn test_tui_rejects_home_override() {
 }
 
 #[test]
-fn test_clients_rejects_home_override() {
-    let tmp = TempDir::new().unwrap();
+fn test_clients_home_override_uses_explicit_home_for_json() {
+    let real_home = create_codex_fixture_dir();
+    let conflicting_home = create_conflicting_codex_fixture_dir();
+    write_codex_token_session(
+        &real_home.path().join(".codex/sessions"),
+        "session-2.jsonl",
+        "gpt-4o-mini",
+        80,
+        20,
+    );
 
-    cargo_bin_cmd!("tokscale")
-        .args(["--home", tmp.path().to_str().unwrap(), "clients"])
-        .assert()
-        .failure()
-        .stderr(predicate::str::contains(
-            "It is not supported for `clients`",
-        ));
+    let output = cmd_with_conflicting_env(conflicting_home.path())
+        .env("CODEX_HOME", conflicting_home.path().join(".codex"))
+        .args([
+            "--home",
+            real_home.path().to_str().unwrap(),
+            "clients",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let codex = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "codex")
+        .unwrap();
+    assert_eq!(
+        codex["sessionsPath"],
+        serde_json::json!(real_home.path().join(".codex/sessions"))
+    );
+    assert_eq!(codex["messageCount"].as_i64().unwrap(), 2);
 }
 
 #[test]
@@ -1245,6 +1304,60 @@ fn test_monthly_json_output() {
     assert!(first.get("cacheWrite").is_some());
     assert!(first.get("messageCount").is_some());
     assert!(first.get("cost").is_some());
+}
+
+#[test]
+fn test_hourly_home_override_uses_explicit_home_scanner_settings() {
+    let real_home = create_empty_fixture_dir();
+    let conflicting_home = create_conflicting_codex_fixture_dir();
+    let extra_home = TempDir::new().unwrap();
+    let extra_sessions = extra_home.path().join("portable-codex/sessions");
+    write_codex_token_session(
+        &extra_sessions,
+        "settings-session.jsonl",
+        "gpt-4o-mini",
+        210,
+        40,
+    );
+    write_settings_json(
+        real_home.path(),
+        &format!(
+            r#"{{
+                "scanner": {{
+                    "extraScanPaths": {{
+                        "codex": [{}]
+                    }}
+                }}
+            }}"#,
+            serde_json::to_string(extra_sessions.to_str().unwrap()).unwrap()
+        ),
+    );
+
+    let output = cmd_with_conflicting_env(conflicting_home.path())
+        .env("TOKSCALE_PRICING_CACHE_ONLY", "1")
+        .env("CODEX_HOME", conflicting_home.path().join(".codex"))
+        .args([
+            "hourly",
+            "--json",
+            "--codex",
+            "--no-spinner",
+            "--home",
+            real_home.path().to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(json["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(json["entries"][0]["input"].as_i64().unwrap(), 210);
+    assert_eq!(json["entries"][0]["output"].as_i64().unwrap(), 40);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("gpt-5"));
 }
 
 #[test]
