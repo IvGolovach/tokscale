@@ -4,7 +4,7 @@ import { revalidateGroupCaches } from "@/lib/groups/cache";
 import { createGroupInvite, GroupInviteError } from "@/lib/groups/invites";
 import { getGroupMembership } from "@/lib/groups/permissions";
 import { getGroupBySlug } from "@/lib/groups/queries";
-import { isGroupRole } from "@/lib/groups/utils";
+import { canManageGroupRole, isGroupRole } from "@/lib/groups/utils";
 import type { GroupRole } from "@/lib/db";
 
 export async function POST(
@@ -43,6 +43,10 @@ export async function POST(
     const invitedUsername = typeof body.invitedUsername === "string"
       ? body.invitedUsername
       : null;
+
+    if (!canManageGroupRole(membership.role, role)) {
+      return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+    }
 
     const invite = await createGroupInvite({
       groupId: group.id,
