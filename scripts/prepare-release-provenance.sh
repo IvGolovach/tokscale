@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${ROOT_DIR}"
+
+NEW_VERSION="${NEW_VERSION:-}"
+RELEASE_REF_NAME="${RELEASE_REF_NAME:-}"
+RELEASE_REF_TYPE="${RELEASE_REF_TYPE:-branch}"
+EXPECTED_RELEASE_BASE_SHA="${EXPECTED_RELEASE_BASE_SHA:-}"
+GITHUB_OUTPUT="${GITHUB_OUTPUT:-}"
+
+MANIFEST_PATHS=(
+  Cargo.toml
+  packages/cli/package.json
+  packages/cli-darwin-arm64/package.json
+  packages/cli-darwin-x64/package.json
+  packages/cli-linux-x64-gnu/package.json
+  packages/cli-linux-x64-musl/package.json
+  packages/cli-linux-arm64-gnu/package.json
+  packages/cli-linux-arm64-musl/package.json
+  packages/cli-win32-x64-msvc/package.json
+  packages/cli-win32-arm64-msvc/package.json
+  packages/tokscale/package.json
+)
+
+fail() {
+  echo "ERROR: $*" >&2
+  exit 1
+}
+
+[[ -n "${NEW_VERSION}" ]] || fail "NEW_VERSION is required"
+[[ -n "${RELEASE_REF_NAME}" ]] || fail "RELEASE_REF_NAME is required"
+[[ -n "${EXPECTED_RELEASE_BASE_SHA}" ]] || fail "EXPECTED_RELEASE_BASE_SHA is required"
+[[ "${RELEASE_REF_TYPE}" == "branch" ]] || fail "Release publishing must run from a branch ref"
+
+git check-ref-format --branch "${RELEASE_REF_NAME}" >/dev/null ||
+  fail "Invalid release branch name: ${RELEASE_REF_NAME}"
+git rev-parse --verify "${EXPECTED_RELEASE_BASE_SHA}^{commit}" >/dev/null ||
+  fail "Expected release base is not a commit: ${EXPECTED_RELEASE_BASE_SHA}"
+
+local_sha="$(git rev-parse HEAD)"
+if [[ "${local_sha}" != "${EXPECTED_RELEASE_BASE_SHA}" ]]; then
+  fail "Checked-out release base ${local_sha} does not match expected ${EXPECTED_RELEASE_BASE_SHA}"
+fi
+
+remote_tracking_ref="refs/remotes/origin/${RELEASE_REF_NAME}"
+git fetch --no-tags origin "+refs/heads/${RELEASE_REF_NAME}:${remote_tracking_ref}"
+remote_sha="$(git rev-parse "${remote_tracking_ref}^{commit}")"
+if [[ "${remote_sha}" != "${EXPECTED_RELEASE_BASE_SHA}" ]]; then
+  fail "Release base is stale: origin/${RELEASE_REF_NAME} is ${remote_sha}, expected ${EXPECTED_RELEASE_BASE_SHA}. Re-run the publish workflow from the updated branch before publishing npm packages."
+fi
+
+if git ls-remote --exit-code --tags origin "refs/tags/v${NEW_VERSION}" >/dev/null 2>&1; then
+  fail "Tag v${NEW_VERSION} already exists. Choose a new version before publishing npm packages."
+fi
+
+bash scripts/check-version-coherence.sh --expect-version "${NEW_VERSION}"
+
+git add -- "${MANIFEST_PATHS[@]}"
+if git diff --cached --quiet; then
+  fail "No release manifest changes staged for ${NEW_VERSION}"
+fi
+
+git commit -m "chore: bump version to ${NEW_VERSION}"
+release_commit="$(git rev-parse HEAD)"
+git push origin "HEAD:refs/heads/${RELEASE_REF_NAME}"
+
+echo "Release commit ${release_commit} pushed to ${RELEASE_REF_NAME}"
+if [[ -n "${GITHUB_OUTPUT}" ]]; then
+  echo "release_commit=${release_commit}" >> "${GITHUB_OUTPUT}"
+fi
