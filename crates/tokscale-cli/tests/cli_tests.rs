@@ -435,12 +435,19 @@ fn write_fake_credentials(base: &Path) {
 }
 
 fn write_settings_json(base: &Path, body: &str) {
-    for dir in [
-        base.join(".config/tokscale"),
-        base.join("Library/Application Support/tokscale"),
-    ] {
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("settings.json"), body).unwrap();
+    let path = settings_json_path(base);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, body).unwrap();
+}
+
+fn settings_json_path(base: &Path) -> std::path::PathBuf {
+    if cfg!(target_os = "windows") {
+        base.join("AppData")
+            .join("Roaming")
+            .join("tokscale")
+            .join("settings.json")
+    } else {
+        base.join(".config").join("tokscale").join("settings.json")
     }
 }
 

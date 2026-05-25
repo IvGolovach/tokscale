@@ -16,6 +16,22 @@ const DEFAULT_NATIVE_TIMEOUT_MS: u64 = 300_000;
 const MIN_NATIVE_TIMEOUT_MS: u64 = 5_000;
 const MAX_NATIVE_TIMEOUT_MS: u64 = 3_600_000;
 
+#[derive(Debug, Clone, Copy)]
+enum ExplicitHomeConfigLayout {
+    UnixDotConfig,
+    WindowsRoaming,
+}
+
+impl ExplicitHomeConfigLayout {
+    fn current() -> Self {
+        if cfg!(target_os = "windows") {
+            Self::WindowsRoaming
+        } else {
+            Self::UnixDotConfig
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LightSettings {
@@ -167,8 +183,25 @@ impl Settings {
         Ok(config_dir.join("settings.json"))
     }
 
+    fn explicit_home_config_path_for_layout(
+        home_dir: &Path,
+        layout: ExplicitHomeConfigLayout,
+    ) -> PathBuf {
+        match layout {
+            ExplicitHomeConfigLayout::UnixDotConfig => home_dir
+                .join(".config")
+                .join("tokscale")
+                .join("settings.json"),
+            ExplicitHomeConfigLayout::WindowsRoaming => home_dir
+                .join("AppData")
+                .join("Roaming")
+                .join("tokscale")
+                .join("settings.json"),
+        }
+    }
+
     fn explicit_home_config_path(home_dir: &Path) -> PathBuf {
-        home_dir.join(".config/tokscale/settings.json")
+        Self::explicit_home_config_path_for_layout(home_dir, ExplicitHomeConfigLayout::current())
     }
 
     fn explicit_home_legacy_macos_path(home_dir: &Path) -> PathBuf {
@@ -285,6 +318,44 @@ impl Settings {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn explicit_home_config_path_uses_unix_dot_config_layout() {
+        assert_eq!(
+            Settings::explicit_home_config_path_for_layout(
+                Path::new("/home/alice"),
+                ExplicitHomeConfigLayout::UnixDotConfig,
+            ),
+            PathBuf::from("/home/alice/.config/tokscale/settings.json")
+        );
+    }
+
+    #[test]
+    fn explicit_home_config_path_uses_windows_roaming_layout() {
+        assert_eq!(
+            Settings::explicit_home_config_path_for_layout(
+                Path::new("C:/Users/Alice"),
+                ExplicitHomeConfigLayout::WindowsRoaming,
+            ),
+            PathBuf::from("C:/Users/Alice/AppData/Roaming/tokscale/settings.json")
+        );
+    }
+
+    #[test]
+    fn load_for_home_override_reads_current_platform_config_path() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let path = Settings::explicit_home_config_path(temp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"colorPalette":"halloween","defaultClients":["codex"]}"#,
+        )
+        .unwrap();
+
+        let loaded = Settings::load_for_home_override(Some(temp.path()));
+        assert_eq!(loaded.color_palette, "halloween");
+        assert_eq!(loaded.default_clients, vec!["codex".to_string()]);
+    }
 
     #[test]
     #[cfg(target_os = "macos")]

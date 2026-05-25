@@ -154,12 +154,29 @@ mod tests {
         app
     }
 
-    fn render_header(app: &mut App, width: u16) {
+    fn render_header(app: &mut App, width: u16) -> Vec<Vec<String>> {
         let backend = TestBackend::new(width, 3);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|frame| render(frame, app, Rect::new(0, 0, width, 3)))
             .unwrap();
+
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width as usize)
+            .map(|row| row.iter().map(|cell| cell.symbol().to_string()).collect())
+            .collect()
+    }
+
+    fn rendered_label_column(rows: &[Vec<String>], label: &str) -> u16 {
+        let target: Vec<String> = label.chars().map(|ch| ch.to_string()).collect();
+
+        rows[1]
+            .windows(target.len())
+            .position(|window| window == target.as_slice())
+            .expect("expected label to be rendered") as u16
     }
 
     fn click_header(app: &mut App, column: u16) {
@@ -175,8 +192,8 @@ mod tests {
     fn daily_label_click_uses_rendered_normal_tab_position() {
         let mut app = make_app(80);
 
-        render_header(&mut app, 80);
-        click_header(&mut app, 38);
+        let rows = render_header(&mut app, 80);
+        click_header(&mut app, rendered_label_column(&rows, "Daily"));
 
         assert_eq!(app.current_tab, Tab::Daily);
     }
@@ -185,8 +202,8 @@ mod tests {
     fn daily_short_label_click_uses_rendered_very_narrow_tab_position() {
         let mut app = make_app(59);
 
-        render_header(&mut app, 59);
-        click_header(&mut app, 27);
+        let rows = render_header(&mut app, 59);
+        click_header(&mut app, rendered_label_column(&rows, "Day"));
 
         assert_eq!(app.current_tab, Tab::Daily);
     }
