@@ -362,6 +362,25 @@ describe('POST /api/submit - Client-Level Merge', () => {
   });
 
   describe("Submission validation guardrails", () => {
+    it("accepts internally consistent high-volume one-day token totals", () => {
+      const payload = createValidationPayload({
+        totalTokens: 20_000_000_000,
+        totalCost: 2_000,
+        tokenBreakdown: {
+          input: 12_000_000_000,
+          output: 5_000_000_000,
+          cacheRead: 2_000_000_000,
+          cacheWrite: 750_000_000,
+          reasoning: 250_000_000,
+        },
+      });
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.errors).toHaveLength(0);
+    });
+
     it("rejects one-day fabricated token totals above the submission cap", () => {
       const payload = createValidationPayload({
         totalTokens: 1_000_000_000_000,
@@ -378,6 +397,28 @@ describe('POST /api/submit - Client-Level Merge', () => {
 
       expect(result.valid).toBe(false);
       expect(result.errors.join("\n")).toContain("Daily token total exceeds");
+      expect(result.errors.join("\n")).toContain("100,000,000,000");
+      expect(result.errors.join("\n")).toContain("Client claude");
+    });
+
+    it("keeps structural validation for high-volume payloads", () => {
+      const payload = createValidationPayload({
+        totalTokens: 20_000_000_000,
+        totalCost: 2_000,
+        tokenBreakdown: {
+          input: 12_000_000_000,
+          output: 5_000_000_000,
+          cacheRead: 2_000_000_000,
+          cacheWrite: 750_000_000,
+          reasoning: 250_000_000,
+        },
+      });
+      payload.contributions[0].clients[0].modelId = "";
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(false);
+      expect(result.errors.join("\n")).toContain("modelId");
     });
 
     it("rejects submitted cost that is implausible for the reported tokens", () => {

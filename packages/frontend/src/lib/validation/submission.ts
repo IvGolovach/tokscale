@@ -13,7 +13,9 @@ import { z } from "zod";
 // SCHEMAS
 // ============================================================================
 
-const MAX_DAILY_TOKENS = 10_000_000_000;
+// Self-reported usage still needs a hard ceiling, but legitimate high-volume
+// local usage can exceed tens of billions of tokens in a day.
+const MAX_DAILY_TOKENS = 100_000_000_000;
 const MAX_DAILY_COST = 10_000;
 const MAX_COST_PER_MILLION_TOKENS = 10_000;
 const COST_RELATIVE_TOLERANCE = 0.01;
