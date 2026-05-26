@@ -10,9 +10,10 @@ import {
 import { authenticatePersonalToken } from "@/lib/auth/personalTokens";
 import { getBearerToken } from "../../../lib/auth/bearerToken";
 import {
-  mergeClientBreakdowns,
+  mergeClientBreakdownsWithRegressionGuard,
   recalculateDayTotals,
   clientContributionToBreakdownData,
+  deriveClientBreakdownProvenance,
   mergeTimestampMs,
   type ClientBreakdownData,
 } from "@/lib/db/helpers";
@@ -136,6 +137,7 @@ export async function POST(request: Request) {
     }
 
     const data = validation.data;
+    const warnings = [...validation.warnings];
 
     if (data.contributions.length === 0) {
       return NextResponse.json(
@@ -345,10 +347,15 @@ export async function POST(request: Request) {
             } else {
               existing.models[client_contrib.modelId] = modelData;
             }
+            existing.provenance = deriveClientBreakdownProvenance(existing);
           } else {
-            incomingClientBreakdown[client_contrib.client] = {
+            const clientBreakdown = {
               ...modelData,
               models: { [client_contrib.modelId]: modelData },
+            };
+            incomingClientBreakdown[client_contrib.client] = {
+              ...clientBreakdown,
+              provenance: deriveClientBreakdownProvenance(clientBreakdown),
             };
           }
         }
@@ -356,12 +363,19 @@ export async function POST(request: Request) {
         const existingDay = existingDaysMap.get(incomingDay.date);
 
         if (existingDay) {
-           const existingClientBreakdown = (existingDay.sourceBreakdown || {}) as Record<string, ClientBreakdownData>;
-           const mergedClientBreakdown = mergeClientBreakdowns(
-             existingClientBreakdown,
-             incomingClientBreakdown,
-             submittedClients
-           );
+          const existingClientBreakdown = (existingDay.sourceBreakdown || {}) as Record<
+            string,
+            ClientBreakdownData
+          >;
+          const mergeResult = mergeClientBreakdownsWithRegressionGuard(
+            existingClientBreakdown,
+            incomingClientBreakdown,
+            submittedClients
+          );
+          warnings.push(
+            ...mergeResult.warnings.map((warning) => `Day ${incomingDay.date}: ${warning}`)
+          );
+          const mergedClientBreakdown = mergeResult.merged;
           const dayTotals = recalculateDayTotals(mergedClientBreakdown);
 
           toUpdate.push({
@@ -546,7 +560,7 @@ export async function POST(request: Request) {
       username: tokenRecord.username,
       metrics: result.metrics,
       mode: result.isNewSubmission ? "create" : "merge",
-      warnings: validation.warnings.length > 0 ? validation.warnings : undefined,
+      warnings: warnings.length > 0 ? warnings : undefined,
     });
   } catch (error) {
     console.error("Submit error:", error);

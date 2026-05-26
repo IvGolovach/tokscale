@@ -4,6 +4,11 @@ import {
   generateSubmissionHash,
   validateSubmission,
 } from "../../src/lib/validation/submission";
+import {
+  deriveClientBreakdownProvenance,
+  mergeClientBreakdownsWithRegressionGuard,
+  type ClientBreakdownData,
+} from "../../src/lib/db/helpers";
 
 /**
  * Test suite for POST /api/submit - Client-Level Merge
@@ -220,6 +225,27 @@ describe('POST /api/submit - Client-Level Merge', () => {
 
       expect(result.valid).toBe(false);
       expect(result.errors.some((error) => error.includes('device.id'))).toBe(true);
+    });
+
+    it('accepts per-client submit provenance metadata', () => {
+      const payload = createMockSubmissionData({ clients: ['codex'] });
+      const client = payload.contributions[0].clients[0] as {
+        provenance?: { schemaVersion: number; messageCount: number; modelCount: number };
+      };
+      client.provenance = {
+        schemaVersion: 1,
+        messageCount: 7,
+        modelCount: 1,
+      };
+
+      const result = validateSubmission(payload);
+
+      expect(result.valid).toBe(true);
+      expect(result.data?.contributions[0].clients[0].provenance).toEqual({
+        schemaVersion: 1,
+        messageCount: 7,
+        modelCount: 1,
+      });
     });
   });
 
@@ -513,6 +539,124 @@ describe('POST /api/submit - Client-Level Merge', () => {
   });
 
   describe('Client-Level Merge Logic', () => {
+    const breakdown = (
+      tokens: number,
+      messages: number,
+      modelId = 'gpt-5.5'
+    ): ClientBreakdownData => ({
+      tokens,
+      cost: tokens / 1000,
+      input: tokens,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      reasoning: 0,
+      messages,
+      models: {
+        [modelId]: {
+          tokens,
+          cost: tokens / 1000,
+          input: tokens,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 0,
+          messages,
+        },
+      },
+      provenance: {
+        schemaVersion: 1,
+        messageCount: messages,
+        modelCount: 1,
+      },
+    });
+
+    it('preserves lower same-client resubmits when coverage also drops', () => {
+      const existing = { codex: breakdown(5_000, 30) };
+      const incoming = { codex: breakdown(3_600, 20) };
+
+      const result = mergeClientBreakdownsWithRegressionGuard(
+        existing,
+        incoming,
+        new Set(['codex'])
+      );
+
+      expect(result.merged.codex).toEqual(existing.codex);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('codex');
+      expect(result.warnings[0]).toContain('5,000');
+      expect(result.warnings[0]).toContain('3,600');
+    });
+
+    it('allows lower token resubmits when coverage does not regress', () => {
+      const existing = { codex: breakdown(5_000, 30) };
+      const incoming = { codex: breakdown(4_800, 32) };
+
+      const result = mergeClientBreakdownsWithRegressionGuard(
+        existing,
+        incoming,
+        new Set(['codex'])
+      );
+
+      expect(result.merged.codex).toEqual(incoming.codex);
+      expect(result.warnings).toEqual([]);
+    });
+
+    it('preserves a submitted client that disappears from a same-device resubmit', () => {
+      const existing = {
+        codex: breakdown(5_000, 30),
+        claude: breakdown(2_000, 10, 'claude-sonnet-4'),
+      };
+
+      const result = mergeClientBreakdownsWithRegressionGuard(
+        existing,
+        {},
+        new Set(['codex'])
+      );
+
+      expect(result.merged.codex).toEqual(existing.codex);
+      expect(result.merged.claude).toEqual(existing.claude);
+      expect(result.warnings).toHaveLength(1);
+      expect(result.warnings[0]).toContain('disappeared');
+    });
+
+    it('adds new clients without warning', () => {
+      const existing = { claude: breakdown(2_000, 10, 'claude-sonnet-4') };
+      const incoming = { codex: breakdown(3_000, 15) };
+
+      const result = mergeClientBreakdownsWithRegressionGuard(
+        existing,
+        incoming,
+        new Set(['codex'])
+      );
+
+      expect(result.merged.claude).toEqual(existing.claude);
+      expect(result.merged.codex).toEqual(incoming.codex);
+      expect(result.warnings).toEqual([]);
+    });
+
+    it('derives provenance from aggregate messages and model keys', () => {
+      const aggregate = {
+        ...breakdown(5_000, 30),
+        messages: 35,
+        models: {
+          'gpt-5.5': breakdown(3_000, 20).models['gpt-5.5'],
+          'gpt-5.5-mini': breakdown(2_000, 15, 'gpt-5.5-mini').models['gpt-5.5-mini'],
+        },
+        provenance: {
+          schemaVersion: 1,
+          messageCount: 30,
+          modelCount: 1,
+        },
+      };
+
+      expect(deriveClientBreakdownProvenance(aggregate)).toEqual({
+        schemaVersion: 1,
+        messageCount: 35,
+        modelCount: 2,
+      });
+    });
+
     it('should preserve clients NOT in submission but delete clients with no day activity', () => {
       const existingClientBreakdown = {
         claude: { tokens: 1000, cost: 10, modelId: 'claude-sonnet-4', input: 600, output: 400, cacheRead: 0, cacheWrite: 0, messages: 5 },

@@ -303,6 +303,11 @@ export const dailyBreakdown = pgTable(
             reasoning: number;
             messages: number;
           }>;
+          provenance?: {
+            schemaVersion: number;
+            messageCount: number;
+            modelCount: number;
+          };
           modelId?: string;
         }
       >

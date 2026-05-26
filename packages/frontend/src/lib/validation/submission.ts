@@ -34,6 +34,12 @@ const TokenBreakdownSchema = z.object({
   reasoning: NonNegativeIntegerSchema,
 });
 
+const ClientContributionProvenanceSchema = z.object({
+  schemaVersion: NonNegativeIntegerSchema.min(1),
+  messageCount: NonNegativeIntegerSchema,
+  modelCount: NonNegativeIntegerSchema,
+});
+
 const SUPPORTED_SOURCES = [
   "opencode",
   "claude",
@@ -68,6 +74,7 @@ const ClientContributionSchema = z.object({
   tokens: TokenBreakdownSchema,
   cost: NonNegativeNumberSchema,
   messages: NonNegativeIntegerSchema,
+  provenance: ClientContributionProvenanceSchema.optional(),
 });
 
 const DailyContributionSchema = z.object({
@@ -528,6 +535,7 @@ export function generateSubmissionHash(data: SubmissionData): string {
             tokens: client.tokens,
             cost: client.cost,
             messages: client.messages,
+            provenance: client.provenance ?? null,
           }))
           .sort((a, b) =>
             `${a.client}\u0000${a.providerId ?? ""}\u0000${a.modelId}`.localeCompare(

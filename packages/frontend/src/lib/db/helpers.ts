@@ -13,6 +13,12 @@ export interface ModelBreakdownData {
   messages: number;
 }
 
+export interface ClientBreakdownProvenanceData {
+  schemaVersion: number;
+  messageCount: number;
+  modelCount: number;
+}
+
 export interface ClientBreakdownData {
   tokens: number;
   cost: number;
@@ -23,8 +29,14 @@ export interface ClientBreakdownData {
   reasoning: number;
   messages: number;
   models: Record<string, ModelBreakdownData>;
+  provenance?: ClientBreakdownProvenanceData;
   /** @deprecated Legacy field for backward compat - use models instead */
   modelId?: string;
+}
+
+export interface MergeClientBreakdownsResult {
+  merged: Record<string, ClientBreakdownData>;
+  warnings: string[];
 }
 
 export interface DayTotals {
@@ -69,6 +81,50 @@ export function recalculateDayTotals(
   };
 }
 
+function formatTokens(value: number): string {
+  return Math.round(value).toLocaleString("en-US");
+}
+
+export function deriveClientBreakdownProvenance(
+  breakdown: ClientBreakdownData
+): ClientBreakdownProvenanceData {
+  const modelCount = breakdown.models
+    ? Object.keys(breakdown.models).length
+    : breakdown.modelId
+    ? 1
+    : 0;
+
+  return {
+    schemaVersion: Math.max(1, breakdown.provenance?.schemaVersion ?? 1),
+    messageCount: Math.max(
+      0,
+      breakdown.provenance?.messageCount ?? 0,
+      breakdown.messages ?? 0
+    ),
+    modelCount: Math.max(0, breakdown.provenance?.modelCount ?? 0, modelCount),
+  };
+}
+
+function withDerivedProvenance(breakdown: ClientBreakdownData): ClientBreakdownData {
+  return {
+    ...breakdown,
+    provenance: deriveClientBreakdownProvenance(breakdown),
+  };
+}
+
+function hasLowerCoverage(
+  existing: ClientBreakdownData,
+  incoming: ClientBreakdownData
+): boolean {
+  const existingProvenance = deriveClientBreakdownProvenance(existing);
+  const incomingProvenance = deriveClientBreakdownProvenance(incoming);
+
+  return (
+    incomingProvenance.messageCount < existingProvenance.messageCount ||
+    incomingProvenance.modelCount < existingProvenance.modelCount
+  );
+}
+
 export function mergeClientBreakdowns(
   existing: Record<string, ClientBreakdownData> | null | undefined,
   incoming: Record<string, ClientBreakdownData>,
@@ -85,6 +141,51 @@ export function mergeClientBreakdowns(
   }
 
   return merged;
+}
+
+export function mergeClientBreakdownsWithRegressionGuard(
+  existing: Record<string, ClientBreakdownData> | null | undefined,
+  incoming: Record<string, ClientBreakdownData>,
+  incomingClients: Set<string>
+): MergeClientBreakdownsResult {
+  const merged: Record<string, ClientBreakdownData> = { ...(existing || {}) };
+  const warnings: string[] = [];
+
+  for (const clientName of incomingClients) {
+    const existingClient = existing?.[clientName];
+    const incomingClient = incoming[clientName];
+
+    if (!incomingClient) {
+      if (existingClient && existingClient.tokens > 0) {
+        merged[clientName] = withDerivedProvenance(existingClient);
+        warnings.push(
+          `Preserved ${clientName} because it disappeared from this same-device resubmit; kept ${formatTokens(existingClient.tokens)} tokens.`
+        );
+      } else {
+        delete merged[clientName];
+      }
+      continue;
+    }
+
+    const nextClient = withDerivedProvenance(incomingClient);
+    if (
+      existingClient &&
+      nextClient.tokens < existingClient.tokens &&
+      hasLowerCoverage(existingClient, nextClient)
+    ) {
+      merged[clientName] = withDerivedProvenance(existingClient);
+      const existingTokens = formatTokens(existingClient.tokens);
+      const nextTokens = formatTokens(nextClient.tokens);
+      warnings.push(
+        `Preserved ${clientName} because this same-device resubmit would reduce ${existingTokens} tokens to ${nextTokens} with lower coverage.`
+      );
+      continue;
+    }
+
+    merged[clientName] = nextClient;
+  }
+
+  return { merged, warnings };
 }
 
 export function clientContributionToBreakdownData(
