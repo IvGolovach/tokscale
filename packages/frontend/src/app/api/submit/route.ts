@@ -233,22 +233,59 @@ export async function POST(request: Request) {
       // ------------------------------------------
       // STEP 3b: Fetch existing daily breakdown for merge
       // ------------------------------------------
-      const existingDays = await tx
-        .select({
-          id: dailyBreakdown.id,
-          date: dailyBreakdown.date,
-          timestampMs: dailyBreakdown.timestampMs,
-          activeTimeMs: dailyBreakdown.activeTimeMs,
-          sourceBreakdown: dailyBreakdown.sourceBreakdown,
-        })
-        .from(dailyBreakdown)
-        .where(
-          and(
-            eq(dailyBreakdown.submissionId, submissionId),
-            eq(dailyBreakdown.submittedDeviceId, submittedDevice.id)
+      const fetchExistingDeviceDays = () =>
+        tx
+          .select({
+            id: dailyBreakdown.id,
+            date: dailyBreakdown.date,
+            timestampMs: dailyBreakdown.timestampMs,
+            activeTimeMs: dailyBreakdown.activeTimeMs,
+            sourceBreakdown: dailyBreakdown.sourceBreakdown,
+          })
+          .from(dailyBreakdown)
+          .where(
+            and(
+              eq(dailyBreakdown.submissionId, submissionId),
+              eq(dailyBreakdown.submittedDeviceId, submittedDevice.id)
+            )
           )
-        )
-        .for('update');
+          .for('update');
+
+      let existingDays = await fetchExistingDeviceDays();
+
+      if (
+        existingDays.length === 0 &&
+        !isNewSubmission &&
+        submitDevice.key !== LEGACY_SUBMIT_DEVICE_KEY
+      ) {
+        // The first device-aware submit after the migration should continue
+        // the user's legacy bucket instead of counting the same history twice.
+        // Once any modern device rows exist, attribution is ambiguous, so the
+        // legacy bucket stays separate.
+        await tx.execute(sql`
+          UPDATE daily_breakdown AS db
+          SET submitted_device_id = ${submittedDevice.id}
+          WHERE db.submission_id = ${submissionId}
+            AND db.submitted_device_id IN (
+              SELECT sd.id
+              FROM submitted_devices AS sd
+              WHERE sd.user_id = ${tokenRecord.userId}
+                AND sd.device_key = ${LEGACY_SUBMIT_DEVICE_KEY}
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM daily_breakdown AS modern
+              WHERE modern.submission_id = db.submission_id
+                AND modern.submitted_device_id NOT IN (
+                  SELECT sd2.id
+                  FROM submitted_devices AS sd2
+                  WHERE sd2.user_id = ${tokenRecord.userId}
+                    AND sd2.device_key = ${LEGACY_SUBMIT_DEVICE_KEY}
+                )
+            )
+        `);
+        existingDays = await fetchExistingDeviceDays();
+      }
 
       const existingDaysMap = new Map(
         existingDays.map((d) => [d.date, d])

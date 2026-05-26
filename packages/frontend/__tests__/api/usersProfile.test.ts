@@ -288,6 +288,150 @@ describe("GET /api/users/[username]", () => {
     expect(mockState.limitCalls[0]).toBe(2);
   });
 
+  it("aggregates same-date rows from multiple submitted devices into one profile contribution", async () => {
+    mockState.pushSelectResult([
+      {
+        id: "user-1",
+        username: "alice",
+        displayName: "Alice",
+        avatarUrl: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        totalTokens: 27,
+        totalCost: 1.25,
+        inputTokens: 17,
+        outputTokens: 10,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        reasoningTokens: 0,
+        submissionCount: 2,
+        earliestDate: "2026-04-30",
+        latestDate: "2026-04-30",
+        totalActiveTimeMs: 0,
+        sessionCount: 0,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        sourcesUsed: ["codex"],
+        modelsUsed: ["gpt-5.5"],
+        updatedAt: new Date("2026-04-30T12:00:00.000Z"),
+        cliVersion: "2.0.0",
+        schemaVersion: 2,
+      },
+    ]);
+    mockState.pushSelectResult([
+      {
+        date: "2026-04-30",
+        timestampMs: 100,
+        tokens: 12,
+        cost: "0.5000",
+        inputTokens: 7,
+        outputTokens: 5,
+        sourceBreakdown: {
+          codex: {
+            tokens: 12,
+            cost: 0.5,
+            input: 7,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            messages: 1,
+            models: {
+              "gpt-5.5": {
+                tokens: 12,
+                cost: 0.5,
+                input: 7,
+                output: 5,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0,
+                messages: 1,
+              },
+            },
+          },
+        },
+      },
+      {
+        date: "2026-04-30",
+        timestampMs: 200,
+        tokens: 15,
+        cost: "0.7500",
+        inputTokens: 10,
+        outputTokens: 5,
+        sourceBreakdown: {
+          codex: {
+            tokens: 15,
+            cost: 0.75,
+            input: 10,
+            output: 5,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            messages: 1,
+            models: {
+              "gpt-5.5": {
+                tokens: 15,
+                cost: 0.75,
+                input: 10,
+                output: 5,
+                cacheRead: 0,
+                cacheWrite: 0,
+                reasoning: 0,
+                messages: 1,
+              },
+            },
+          },
+        },
+      },
+    ]);
+    mockState.pushExecuteResult([{ rank: 4 }]);
+
+    const response = await GET(
+      new Request("http://localhost:3000/api/users/alice"),
+      { params: Promise.resolve({ username: "alice" }) }
+    );
+    const body = await response.json();
+
+    expect(response.status).toBe(200);
+    expect(body.stats.totalTokens).toBe(27);
+    expect(body.stats.activeDays).toBe(1);
+    expect(body.contributions).toHaveLength(1);
+    expect(body.contributions[0]).toEqual(expect.objectContaining({
+      date: "2026-04-30",
+      timestampMs: 100,
+      totals: expect.objectContaining({
+        tokens: 27,
+        cost: 1.25,
+      }),
+      tokenBreakdown: expect.objectContaining({
+        input: 17,
+        output: 10,
+      }),
+    }));
+    expect(body.contributions[0].clients[0]).toEqual(expect.objectContaining({
+      client: "codex",
+      cost: 1.25,
+      messages: 2,
+      tokens: expect.objectContaining({
+        input: 17,
+        output: 10,
+      }),
+    }));
+    expect(body.modelUsage).toEqual([
+      expect.objectContaining({
+        model: "gpt-5.5",
+        tokens: 27,
+        cost: 1.25,
+        percentage: 100,
+      }),
+    ]);
+  });
+
   it("returns submission freshness metadata for the latest submission", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-03-11T12:00:00.000Z"));
