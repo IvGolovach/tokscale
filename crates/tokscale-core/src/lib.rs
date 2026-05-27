@@ -5258,6 +5258,42 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_pricing_if_available_prices_kimi_k2p6_alias() {
+        let mut openrouter = HashMap::new();
+        openrouter.insert(
+            "moonshotai/kimi-k2.6".into(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(9.5e-7),
+                output_cost_per_token: Some(0.000004),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(HashMap::new(), openrouter);
+
+        let mut msg = UnifiedMessage::new(
+            "kimi",
+            "k2p6",
+            "kimi-for-coding",
+            "session-1",
+            1_776_000_000_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 250_000,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, Some(&pricing));
+
+        let expected = 1_000_000.0 * 9.5e-7 + 250_000.0 * 0.000004;
+        assert!((msg.cost - expected).abs() < 1e-12);
+        assert!(msg.cost > 0.0);
+    }
+
+    #[test]
     fn test_select_local_parse_pricing_prefers_fresh_service_for_new_models() {
         let mut fresh_litellm = HashMap::new();
         fresh_litellm.insert(
