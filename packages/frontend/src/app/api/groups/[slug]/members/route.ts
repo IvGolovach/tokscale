@@ -6,6 +6,8 @@ import { revalidateGroupCaches } from "@/lib/groups/cache";
 import { canManageGroupMember, getGroupMembership } from "@/lib/groups/permissions";
 import { getGroupBySlug } from "@/lib/groups/queries";
 
+const BROWSER_SESSION_OPTIONS = { allowAuthorizationHeader: false } as const;
+
 interface RouteParams {
   params: Promise<{ slug: string }>;
 }
@@ -57,7 +59,7 @@ export async function GET(request: Request, { params }: RouteParams) {
 
 export async function DELETE(request: Request, { params }: RouteParams) {
   try {
-    const session = await getSessionFromRequest(request);
+    const session = await getSessionFromRequest(request, BROWSER_SESSION_OPTIONS);
     if (!session) {
       return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
     }
