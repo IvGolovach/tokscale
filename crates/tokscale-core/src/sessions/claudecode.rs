@@ -50,6 +50,18 @@ struct AgentMetaFile {
     agent_type: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct CcMirrorVariantMetadata {
+    name: String,
+    provider_id: Option<String>,
+}
+
+impl CcMirrorVariantMetadata {
+    fn client_id(&self) -> String {
+        format!("cc-mirror/{}", sanitize_cc_mirror_segment(&self.name))
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ClaudeMessage {
     pub model: Option<String>,
@@ -294,15 +306,37 @@ fn extract_agent_id_from_text(text: &str) -> Option<String> {
 
 /// Parse a Claude Code JSONL file
 pub fn parse_claude_file(path: &Path) -> Vec<UnifiedMessage> {
+    let home_dir = dirs::home_dir();
+    parse_claude_file_with_home(path, home_dir.as_deref())
+}
+
+pub fn parse_claude_file_with_home(path: &Path, home_dir: Option<&Path>) -> Vec<UnifiedMessage> {
     let mut parent_cache = ParentSubagentTypeCache::new();
-    parse_claude_file_with_cache(path, &mut parent_cache)
+    parse_claude_file_with_cache_and_home(path, &mut parent_cache, home_dir)
 }
 
 pub fn parse_claude_file_with_cache(
     path: &Path,
     parent_cache: &mut ParentSubagentTypeCache,
 ) -> Vec<UnifiedMessage> {
+    let home_dir = dirs::home_dir();
+    parse_claude_file_with_cache_and_home(path, parent_cache, home_dir.as_deref())
+}
+
+pub fn parse_claude_file_with_cache_and_home(
+    path: &Path,
+    parent_cache: &mut ParentSubagentTypeCache,
+    home_dir: Option<&Path>,
+) -> Vec<UnifiedMessage> {
     let (workspace_key, workspace_label) = claude_workspace_from_path(path);
+    let cc_mirror_metadata = cc_mirror_variant_metadata_from_path(path, home_dir);
+    let client_id = cc_mirror_metadata
+        .as_ref()
+        .map(CcMirrorVariantMetadata::client_id)
+        .unwrap_or_else(|| "claude".to_string());
+    let metadata_provider_hint = cc_mirror_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.provider_id.as_deref());
     let mut session_id = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -318,6 +352,8 @@ pub fn parse_claude_file_with_cache(
             fallback_timestamp,
             workspace_key.clone(),
             workspace_label.clone(),
+            &client_id,
+            metadata_provider_hint,
         );
         if !json_messages.is_empty() {
             return json_messages;
@@ -453,7 +489,8 @@ pub fn parse_claude_file_with_cache(
                     message
                         .provider_id
                         .as_deref()
-                        .or(entry.provider_id.as_deref()),
+                        .or(entry.provider_id.as_deref())
+                        .or(metadata_provider_hint),
                 );
 
                 // Build dedup key for global deduplication (messageId:requestId composite).
@@ -512,7 +549,8 @@ pub fn parse_claude_file_with_cache(
                     message
                         .provider_id
                         .as_deref()
-                        .or(entry.provider_id.as_deref()),
+                        .or(entry.provider_id.as_deref())
+                        .or(metadata_provider_hint),
                 );
                 let provider_confidence = provider_choice.confidence;
                 let model = canonicalize_claude_model(&raw_model);
@@ -528,7 +566,7 @@ pub fn parse_claude_file_with_cache(
                 });
 
                 let mut unified = UnifiedMessage::new_with_dedup(
-                    "claude",
+                    client_id.clone(),
                     model,
                     provider_choice.id,
                     session_id.clone(),
@@ -573,6 +611,8 @@ pub fn parse_claude_file_with_cache(
             &session_id,
             &mut headless_state,
             fallback_timestamp,
+            &client_id,
+            metadata_provider_hint,
         ) {
             let mut message = message;
             message.set_workspace(workspace_key.clone(), workspace_label.clone());
@@ -582,9 +622,13 @@ pub fn parse_claude_file_with_cache(
         }
     }
 
-    if let Some(message) =
-        finalize_headless_state(&mut headless_state, &session_id, fallback_timestamp)
-    {
+    if let Some(message) = finalize_headless_state(
+        &mut headless_state,
+        &session_id,
+        fallback_timestamp,
+        &client_id,
+        metadata_provider_hint,
+    ) {
         let mut message = message;
         message.set_workspace(workspace_key, workspace_label);
         let provider_confidence = stored_claude_provider_confidence(&message.provider_id);
@@ -609,7 +653,94 @@ fn claude_workspace_from_path(path: &Path) -> (Option<String>, Option<String>) {
         }
     }
 
+    for window in components.windows(5) {
+        if window[0] == ".cc-mirror" && window[2] == "config" && window[3] == "projects" {
+            let key = normalize_workspace_key(&window[4]);
+            let label = key.as_deref().and_then(workspace_label_from_key);
+            return (key, label);
+        }
+    }
+
+    for window in components.windows(2).rev() {
+        if window[0] == "projects" {
+            let key = normalize_workspace_key(&window[1]);
+            let label = key.as_deref().and_then(workspace_label_from_key);
+            return (key, label);
+        }
+    }
+
     (None, None)
+}
+
+fn sanitize_cc_mirror_segment(raw: &str) -> String {
+    let mut segment: String = raw
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+
+    while segment.contains("--") {
+        segment = segment.replace("--", "-");
+    }
+    let mut segment = segment
+        .trim_matches(|ch| matches!(ch, '-' | '_' | '.'))
+        .to_string();
+    if segment.len() > 96 {
+        segment.truncate(96);
+        segment = segment
+            .trim_matches(|ch| matches!(ch, '-' | '_' | '.'))
+            .to_string();
+    }
+    if segment.is_empty() {
+        "variant".to_string()
+    } else {
+        segment
+    }
+}
+
+fn cc_mirror_provider_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.eq_ignore_ascii_case("mirror") {
+        return Some("anthropic".to_string());
+    }
+    provider_identity::canonical_provider(trimmed)
+}
+
+fn cc_mirror_variant_metadata_from_path(
+    path: &Path,
+    home_dir: Option<&Path>,
+) -> Option<CcMirrorVariantMetadata> {
+    let variant_dir = crate::cc_mirror::variant_dir_from_session_path(path, home_dir)?;
+    let variant_name = variant_dir.file_name()?.to_string_lossy().to_string();
+    let variant_path = crate::cc_mirror::variant_file_path(&variant_dir);
+    let metadata = crate::cc_mirror::read_variant_file(&variant_path);
+
+    let name = metadata
+        .as_ref()
+        .and_then(|metadata| metadata.name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or(&variant_name)
+        .to_string();
+    let provider_id = metadata
+        .as_ref()
+        .and_then(|metadata| {
+            metadata
+                .provider_id
+                .as_deref()
+                .or(metadata.provider.as_deref())
+        })
+        .and_then(cc_mirror_provider_id);
+
+    Some(CcMirrorVariantMetadata { name, provider_id })
 }
 
 fn parse_claude_entry_timestamp(timestamp: Option<&str>) -> Option<i64> {
@@ -942,6 +1073,8 @@ fn parse_claude_headless_json(
     fallback_timestamp: i64,
     workspace_key: Option<String>,
     workspace_label: Option<String>,
+    client_id: &str,
+    default_provider_hint: Option<&str>,
 ) -> Vec<UnifiedMessage> {
     let Some(data) = read_file_or_none(path) else {
         return Vec::new();
@@ -954,7 +1087,13 @@ fn parse_claude_headless_json(
     };
 
     let mut messages = Vec::with_capacity(1);
-    if let Some(message) = extract_claude_headless_message(&value, session_id, fallback_timestamp) {
+    if let Some(message) = extract_claude_headless_message(
+        &value,
+        session_id,
+        fallback_timestamp,
+        client_id,
+        default_provider_hint,
+    ) {
         let mut message = message;
         message.set_workspace(workspace_key, workspace_label);
         messages.push(message);
@@ -968,6 +1107,8 @@ fn process_claude_headless_line(
     session_id: &str,
     state: &mut ClaudeHeadlessState,
     fallback_timestamp: i64,
+    client_id: &str,
+    default_provider_hint: Option<&str>,
 ) -> Option<UnifiedMessage> {
     let mut bytes = line.as_bytes().to_vec();
     let value: Value = simd_json::from_slice(&mut bytes).ok()?;
@@ -977,7 +1118,13 @@ fn process_claude_headless_line(
 
     match event_type {
         "message_start" => {
-            completed_message = finalize_headless_state(state, session_id, fallback_timestamp);
+            completed_message = finalize_headless_state(
+                state,
+                session_id,
+                fallback_timestamp,
+                client_id,
+                default_provider_hint,
+            );
 
             state.model = extract_claude_model(&value);
             state.provider_id = extract_claude_provider(&value);
@@ -999,12 +1146,22 @@ fn process_claude_headless_line(
             }
         }
         "message_stop" => {
-            completed_message = finalize_headless_state(state, session_id, fallback_timestamp);
+            completed_message = finalize_headless_state(
+                state,
+                session_id,
+                fallback_timestamp,
+                client_id,
+                default_provider_hint,
+            );
         }
         _ => {
-            if let Some(message) =
-                extract_claude_headless_message(&value, session_id, fallback_timestamp)
-            {
+            if let Some(message) = extract_claude_headless_message(
+                &value,
+                session_id,
+                fallback_timestamp,
+                client_id,
+                default_provider_hint,
+            ) {
                 completed_message = Some(message);
             }
         }
@@ -1017,17 +1174,23 @@ fn extract_claude_headless_message(
     value: &Value,
     session_id: &str,
     fallback_timestamp: i64,
+    client_id: &str,
+    default_provider_hint: Option<&str>,
 ) -> Option<UnifiedMessage> {
     let usage = value
         .get("usage")
         .or_else(|| value.get("message").and_then(|msg| msg.get("usage")))?;
     let raw_model = extract_claude_model(value)?;
-    let provider_id = claude_provider_id(&raw_model, extract_claude_provider(value).as_deref());
+    let provider_hint = extract_claude_provider(value);
+    let provider_id = claude_provider_id(
+        &raw_model,
+        provider_hint.as_deref().or(default_provider_hint),
+    );
     let model = canonicalize_claude_model(&raw_model);
     let timestamp = extract_claude_timestamp(value).unwrap_or(fallback_timestamp);
 
     Some(UnifiedMessage::new(
-        "claude",
+        client_id,
         model,
         provider_id,
         session_id.to_string(),
@@ -1239,9 +1402,14 @@ fn finalize_headless_state(
     state: &mut ClaudeHeadlessState,
     session_id: &str,
     fallback_timestamp: i64,
+    client_id: &str,
+    default_provider_hint: Option<&str>,
 ) -> Option<UnifiedMessage> {
     let raw_model = state.model.clone()?;
-    let provider_id = claude_provider_id(&raw_model, state.provider_id.as_deref());
+    let provider_id = claude_provider_id(
+        &raw_model,
+        state.provider_id.as_deref().or(default_provider_hint),
+    );
     let model = canonicalize_claude_model(&raw_model);
     let timestamp = state.timestamp_ms.unwrap_or(fallback_timestamp);
     if state.input == 0 && state.output == 0 && state.cache_read == 0 && state.cache_write == 0 {
@@ -1250,7 +1418,7 @@ fn finalize_headless_state(
     }
 
     let message = UnifiedMessage::new(
-        "claude",
+        client_id,
         model,
         provider_id,
         session_id.to_string(),
@@ -1323,6 +1491,30 @@ mod tests {
         (temp_dir, path)
     }
 
+    fn create_cc_mirror_project_file(
+        content: &str,
+        variant: &str,
+        provider: &str,
+        project: &str,
+        filename: &str,
+    ) -> (TempDir, std::path::PathBuf) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let variant_dir = temp_dir.path().join(".cc-mirror").join(variant);
+        let config_dir = variant_dir.join("config");
+        let path = config_dir.join("projects").join(project).join(filename);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            variant_dir.join("variant.json"),
+            format!(
+                r#"{{"name":"{variant}","provider":"{provider}","configDir":"{}"}}"#,
+                config_dir.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(&path, content).unwrap();
+        (temp_dir, path)
+    }
+
     fn create_transcript_file(content: &str, filename: &str) -> (TempDir, std::path::PathBuf) {
         let temp_dir = tempfile::tempdir().unwrap();
         let path = temp_dir
@@ -1351,6 +1543,46 @@ mod tests {
         );
         assert_eq!(messages[0].tokens.input, 100);
         assert_eq!(messages[1].tokens.input, 200);
+    }
+
+    #[test]
+    fn test_parse_cc_mirror_claude_variant_attributes_client_provider_and_workspace() {
+        let content = r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}}"#;
+
+        let (_temp_dir, path) = create_cc_mirror_project_file(
+            content,
+            "zai-worker",
+            "zai",
+            "-Users-example-work",
+            "session.jsonl",
+        );
+
+        let messages = parse_claude_file(&path);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].client, "cc-mirror/zai-worker");
+        assert_eq!(messages[0].provider_id, "zai");
+        assert_eq!(messages[0].model_id, "claude-3-5-sonnet");
+        assert_eq!(messages[0].tokens.input, 100);
+        assert_eq!(messages[0].tokens.output, 50);
+        assert_eq!(messages[0].tokens.cache_read, 10);
+        assert_eq!(messages[0].tokens.cache_write, 5);
+        assert_eq!(
+            messages[0].workspace_key.as_deref(),
+            Some("-Users-example-work")
+        );
+        assert_eq!(
+            messages[0].workspace_label.as_deref(),
+            Some("-Users-example-work")
+        );
+    }
+
+    #[test]
+    fn test_cc_mirror_variant_client_segment_is_submit_safe() {
+        assert_eq!(sanitize_cc_mirror_segment(" zaicc "), "zaicc");
+        assert_eq!(sanitize_cc_mirror_segment("../Zai CC!"), "zai-cc");
+        assert_eq!(sanitize_cc_mirror_segment("..."), "variant");
+        assert_eq!(sanitize_cc_mirror_segment(&"a".repeat(120)).len(), 96);
     }
 
     #[test]

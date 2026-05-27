@@ -356,6 +356,11 @@ pub fn built_in_extra_scan_paths_for(
             ClientId::Claude,
             PathBuf::from(format!("{}/.claude/transcripts", home_dir)),
         ));
+        paths.extend(
+            crate::cc_mirror::discover_claude_project_roots(Path::new(home_dir))
+                .into_iter()
+                .map(|path| (ClientId::Claude, path)),
+        );
     }
 
     paths
@@ -2142,6 +2147,69 @@ mod tests {
 
         assert_eq!(result.get(ClientId::Claude), &vec![transcript]);
         assert!(result.get(ClientId::OpenCode).is_empty());
+    }
+
+    #[test]
+    fn test_scan_all_clients_claude_discovers_cc_mirror_variant_projects() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_claude_dir(home);
+
+        let variant_dir = home.join(".cc-mirror/kimi-code");
+        let config_dir = variant_dir.join("config");
+        let project_dir = config_dir.join("projects/project-one");
+        fs::create_dir_all(&project_dir).unwrap();
+        let variant_file = variant_dir.join("variant.json");
+        fs::write(
+            &variant_file,
+            format!(
+                r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
+                config_dir.display()
+            ),
+        )
+        .unwrap();
+        let variant_session = project_dir.join("variant-session.jsonl");
+        File::create(&variant_session).unwrap();
+
+        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+
+        assert_eq!(result.get(ClientId::Claude).len(), 2);
+        assert!(
+            result
+                .get(ClientId::Claude)
+                .iter()
+                .any(|path| path == &variant_session),
+            "expected cc-mirror session {} in {:?}",
+            variant_session.display(),
+            result.get(ClientId::Claude)
+        );
+    }
+
+    #[test]
+    fn test_scan_all_clients_claude_dedups_cc_mirror_config_dir_pointing_at_normal_claude() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        setup_mock_claude_dir(home);
+
+        let normal_claude_dir = home.join(".claude");
+        let variant_dir = home.join(".cc-mirror/plain-mirror");
+        fs::create_dir_all(&variant_dir).unwrap();
+        fs::write(
+            variant_dir.join("variant.json"),
+            format!(
+                r#"{{"name":"plain-mirror","provider":"mirror","configDir":"{}"}}"#,
+                normal_claude_dir.display()
+            ),
+        )
+        .unwrap();
+
+        let result = scan_all_clients(home.to_str().unwrap(), &["claude".to_string()]);
+
+        assert_eq!(
+            result.get(ClientId::Claude).len(),
+            1,
+            "cc-mirror variants pointing at ~/.claude must not duplicate normal Claude files"
+        );
     }
 
     #[test]

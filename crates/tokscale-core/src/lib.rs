@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
 mod aggregator;
+mod cc_mirror;
 pub mod clients;
 pub mod fs_atomic;
 mod message_cache;
@@ -118,6 +119,7 @@ fn retain_for_requested_clients(
     requested: &HashSet<&str>,
 ) -> bool {
     requested.contains(client)
+        || (requested.contains("claude") && client.starts_with("cc-mirror/"))
         || (requested.contains("synthetic")
             && sessions::synthetic::matches_synthetic_filter(client, model_id, provider_id))
 }
@@ -627,15 +629,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         ))
     }
 
-    fn load_or_parse_source_with_fingerprint_and_policy<F>(
+    fn load_or_parse_source_with_fingerprint_and_policy<F, FingerprintFn>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
-        fingerprint_from_path: fn(&Path) -> Option<message_cache::SourceFingerprint>,
+        fingerprint_from_path: FingerprintFn,
         parse: F,
     ) -> CachedParseOutcome
     where
         F: Fn(&Path) -> (Vec<UnifiedMessage>, bool),
+        FingerprintFn: Fn(&Path) -> Option<message_cache::SourceFingerprint>,
     {
         let Some(fingerprint) = fingerprint_from_path(path) else {
             let (mut messages, _) = parse(path);
@@ -678,15 +681,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
-    fn load_or_parse_source_with_fingerprint<F>(
+    fn load_or_parse_source_with_fingerprint<F, FingerprintFn>(
         path: &Path,
         source_cache: &message_cache::SourceMessageCache,
         pricing: Option<&pricing::PricingService>,
-        fingerprint_from_path: fn(&Path) -> Option<message_cache::SourceFingerprint>,
+        fingerprint_from_path: FingerprintFn,
         parse: F,
     ) -> CachedParseOutcome
     where
         F: Fn(&Path) -> Vec<UnifiedMessage>,
+        FingerprintFn: Fn(&Path) -> Option<message_cache::SourceFingerprint>,
     {
         load_or_parse_source_with_fingerprint_and_policy(
             path,
@@ -888,6 +892,7 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let claude_home = PathBuf::from(home_dir);
     let claude_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Claude)
         .par_iter()
@@ -896,8 +901,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 path,
                 &source_cache,
                 pricing,
-                message_cache::SourceFingerprint::from_claude_code_path,
-                sessions::claudecode::parse_claude_file,
+                |path| {
+                    message_cache::SourceFingerprint::from_claude_code_path_with_home(
+                        path,
+                        Some(&claude_home),
+                    )
+                },
+                |path| sessions::claudecode::parse_claude_file_with_home(path, Some(&claude_home)),
             )
         })
         .collect();
@@ -2079,17 +2089,22 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     };
     counts.set(ClientId::OpenCode, opencode_count);
 
+    let claude_home = PathBuf::from(&home_dir);
     let claude_msgs_raw: Vec<(String, ParsedMessage)> = scan_result
         .get(ClientId::Claude)
         .par_iter()
         .map_init(std::collections::HashMap::new, |parent_cache, path| {
-            sessions::claudecode::parse_claude_file_with_cache(path, parent_cache)
-                .into_iter()
-                .map(|msg| {
-                    let dedup_key = msg.dedup_key.clone().unwrap_or_default();
-                    (dedup_key, unified_to_parsed(&msg))
-                })
-                .collect::<Vec<_>>()
+            sessions::claudecode::parse_claude_file_with_cache_and_home(
+                path,
+                parent_cache,
+                Some(&claude_home),
+            )
+            .into_iter()
+            .map(|msg| {
+                let dedup_key = msg.dedup_key.clone().unwrap_or_default();
+                (dedup_key, unified_to_parsed(&msg))
+            })
+            .collect::<Vec<_>>()
         })
         .flatten()
         .collect();
@@ -6003,6 +6018,117 @@ mod tests {
         assert_eq!(parsed.messages[0].output, 45);
         assert_eq!(parsed.messages[0].cache_read, 67);
         assert_eq!(parsed.messages[0].cache_write, 8);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_refreshes_cc_mirror_provider_when_variant_metadata_changes() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let variant_dir = source_home.path().join(".cc-mirror/kimi-code");
+            let config_dir = source_home.path().join("mirror-configs/kimi-code");
+            let project_dir = config_dir.join("projects/project-one");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            std::fs::create_dir_all(&variant_dir).unwrap();
+            let variant_path = variant_dir.join("variant.json");
+            std::fs::write(
+                &variant_path,
+                format!(
+                    r#"{{"name":"kimi-code","provider":"kimi","configDir":"{}"}}"#,
+                    config_dir.display()
+                ),
+            )
+            .unwrap();
+            let session_path = project_dir.join("session.jsonl");
+            std::fs::write(
+                &session_path,
+                r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}
+"#,
+            )
+            .unwrap();
+
+            let first_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+            );
+            assert_eq!(first_messages.len(), 1);
+            assert_eq!(first_messages[0].client, "cc-mirror/kimi-code");
+            assert_eq!(first_messages[0].provider_id, "kimi");
+
+            std::fs::write(
+                &variant_path,
+                format!(
+                    r#"{{"name":"kimi-code","provider":"minimax","configDir":"{}"}}"#,
+                    config_dir.display()
+                ),
+            )
+            .unwrap();
+
+            let refreshed_messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+            );
+            assert_eq!(refreshed_messages.len(), 1);
+            assert_eq!(refreshed_messages[0].client, "cc-mirror/kimi-code");
+            assert_eq!(refreshed_messages[0].provider_id, "minimax");
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_keeps_normal_claude_when_cc_mirror_points_at_claude_config() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let original_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", cache_home.path());
+
+        {
+            let claude_dir = source_home.path().join(".claude");
+            let project_dir = claude_dir.join("projects/project-one");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let session_path = project_dir.join("session.jsonl");
+            std::fs::write(
+                &session_path,
+                r#"{"type":"assistant","timestamp":"2024-12-01T10:00:00.000Z","requestId":"req_001","message":{"id":"msg_001","model":"claude-3-5-sonnet","usage":{"input_tokens":100,"output_tokens":50}}}
+"#,
+            )
+            .unwrap();
+
+            let variant_dir = source_home.path().join(".cc-mirror/plain-mirror");
+            std::fs::create_dir_all(&variant_dir).unwrap();
+            std::fs::write(
+                variant_dir.join("variant.json"),
+                format!(
+                    r#"{{"name":"plain-mirror","provider":"mirror","configDir":"{}"}}"#,
+                    claude_dir.display()
+                ),
+            )
+            .unwrap();
+
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["claude".to_string()],
+                None,
+            );
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].client, "claude");
+        }
+
+        match original_home {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     #[test]
