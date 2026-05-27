@@ -75,6 +75,14 @@ function getSubmitDevice(data: SubmissionData): { key: string; name: string | nu
   };
 }
 
+function isUniqueConstraintViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const maybeError = error as { code?: unknown; cause?: unknown };
+  if (maybeError.code === "23505") return true;
+  const cause = maybeError.cause;
+  return Boolean(cause && typeof cause === "object" && (cause as { code?: unknown }).code === "23505");
+}
+
 /**
  * POST /api/submit
  * Submit token usage data from CLI
@@ -189,27 +197,48 @@ export async function POST(request: Request) {
       if (existingSubmission) {
         submissionId = existingSubmission.id;
       } else {
-        isNewSubmission = true;
-        const [newSubmission] = await tx
-          .insert(submissions)
-          .values({
-            userId: tokenRecord.userId,
-            totalTokens: 0,
-            totalCost: "0",
-            inputTokens: 0,
-            outputTokens: 0,
-            cacheCreationTokens: 0,
-            cacheReadTokens: 0,
-            dateStart: data.meta.dateRange.start,
-            dateEnd: data.meta.dateRange.end,
-            sourcesUsed: [],
-            modelsUsed: [],
-            cliVersion: data.meta.version,
-            submissionHash: generateSubmissionHash(hashData),
-          })
-          .returning({ id: submissions.id });
+        try {
+          const [newSubmission] = await tx.transaction(async (sp) =>
+            sp
+              .insert(submissions)
+              .values({
+                userId: tokenRecord.userId,
+                totalTokens: 0,
+                totalCost: "0",
+                inputTokens: 0,
+                outputTokens: 0,
+                cacheCreationTokens: 0,
+                cacheReadTokens: 0,
+                dateStart: data.meta.dateRange.start,
+                dateEnd: data.meta.dateRange.end,
+                sourcesUsed: [],
+                modelsUsed: [],
+                cliVersion: data.meta.version,
+                submissionHash: generateSubmissionHash(hashData),
+              })
+              .returning({ id: submissions.id })
+          );
 
-        submissionId = newSubmission.id;
+          submissionId = newSubmission.id;
+          isNewSubmission = true;
+        } catch (creationErr) {
+          if (!isUniqueConstraintViolation(creationErr)) {
+            throw creationErr;
+          }
+
+          const [racedSubmission] = await tx
+            .select({ id: submissions.id })
+            .from(submissions)
+            .where(eq(submissions.userId, tokenRecord.userId))
+            .for('update')
+            .limit(1);
+
+          if (!racedSubmission) {
+            throw creationErr;
+          }
+
+          submissionId = racedSubmission.id;
+        }
       }
 
       const submitDevice = getSubmitDevice(data);
