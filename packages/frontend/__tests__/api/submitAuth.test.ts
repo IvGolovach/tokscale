@@ -715,9 +715,22 @@ describe("POST /api/submit auth path", () => {
         models: { "gpt-5.5": incomingBreakdown },
       },
     };
+    const incomingBreakdownWithProvenance = {
+      codex: {
+        ...mergedBreakdown.codex,
+        provenance: {
+          schemaVersion: 1,
+          messageCount: 1,
+          modelCount: 1,
+        },
+      },
+    };
 
     mockState.clientContributionToBreakdownData.mockReturnValue(incomingBreakdown);
-    mockState.mergeClientBreakdowns.mockReturnValue(mergedBreakdown);
+    mockState.mergeClientBreakdownsWithRegressionGuard.mockReturnValue({
+      merged: mergedBreakdown,
+      warnings: [],
+    });
     mockState.recalculateDayTotals.mockReturnValue({
       tokens: 15,
       cost: 0.75,
@@ -802,9 +815,9 @@ describe("POST /api/submit auth path", () => {
     expect(tx.insert).toHaveBeenCalledTimes(1);
     expect(dailyInsertValues).toBeUndefined();
     expect(tx.execute).toHaveBeenCalledTimes(2);
-    expect(mockState.mergeClientBreakdowns).toHaveBeenCalledWith(
+    expect(mockState.mergeClientBreakdownsWithRegressionGuard).toHaveBeenCalledWith(
       legacyBreakdown,
-      { codex: mergedBreakdown.codex },
+      incomingBreakdownWithProvenance,
       expect.any(Set)
     );
     expect(await response.json()).toEqual(expect.objectContaining({
@@ -881,6 +894,11 @@ describe("POST /api/submit auth path", () => {
       codex: {
         ...incomingBreakdown,
         models: { "gpt-5.5": incomingBreakdown },
+        provenance: {
+          schemaVersion: 1,
+          messageCount: 1,
+          modelCount: 1,
+        },
       },
     };
 
@@ -967,7 +985,7 @@ describe("POST /api/submit auth path", () => {
       tokens: 15,
       sourceBreakdown: insertedBreakdown,
     })]);
-    expect(mockState.mergeClientBreakdowns).not.toHaveBeenCalled();
+    expect(mockState.mergeClientBreakdownsWithRegressionGuard).not.toHaveBeenCalled();
     expect(await response.json()).toEqual(expect.objectContaining({
       success: true,
       metrics: expect.objectContaining({
