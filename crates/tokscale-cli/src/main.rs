@@ -4353,14 +4353,27 @@ fn run_time_metrics_report(
         had_cursor_cache,
         explicit_cursor_filter,
     );
-    emit_cursor_setup_warnings(&cursor_setup_warnings);
 
     let m = &report.metrics;
 
     if json {
-        let output = serde_json::to_string_pretty(&report).unwrap_or_default();
-        println!("{}", output);
+        #[derive(serde::Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct TimeMetricsReportJson<'a> {
+            metrics: &'a tokscale_core::TimeMetrics,
+            processing_time_ms: u32,
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            warnings: Vec<String>,
+        }
+
+        let output = TimeMetricsReportJson {
+            metrics: &report.metrics,
+            processing_time_ms: report.processing_time_ms,
+            warnings: cursor_setup_warnings,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
+        emit_cursor_setup_warnings(&cursor_setup_warnings);
         println!("Session Time Metrics");
         println!("====================");
         println!(

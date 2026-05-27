@@ -480,6 +480,34 @@ fn write_codex_token_session(dir: &Path, name: &str, model: &str, input: i64, ou
     .unwrap();
 }
 
+fn write_cursor_usage_cache(base: &Path) {
+    let cache_dir = base.join(".config/tokscale/cursor-cache");
+    fs::create_dir_all(&cache_dir).unwrap();
+    fs::write(cache_dir.join("usage.csv"), "Date,Model\n").unwrap();
+}
+
+fn write_cursor_credentials(base: &Path) {
+    let config_dir = base.join(".config/tokscale");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("cursor-credentials.json"),
+        serde_json::json!({
+            "version": 1,
+            "activeAccountId": "active-account",
+            "accounts": {
+                "active-account": {
+                    "sessionToken": "test-session-token",
+                    "userId": "active-account",
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "label": "work"
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
 // ── Existing tests ─────────────────────────────────────────────────────────
 
 #[test]
@@ -1166,6 +1194,100 @@ fn test_models_default_missing_cursor_cache_does_not_emit_setup_warning_json() {
             .is_none_or(Vec::is_empty),
         "default all-client report should not warn about unrequested Cursor setup"
     );
+}
+
+#[test]
+fn test_models_cursor_explicit_existing_cache_suppresses_setup_warning_json() {
+    let tmp = create_empty_fixture_dir();
+    write_cursor_usage_cache(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .args(["models", "--json", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        json.get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "existing Cursor cache should suppress setup warnings"
+    );
+}
+
+#[test]
+fn test_models_cursor_logged_in_missing_cache_suggests_sync_only_json() {
+    let tmp = create_empty_fixture_dir();
+    write_cursor_credentials(tmp.path());
+
+    let output = cmd_with_home(tmp.path())
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "http://127.0.0.1:9")
+        .args(["models", "--json", "--client", "cursor", "--no-spinner"])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let warnings = json["warnings"].as_array().unwrap();
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("tokscale cursor sync"));
+    assert!(
+        !warning.contains("tokscale cursor login"),
+        "logged-in users with no cache should be told to sync, not log in again: {warning}"
+    );
+}
+
+#[test]
+fn test_time_metrics_cursor_explicit_missing_cache_reports_setup_warning_json() {
+    let tmp = create_empty_fixture_dir();
+    let output = cmd_with_home(tmp.path())
+        .args([
+            "time-metrics",
+            "--json",
+            "--client",
+            "cursor",
+            "--no-spinner",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_cursor_setup_warning(&json);
+}
+
+#[test]
+fn test_graph_cursor_explicit_missing_cache_reports_setup_warning_text() {
+    let tmp = create_empty_fixture_dir();
+    cmd_with_home(tmp.path())
+        .args(["graph", "--client", "cursor", "--no-spinner"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Cursor usage requires"))
+        .stderr(predicate::str::contains("tokscale cursor login"));
+}
+
+#[test]
+fn test_submit_cursor_explicit_missing_cache_reports_setup_warning_text() {
+    let tmp = create_empty_fixture_dir();
+    cmd_with_home(tmp.path())
+        .env("TOKSCALE_API_TOKEN", "test-token")
+        .args(["submit", "--client", "cursor", "--dry-run"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("Cursor usage requires"))
+        .stderr(predicate::str::contains("tokscale cursor login"));
 }
 
 #[test]
