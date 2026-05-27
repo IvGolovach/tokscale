@@ -905,6 +905,43 @@ fn test_clients_home_override_uses_explicit_home_for_json() {
 }
 
 #[test]
+fn test_clients_home_override_ignores_copilot_exporter_env() {
+    let real_home = create_empty_fixture_dir();
+    let conflicting_home = create_empty_fixture_dir();
+    let exporter_file = conflicting_home.path().join("copilot-host.jsonl");
+    fs::write(&exporter_file, "{}").unwrap();
+
+    let output = cmd_with_conflicting_env(conflicting_home.path())
+        .env("COPILOT_OTEL_FILE_EXPORTER_PATH", &exporter_file)
+        .args([
+            "--home",
+            real_home.path().to_str().unwrap(),
+            "clients",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let copilot = json["clients"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["client"] == "copilot")
+        .unwrap();
+    assert!(
+        copilot.get("exporterStatus").is_none(),
+        "explicit --home diagnostics must not report host COPILOT_OTEL_FILE_EXPORTER_PATH: {copilot:#?}"
+    );
+}
+
+#[test]
 fn test_models_with_since_only() {
     let tmp = create_temp_fixture_dir();
     cmd_with_home(tmp.path())
