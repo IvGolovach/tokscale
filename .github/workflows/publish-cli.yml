@@ -17,6 +17,11 @@ on:
         description: "Override version (e.g., 2.0.0-beta.1). Takes precedence over bump."
         required: false
         type: string
+      recovery:
+        description: "Retry publishing an already committed release version. Requires version."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -28,8 +33,12 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.bump.outputs.version }}
+      base_version: ${{ steps.bump.outputs.base_version }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Calculate version
         id: bump
@@ -37,6 +46,12 @@ jobs:
           # Read current version from packages/cli/package.json (source of truth)
           CURRENT_VERSION=$(jq -r '.version' packages/cli/package.json)
           echo "📦 Current version: $CURRENT_VERSION"
+          echo "base_version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+
+          if [ "${{ inputs.recovery }}" = "true" ] && [ -z "${{ inputs.version }}" ]; then
+            echo "Recovery publishes must provide the existing release version." >&2
+            exit 1
+          fi
           
           # Calculate new version
           if [ -n "${{ inputs.version }}" ]; then
@@ -113,6 +128,9 @@ jobs:
           path.write_text(updated)
           PY
           echo "✅ Updated Cargo.toml workspace version"
+
+          cargo update --workspace --offline
+          echo "✅ Updated Cargo.lock workspace package versions"
           
           # Verify all versions are updated
           echo ""
@@ -144,6 +162,7 @@ jobs:
           name: bumped-manifests
           path: |
             Cargo.toml
+            Cargo.lock
             packages/cli/package.json
             packages/cli-darwin-arm64/package.json
             packages/cli-darwin-x64/package.json
@@ -224,7 +243,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Download bumped package.json files
+      - name: Download bumped release files
         uses: actions/download-artifact@v6
         with:
           name: bumped-manifests
@@ -306,10 +325,24 @@ jobs:
           name: bumped-manifests
           path: .
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
       - name: Configure Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Check npm release state
+        env:
+          NEW_VERSION: ${{ needs.bump-versions.outputs.version }}
+          RELEASE_BASE_VERSION: ${{ needs.bump-versions.outputs.base_version }}
+          RELEASE_RECOVERY: ${{ inputs.recovery }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: bash scripts/check-npm-release-state.sh
 
       - name: Commit and push release provenance
         id: prepare
@@ -318,6 +351,7 @@ jobs:
           RELEASE_REF_NAME: ${{ github.ref_name }}
           RELEASE_REF_TYPE: ${{ github.ref_type }}
           EXPECTED_RELEASE_BASE_SHA: ${{ github.sha }}
+          RELEASE_RECOVERY: ${{ inputs.recovery }}
         run: bash scripts/prepare-release-provenance.sh
 
   publish-platform-packages:
@@ -371,6 +405,12 @@ jobs:
         with:
           bun-version: 1.1.38
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
       - name: Download CLI binary artifact
         uses: actions/download-artifact@v6
         with:
@@ -388,12 +428,12 @@ jobs:
           ls -la "packages/${{ matrix.settings.package_dir }}/bin"
 
       - name: Publish platform package
-        working-directory: packages/${{ matrix.settings.package_dir }}
         run: |
-          echo "📦 Publishing ${{ matrix.settings.package_name }} version: $(jq -r '.version' package.json)"
-          bun publish --access public
+          echo "📦 Publishing ${{ matrix.settings.package_name }} version: $(jq -r '.version' "packages/${{ matrix.settings.package_dir }}/package.json")"
+          bash scripts/publish-npm-package.sh "packages/${{ matrix.settings.package_dir }}"
         env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_RECOVERY: ${{ inputs.recovery }}
 
   publish-cli:
     name: Publish @tokscale/cli
@@ -410,6 +450,12 @@ jobs:
         with:
           bun-version: 1.1.38
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
       - name: Install dependencies
         working-directory: packages/cli
         run: bun install
@@ -419,12 +465,12 @@ jobs:
         run: bun run build
 
       - name: Publish @tokscale/cli
-        working-directory: packages/cli
         run: |
-          echo "📦 Publishing version: $(jq -r '.version' package.json)"
-          bun publish --access public
+          echo "📦 Publishing version: $(jq -r '.version' packages/cli/package.json)"
+          bash scripts/publish-npm-package.sh packages/cli
         env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_RECOVERY: ${{ inputs.recovery }}
 
   publish-alias:
     name: Publish tokscale (wrapper)
@@ -441,13 +487,19 @@ jobs:
         with:
           bun-version: 1.1.38
 
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
       - name: Publish tokscale
-        working-directory: packages/tokscale
         run: |
-          echo "📦 Publishing version: $(jq -r '.version' package.json)"
-          bun publish --access public
+          echo "📦 Publishing version: $(jq -r '.version' packages/tokscale/package.json)"
+          bash scripts/publish-npm-package.sh packages/tokscale
         env:
-          NPM_CONFIG_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          RELEASE_RECOVERY: ${{ inputs.recovery }}
 
   finalize:
     name: Create release
