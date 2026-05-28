@@ -147,11 +147,6 @@ struct SessionCandidate {
 pub fn run_antigravity_sync() -> Result<()> {
     use colored::Colorize;
 
-    #[cfg(target_os = "windows")]
-    anyhow::bail!(
-        "Antigravity sync is not supported on Windows yet. Use macOS or Linux for `tokscale antigravity sync`, or remove Antigravity from your release notes for Windows."
-    );
-
     let cache_dir = get_antigravity_cache_dir()?;
     let sessions_dir = get_antigravity_sessions_dir()?;
     ensure_config_dir()?;
@@ -265,11 +260,6 @@ pub fn run_antigravity_sync() -> Result<()> {
 
 pub fn run_antigravity_status(json: bool) -> Result<()> {
     use colored::Colorize;
-
-    #[cfg(target_os = "windows")]
-    anyhow::bail!(
-        "Antigravity status is not supported on Windows yet because local language-server discovery is not implemented there. Use macOS or Linux for `tokscale antigravity status`."
-    );
 
     let cache_dir = get_antigravity_cache_dir()?;
     let sessions_dir = get_antigravity_sessions_dir()?;
@@ -690,12 +680,6 @@ fn bool_label(value: bool) -> &'static str {
 }
 
 pub fn detect_antigravity_connections() -> Result<Vec<AntigravityConnection>> {
-    if cfg!(target_os = "windows") {
-        anyhow::bail!(
-            "Antigravity connection discovery is not supported on Windows yet. Use macOS or Linux, or sync from another machine and copy artifacts manually."
-        );
-    }
-
     let candidates = detect_process_candidates()?;
     let mut connections = Vec::new();
 
@@ -738,6 +722,19 @@ fn candidate_probe_ports(candidate: &ProcessCandidate, mut ports: Vec<u16>) -> V
 }
 
 fn detect_process_candidates() -> Result<Vec<ProcessCandidate>> {
+    #[cfg(target_os = "windows")]
+    {
+        return detect_windows_process_candidates();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        detect_unix_process_candidates()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn detect_unix_process_candidates() -> Result<Vec<ProcessCandidate>> {
     let output = run_command("ps", &["-ww", "-eo", "pid,ppid,args"])?;
     let mut candidates = Vec::new();
 
@@ -807,6 +804,107 @@ fn detect_process_candidates() -> Result<Vec<ProcessCandidate>> {
     Ok(candidates)
 }
 
+#[cfg(target_os = "windows")]
+fn detect_windows_process_candidates() -> Result<Vec<ProcessCandidate>> {
+    let script = "$ErrorActionPreference = 'Stop'; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine | ConvertTo-Json -Compress";
+    let output = run_windows_powershell(script)?;
+    if output.trim().is_empty() {
+        anyhow::bail!(
+            "Windows process discovery returned no data; cannot discover Antigravity language servers"
+        );
+    }
+    parse_windows_process_candidates(&output)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn parse_windows_process_candidates(output: &str) -> Result<Vec<ProcessCandidate>> {
+    let value: Value = serde_json::from_str(output.trim())
+        .context("Failed to parse Windows process discovery JSON")?;
+    let items: Vec<&Value> = match &value {
+        Value::Array(values) => values.iter().collect(),
+        Value::Object(_) => vec![&value],
+        Value::Null => Vec::new(),
+        _ => {
+            anyhow::bail!("Windows process discovery JSON must be an object or array");
+        }
+    };
+    let mut candidates = Vec::new();
+
+    for item in items {
+        let Some(pid) = item
+            .get("ProcessId")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+        else {
+            continue;
+        };
+        let ppid = item
+            .get("ParentProcessId")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0);
+        let command = item
+            .get("CommandLine")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !is_antigravity_process(command) {
+            continue;
+        }
+
+        let executable_path = item.get("ExecutablePath").and_then(Value::as_str);
+        if !windows_candidate_executable_ok(executable_path, command) {
+            continue;
+        }
+
+        let Some(csrf_token) = extract_csrf_token(command) else {
+            continue;
+        };
+        let declared_port = extract_declared_port(command);
+
+        candidates.push(ProcessCandidate {
+            pid,
+            ppid,
+            declared_port,
+            csrf_token,
+        });
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .pid
+            .cmp(&left.pid)
+            .then_with(|| right.ppid.cmp(&left.ppid))
+            .then_with(|| right.declared_port.cmp(&left.declared_port))
+    });
+    candidates.dedup_by(|left, right| left.pid == right.pid);
+
+    Ok(candidates)
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_candidate_executable_ok(executable_path: Option<&str>, command: &str) -> bool {
+    executable_path
+        .filter(|path| !path.trim().is_empty())
+        .map(executable_path_looks_antigravity)
+        .unwrap_or_else(|| command_line_executable_looks_antigravity(command))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn executable_path_looks_antigravity(path: &str) -> bool {
+    let lower = path.to_lowercase();
+    lower.contains("antigravity") || lower.contains("language_server")
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn command_line_executable_looks_antigravity(command: &str) -> bool {
+    let first = command
+        .trim_start()
+        .strip_prefix('"')
+        .and_then(|rest| rest.split('"').next())
+        .unwrap_or_else(|| command.split_whitespace().next().unwrap_or_default());
+    executable_path_looks_antigravity(first)
+}
+
 fn is_antigravity_process(command: &str) -> bool {
     let lower = command.to_lowercase();
     (lower.contains("language_server")
@@ -874,6 +972,19 @@ fn extract_flag_value(command: &str, flag: &str) -> Option<String> {
 }
 
 fn find_listening_ports(pid: u32) -> Result<Vec<u16>> {
+    #[cfg(target_os = "windows")]
+    {
+        return find_windows_listening_ports(pid);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        find_unix_listening_ports(pid)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn find_unix_listening_ports(pid: u32) -> Result<Vec<u16>> {
     let pid_str = pid.to_string();
     let mut ports = run_port_query(
         "lsof",
@@ -888,6 +999,45 @@ fn find_listening_ports(pid: u32) -> Result<Vec<u16>> {
     ports.sort_unstable();
     ports.dedup();
     Ok(ports)
+}
+
+#[cfg(target_os = "windows")]
+fn find_windows_listening_ports(pid: u32) -> Result<Vec<u16>> {
+    let output = run_command_required("netstat", &["-ano", "-p", "TCP"])
+        .context("Failed to discover Windows TCP listeners with netstat")?;
+    Ok(parse_windows_netstat_ports(&output, pid))
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn parse_windows_netstat_ports(output: &str, pid: u32) -> Vec<u16> {
+    let mut ports = Vec::new();
+    let pid_text = pid.to_string();
+
+    for line in output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        if !parts[0].eq_ignore_ascii_case("TCP") {
+            continue;
+        }
+        if !parts[3].eq_ignore_ascii_case("LISTENING") || parts[4] != pid_text {
+            continue;
+        }
+        if let Some(port) = parse_port_from_windows_address(parts[1]) {
+            ports.push(port);
+        }
+    }
+
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn parse_port_from_windows_address(address: &str) -> Option<u16> {
+    let (_, port) = address.rsplit_once(':')?;
+    port.parse::<u16>().ok()
 }
 
 fn run_port_query(program: &str, warning_label: &str, args: &[&str]) -> Result<Vec<u16>> {
@@ -1171,10 +1321,7 @@ fn contains_antigravity_marker(value: &Value) -> bool {
 }
 
 fn run_command(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+    let output = run_command_output(program, args)?;
 
     if !output.status.success() && output.stdout.is_empty() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1193,6 +1340,52 @@ fn run_command(program: &str, args: &[&str]) -> Result<String> {
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn run_command_required(program: &str, args: &[&str]) -> Result<String> {
+    let output = run_command_output(program, args)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "{} {} exited with status {}{}",
+            program,
+            args.join(" "),
+            output.status,
+            if stderr.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {}", stderr.trim())
+            }
+        );
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_powershell(script: &str) -> Result<String> {
+    let args = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ];
+    match run_command_required("powershell", &args) {
+        Ok(output) => Ok(output),
+        Err(err) if is_command_not_found(&err) => run_command_required("powershell.exe", &args),
+        Err(err) => Err(err),
+    }
+}
+
+fn run_command_output(program: &str, args: &[&str]) -> Result<std::process::Output> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("Failed to run {} {}", program, args.join(" ")))?;
+    Ok(output)
 }
 
 pub fn list_trajectory_summaries(
@@ -1986,6 +2179,62 @@ mod tests {
         assert_eq!(
             parse_port_from_line("proc 123 user 12u IPv4 0x0 0t0 TCP 127.0.0.1:41234 (LISTEN)"),
             Some(41234)
+        );
+    }
+
+    #[test]
+    fn windows_process_candidates_parse_powershell_json() {
+        let output = r#"[
+            {
+                "ProcessId": 4242,
+                "ParentProcessId": 100,
+                "ExecutablePath": "C:\\Users\\me\\AppData\\Local\\Programs\\Antigravity\\language_server.exe",
+                "CommandLine": "\"C:\\Users\\me\\AppData\\Local\\Programs\\Antigravity\\language_server.exe\" --app_data_dir antigravity --extension_server_port=49321 --csrf_token=abcdef0123456789abcdef0123456789"
+            },
+            {
+                "ProcessId": 5000,
+                "ParentProcessId": 100,
+                "ExecutablePath": "C:\\Windows\\System32\\notepad.exe",
+                "CommandLine": "notepad.exe --app_data_dir antigravity --extension_server_port=49322 --csrf_token=abcdef0123456789abcdef0123456789"
+            }
+        ]"#;
+
+        let candidates = parse_windows_process_candidates(output).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pid, 4242);
+        assert_eq!(candidates[0].ppid, 100);
+        assert_eq!(candidates[0].declared_port, Some(49321));
+        assert_eq!(candidates[0].csrf_token, "abcdef0123456789abcdef0123456789");
+    }
+
+    #[test]
+    fn windows_process_candidates_accept_single_json_object() {
+        let output = r#"{
+            "ProcessId": 4243,
+            "ParentProcessId": 101,
+            "ExecutablePath": null,
+            "CommandLine": "\"C:\\Antigravity\\language_server.exe\" --extension_server_port 49323 --csrf_token abcdef0123456789abcdef0123456789"
+        }"#;
+
+        let candidates = parse_windows_process_candidates(output).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].pid, 4243);
+        assert_eq!(candidates[0].declared_port, Some(49323));
+    }
+
+    #[test]
+    fn windows_netstat_ports_filter_listeners_by_pid() {
+        let output = r#"
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    127.0.0.1:49321        0.0.0.0:0              LISTENING       4242
+  TCP    [::1]:49322            [::]:0                 LISTENING       4242
+  TCP    127.0.0.1:49323        0.0.0.0:0              ESTABLISHED     4242
+  TCP    127.0.0.1:49324        0.0.0.0:0              LISTENING       5000
+"#;
+
+        assert_eq!(
+            parse_windows_netstat_ports(output, 4242),
+            vec![49321, 49322]
         );
     }
 
