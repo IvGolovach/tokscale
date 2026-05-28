@@ -53,6 +53,11 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme_accent = app.theme.accent;
     let theme_muted = app.theme.muted;
     let theme_selection = app.theme.selection;
+    let metric_input_style = app.theme.metric_input_style();
+    let metric_output_style = app.theme.metric_output_style();
+    let metric_cache_read_style = app.theme.metric_cache_read_style();
+    let metric_cache_write_style = app.theme.metric_cache_write_style();
+    let striped_row_style = app.theme.striped_row_style();
 
     let models = app.get_sorted_models();
     if models.is_empty() {
@@ -172,14 +177,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(get_provider_display_name(&model.provider)),
                     Cell::from(get_client_display_name(&model.client))
                         .style(Style::default().fg(theme_muted)),
-                    Cell::from(format_tokens(model.tokens.input))
-                        .style(Style::default().fg(Color::Rgb(100, 200, 100))),
-                    Cell::from(format_tokens(model.tokens.output))
-                        .style(Style::default().fg(Color::Rgb(200, 100, 100))),
+                    Cell::from(format_tokens(model.tokens.input)).style(metric_input_style),
+                    Cell::from(format_tokens(model.tokens.output)).style(metric_output_style),
                     Cell::from(format_tokens(model.tokens.cache_read))
-                        .style(Style::default().fg(Color::Rgb(100, 150, 200))),
+                        .style(metric_cache_read_style),
                     Cell::from(format_tokens(model.tokens.cache_write))
-                        .style(Style::default().fg(Color::Rgb(200, 150, 100))),
+                        .style(metric_cache_write_style),
                     Cell::from(format_tokens(model.tokens.total())),
                     Cell::from(format_ms_per_1k(model.performance.ms_per_1k_tokens))
                         .style(Style::default().fg(Color::Yellow)),
@@ -196,14 +199,12 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
                     Cell::from(get_provider_display_name(&model.provider)),
                     Cell::from(get_client_display_name(&model.client))
                         .style(Style::default().fg(theme_muted)),
-                    Cell::from(format_tokens(model.tokens.input))
-                        .style(Style::default().fg(Color::Rgb(100, 200, 100))),
-                    Cell::from(format_tokens(model.tokens.output))
-                        .style(Style::default().fg(Color::Rgb(200, 100, 100))),
+                    Cell::from(format_tokens(model.tokens.input)).style(metric_input_style),
+                    Cell::from(format_tokens(model.tokens.output)).style(metric_output_style),
                     Cell::from(format_tokens(model.tokens.cache_read))
-                        .style(Style::default().fg(Color::Rgb(100, 150, 200))),
+                        .style(metric_cache_read_style),
                     Cell::from(format_tokens(model.tokens.cache_write))
-                        .style(Style::default().fg(Color::Rgb(200, 150, 100))),
+                        .style(metric_cache_write_style),
                     Cell::from(format_cache_hit_rate(
                         model.tokens.cache_read,
                         model.tokens.input,
@@ -220,7 +221,7 @@ pub fn render(frame: &mut Frame, app: &mut App, area: Rect) {
             let row_style = if is_selected {
                 Style::default().bg(theme_selection)
             } else if is_striped {
-                Style::default().bg(Color::Rgb(20, 24, 30))
+                striped_row_style
             } else {
                 Style::default()
             };
