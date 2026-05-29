@@ -119,6 +119,13 @@ impl CodexTotals {
             .saturating_add(self.reasoning)
     }
 
+    fn is_within(self, baseline: Self) -> bool {
+        self.input <= baseline.input
+            && self.output <= baseline.output
+            && self.cached <= baseline.cached
+            && self.reasoning <= baseline.reasoning
+    }
+
     fn looks_like_stale_regression(self, previous: Self, last: Self) -> bool {
         let previous_total = previous.total();
         let current_total = self.total();
@@ -302,8 +309,13 @@ fn parse_codex_reader<R: BufRead>(
                     if let Some(ref id) = payload.id {
                         state.session_id_from_meta = Some(id.clone());
                     }
-                    if let Some(ref forked_from_id) = payload.forked_from_id {
-                        state.session_forked_from_id = Some(forked_from_id.clone());
+                    let forked_from_id = payload
+                        .forked_from_id
+                        .as_deref()
+                        .filter(|id| !id.is_empty())
+                        .or_else(|| forked_from_id_from_source(payload.source.as_ref()));
+                    if let Some(forked_from_id) = forked_from_id {
+                        state.session_forked_from_id = Some(forked_from_id.to_string());
                         state.forked_child_waiting_for_turn_context = true;
                         state.forked_child_inherited_baseline = None;
                         state.forked_child_inherited_reported_total = None;
@@ -363,16 +375,15 @@ fn parse_codex_reader<R: BufRead>(
                     let total_usage = info.total_token_usage.as_ref().map(CodexTotals::from_usage);
                     let last_usage = info.last_token_usage.as_ref().map(CodexTotals::from_usage);
 
-                    if forked_child_matches_inherited_baseline(
+                    // Forked child logs can replay more than one parent
+                    // token_count row after the first child turn_context,
+                    // often with child-local timestamps. Keep the inherited
+                    // baseline active until totals move beyond it.
+                    if forked_child_should_skip_inherited_snapshot(
                         &state,
                         info.total_token_usage.as_ref(),
                         total_usage,
                     ) {
-                        if let Some(total) = total_usage {
-                            state.previous_totals = Some(total);
-                        }
-                        state.forked_child_inherited_baseline = None;
-                        state.forked_child_inherited_reported_total = None;
                         continue;
                     }
                     state.forked_child_inherited_baseline = None;
@@ -561,6 +572,15 @@ fn codex_source_is_exec(source: Option<&Value>) -> bool {
     source.and_then(Value::as_str) == Some("exec")
 }
 
+fn forked_from_id_from_source(source: Option<&Value>) -> Option<&str> {
+    source?
+        .get("subagent")?
+        .get("thread_spawn")?
+        .get("parent_thread_id")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+}
+
 fn parse_codex_entry_timestamp(timestamp: Option<&str>) -> Option<i64> {
     timestamp
         .and_then(|ts| chrono::DateTime::parse_from_rfc3339(ts).ok())
@@ -664,7 +684,7 @@ fn remember_forked_child_inherited_baseline(state: &mut CodexParseState, info: &
     state.forked_child_inherited_reported_total = reported_total_tokens(total_usage);
 }
 
-fn forked_child_matches_inherited_baseline(
+fn forked_child_should_skip_inherited_snapshot(
     state: &CodexParseState,
     total_usage: Option<&CodexTokenUsage>,
     totals: Option<CodexTotals>,
@@ -672,13 +692,13 @@ fn forked_child_matches_inherited_baseline(
     if let (Some(usage), Some(baseline)) =
         (total_usage, state.forked_child_inherited_reported_total)
     {
-        if reported_total_tokens(usage) == Some(baseline) {
+        if reported_total_tokens(usage).is_some_and(|total| total <= baseline) {
             return true;
         }
     }
 
     if let (Some(totals), Some(baseline)) = (totals, state.forked_child_inherited_baseline) {
-        return totals == baseline;
+        return totals.is_within(baseline);
     }
 
     false
@@ -1517,6 +1537,54 @@ mod tests {
         assert_eq!(messages[0].tokens.cache_read, 1000);
         assert_eq!(messages[0].tokens.output, 200);
         assert_eq!(messages[0].tokens.reasoning, 50);
+    }
+
+    #[test]
+    fn test_forked_child_ignores_replayed_parent_rows_after_turn_context() {
+        let file = create_test_file(concat!(
+            r#"{"timestamp":"2026-05-05T21:51:57.991Z","type":"session_meta","payload":{"id":"child-session","forked_from_id":"parent-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}},"model_provider":"openai","agent_nickname":"worker","cwd":"/repo-child"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:57.994Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"output_tokens":30,"total_tokens":330},"last_token_usage":{"input_tokens":300,"output_tokens":30,"total_tokens":330}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:58.947Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/repo-child"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:58.948Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55},"last_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:58.949Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"output_tokens":30,"total_tokens":330},"last_token_usage":{"input_tokens":250,"output_tokens":25,"total_tokens":275}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:59.253Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":310,"output_tokens":32,"total_tokens":342},"last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "gpt-5.5");
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].tokens.output, 2);
+    }
+
+    #[test]
+    fn test_forked_child_detects_thread_spawn_source_without_top_level_fork_id() {
+        let file = create_test_file(concat!(
+            r#"{"timestamp":"2026-05-05T21:51:57.991Z","type":"session_meta","payload":{"id":"child-session","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-session","depth":1}}},"model_provider":"openai","agent_nickname":"worker","cwd":"/repo-child"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:57.994Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"output_tokens":30,"total_tokens":330},"last_token_usage":{"input_tokens":300,"output_tokens":30,"total_tokens":330}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:58.947Z","type":"turn_context","payload":{"model":"gpt-5.5","cwd":"/repo-child"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:58.948Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55},"last_token_usage":{"input_tokens":50,"output_tokens":5,"total_tokens":55}}}}"#,
+            "\n",
+            r#"{"timestamp":"2026-05-05T21:51:59.253Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":310,"output_tokens":32,"total_tokens":342},"last_token_usage":{"input_tokens":10,"output_tokens":2,"total_tokens":12}}}}"#,
+            "\n"
+        ));
+
+        let messages = parse_codex_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].model_id, "gpt-5.5");
+        assert_eq!(messages[0].tokens.input, 10);
+        assert_eq!(messages[0].tokens.output, 2);
     }
 
     #[test]
