@@ -1457,6 +1457,43 @@ fn test_graph_offline_without_pricing_cache_still_succeeds() {
 }
 
 #[test]
+fn test_hourly_json_offline_without_pricing_cache_still_succeeds() {
+    let tmp = create_temp_fixture_dir_without_pricing_cache();
+    let output = offline_cmd_with_home(tmp.path())
+        .args(["hourly", "--json", "--opencode", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["input"].as_i64().unwrap())
+            .sum::<i64>(),
+        2400
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["output"].as_i64().unwrap())
+            .sum::<i64>(),
+        1000
+    );
+    let total_cost = json["totalCost"].as_f64().unwrap();
+    assert!(
+        (total_cost - 0.10).abs() < 1e-9,
+        "unexpected totalCost without pricing: {total_cost}"
+    );
+}
+
+#[test]
 fn test_models_json_offline_uses_stale_pricing_cache_when_available() {
     let tmp = create_temp_fixture_dir_without_pricing_cache();
     write_pricing_cache(tmp.path(), 1);
@@ -1519,6 +1556,45 @@ fn test_graph_offline_uses_stale_pricing_cache_when_available() {
 
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     let total_cost = json["summary"]["totalCost"].as_f64().unwrap();
+    assert!(
+        (total_cost - 0.0209).abs() < 1e-9,
+        "unexpected totalCost: {total_cost}"
+    );
+}
+
+#[test]
+fn test_hourly_json_offline_uses_stale_pricing_cache_when_available() {
+    let tmp = create_temp_fixture_dir_without_pricing_cache();
+    write_pricing_cache(tmp.path(), 1);
+
+    let output = offline_cmd_with_home(tmp.path())
+        .args(["hourly", "--json", "--opencode", "--no-spinner"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["input"].as_i64().unwrap())
+            .sum::<i64>(),
+        2400
+    );
+    assert_eq!(
+        entries
+            .iter()
+            .map(|entry| entry["output"].as_i64().unwrap())
+            .sum::<i64>(),
+        1000
+    );
+    let total_cost = json["totalCost"].as_f64().unwrap();
     assert!(
         (total_cost - 0.0209).abs() < 1e-9,
         "unexpected totalCost: {total_cost}"

@@ -1666,11 +1666,11 @@ pub async fn get_hourly_report(options: ReportOptions) -> Result<HourlyReport, S
         clients
     });
 
-    let pricing = pricing::PricingService::get_or_init().await?;
+    let pricing = load_pricing_for_local_parse().await;
     let all_messages = parse_all_messages_with_pricing_with_env_strategy(
         &home_dir,
         &clients,
-        Some(&pricing),
+        pricing.as_deref(),
         options.use_env_roots,
         &options.scanner_settings,
     );
