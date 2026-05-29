@@ -358,7 +358,29 @@ async fn send_graphql(
     if !response.status().is_success() {
         anyhow::bail!("Warp GraphQL API returned status {}", response.status());
     }
-    Ok(response.json().await?)
+    let value: Value = response.json().await?;
+    ensure_graphql_response_ok(&value)?;
+    Ok(value)
+}
+
+fn ensure_graphql_response_ok(response: &Value) -> Result<()> {
+    let Some(errors) = response.get("errors").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    if errors.is_empty() {
+        return Ok(());
+    }
+
+    let message = errors
+        .iter()
+        .filter_map(|error| error.get("message").and_then(Value::as_str))
+        .take(3)
+        .collect::<Vec<_>>()
+        .join("; ");
+    if message.is_empty() {
+        anyhow::bail!("Warp GraphQL API returned errors");
+    }
+    anyhow::bail!("Warp GraphQL API returned errors: {message}");
 }
 
 fn write_usage_cache(cache: &WarpUsageCache) -> Result<()> {
@@ -539,6 +561,27 @@ fn value_to_i64(value: &Value) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_graphql_response_ok_rejects_semantic_errors() {
+        let response = serde_json::json!({
+            "data": {
+                "requestLimitInfo": null
+            },
+            "errors": [
+                { "message": "token expired" },
+                { "message": "workspace unavailable" }
+            ]
+        });
+
+        let err = ensure_graphql_response_ok(&response)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("Warp GraphQL API returned errors"));
+        assert!(err.contains("token expired"));
+        assert!(err.contains("workspace unavailable"));
+    }
 
     #[test]
     fn normalize_graphql_usage_extracts_request_limit_and_workspace_overage() {
