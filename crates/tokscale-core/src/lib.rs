@@ -1003,6 +1003,22 @@ fn parse_all_messages_with_pricing_with_env_strategy(
         }
     }
 
+    let warp_outcomes: Vec<CachedParseOutcome> = scan_result
+        .get(ClientId::Warp)
+        .par_iter()
+        .map(|path| {
+            load_or_parse_source(path, &source_cache, pricing, |path| {
+                sessions::warp::parse_warp_file(path)
+            })
+        })
+        .collect();
+    for outcome in warp_outcomes {
+        all_messages.extend(outcome.messages);
+        if let Some(entry) = outcome.cache_entry {
+            source_cache.insert(entry);
+        }
+    }
+
     let amp_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::Amp)
         .par_iter()
@@ -2401,6 +2417,20 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     let trae_count = trae_msgs.len() as i32;
     counts.set(ClientId::Trae, trae_count);
     messages.extend(trae_msgs);
+
+    let warp_msgs: Vec<ParsedMessage> = scan_result
+        .get(ClientId::Warp)
+        .par_iter()
+        .flat_map(|path| {
+            sessions::warp::parse_warp_file(path)
+                .into_iter()
+                .map(|msg| unified_to_parsed(&msg))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let warp_count = summed_parsed_message_count(&warp_msgs);
+    counts.set(ClientId::Warp, warp_count);
+    messages.extend(warp_msgs);
 
     if include_synthetic {
         if let Some(db_path) = &scan_result.synthetic_db {

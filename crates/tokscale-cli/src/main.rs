@@ -6,6 +6,7 @@ mod device;
 mod paths;
 mod trae;
 mod tui;
+mod warp;
 
 use crate::tui::client_ui;
 use anyhow::Result;
@@ -284,6 +285,11 @@ enum Commands {
         #[command(subcommand)]
         subcommand: TraeSubcommand,
     },
+    #[command(about = "Warp/Oz aggregate usage integration commands")]
+    Warp {
+        #[command(subcommand)]
+        subcommand: WarpSubcommand,
+    },
     #[command(about = "Delete all submitted usage data from the server")]
     DeleteSubmittedData,
     #[command(
@@ -379,6 +385,35 @@ enum TraeSubcommand {
         since: Option<i64>,
         #[arg(long, help = "Include auxiliary usage types (not just main chat)")]
         include_aux: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum WarpSubcommand {
+    #[command(about = "Save Warp GraphQL authentication for aggregate usage sync")]
+    Login {
+        #[arg(long, help = "Warp bearer token or cookie header value")]
+        token: Option<String>,
+        #[arg(
+            long,
+            help = "Treat token as a Cookie header instead of a bearer token"
+        )]
+        cookie: bool,
+    },
+    #[command(about = "Remove cached Warp credentials")]
+    Logout {
+        #[arg(long, help = "Also delete cached Warp aggregate usage")]
+        purge_cache: bool,
+    },
+    #[command(about = "Show Warp aggregate sync status")]
+    Status {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
+    },
+    #[command(about = "Sync Warp aggregate usage into local cache")]
+    Sync {
+        #[arg(long, help = "Output as JSON")]
+        json: bool,
     },
 }
 
@@ -671,6 +706,10 @@ fn main() -> Result<()> {
             reject_unsupported_home_override(&cli.home, "trae")?;
             run_trae_command(subcommand)
         }
+        Some(Commands::Warp { subcommand }) => {
+            reject_unsupported_home_override(&cli.home, "warp")?;
+            run_warp_command(subcommand)
+        }
         Some(Commands::DeleteSubmittedData) => {
             reject_unsupported_home_override(&cli.home, "delete-submitted-data")?;
             run_delete_data_command()
@@ -804,6 +843,7 @@ pub enum ClientFilter {
     Kiro,
     #[value(name = "trae")]
     Trae,
+    Warp,
     Synthetic,
 }
 
@@ -837,6 +877,7 @@ impl ClientFilter {
             Self::Zed => "zed",
             Self::Kiro => "kiro",
             Self::Trae => "trae",
+            Self::Warp => "warp",
             Self::Synthetic => "synthetic",
         }
     }
@@ -873,6 +914,7 @@ impl ClientFilter {
             Self::Zed => Some(ClientId::Zed),
             Self::Kiro => Some(ClientId::Kiro),
             Self::Trae => Some(ClientId::Trae),
+            Self::Warp => Some(ClientId::Warp),
             Self::Synthetic => None,
         }
     }
@@ -906,6 +948,7 @@ impl ClientFilter {
             ClientId::Zed => Self::Zed,
             ClientId::Kiro => Self::Kiro,
             ClientId::Trae => Self::Trae,
+            ClientId::Warp => Self::Warp,
         }
     }
 
@@ -1007,6 +1050,8 @@ pub struct ClientFlags {
     #[arg(long, hide = true)]
     pub trae: bool,
     #[arg(long, hide = true)]
+    pub warp: bool,
+    #[arg(long, hide = true)]
     pub synthetic: bool,
 }
 
@@ -1060,7 +1105,7 @@ fn build_client_filter_with_defaults(
         }
     }
 
-    let legacy: [(bool, ClientFilter); 25] = [
+    let legacy: [(bool, ClientFilter); 26] = [
         (flags.opencode, ClientFilter::Opencode),
         (flags.claude, ClientFilter::Claude),
         (flags.codex, ClientFilter::Codex),
@@ -1085,6 +1130,7 @@ fn build_client_filter_with_defaults(
         (flags.zed, ClientFilter::Zed),
         (flags.kiro, ClientFilter::Kiro),
         (flags.trae, ClientFilter::Trae),
+        (flags.warp, ClientFilter::Warp),
         (flags.synthetic, ClientFilter::Synthetic),
     ];
 
@@ -1152,6 +1198,12 @@ fn client_filter_explicitly_requests_cursor(clients: &Option<Vec<String>>) -> bo
     clients
         .as_ref()
         .is_some_and(|sources| sources.iter().any(|source| source == "cursor"))
+}
+
+fn client_filter_explicitly_requests_warp(clients: &Option<Vec<String>>) -> bool {
+    clients
+        .as_ref()
+        .is_some_and(|sources| sources.iter().any(|source| source == "warp"))
 }
 
 #[derive(Debug)]
@@ -1236,6 +1288,65 @@ fn emit_cursor_setup_warnings(warnings: &[String]) {
     }
 }
 
+fn warp_setup_warnings_for_report(
+    home_dir: &Option<String>,
+    clients: &Option<Vec<String>>,
+) -> Vec<String> {
+    if !client_filter_explicitly_requests_warp(clients) {
+        return Vec::new();
+    }
+
+    let (home_path, home_override) = match home_dir {
+        Some(home) => (PathBuf::from(home), true),
+        None => match dirs::home_dir() {
+            Some(home) => (home, false),
+            None => {
+                return vec![
+                    "Warp usage requires Tokscale's Warp aggregate cache, but the home directory could not be resolved. Tokscale does not parse local Warp transcripts.".to_string(),
+                ];
+            }
+        },
+    };
+    let has_cache = if home_override {
+        warp::has_usage_cache_in_home(&home_path)
+    } else {
+        warp::load_usage_cache().is_some()
+    };
+    if has_cache {
+        return Vec::new();
+    }
+
+    let cache_glob = if home_override {
+        home_path
+            .join(".config/tokscale/warp-cache/usage*.json")
+            .to_string_lossy()
+            .to_string()
+    } else {
+        "~/.config/tokscale/warp-cache/usage*.json".to_string()
+    };
+    let action = if home_override {
+        "run `tokscale warp sync` for the default profile or populate that cache before running a report with --home"
+    } else if warp::has_credentials() {
+        "run `tokscale warp sync`"
+    } else {
+        "run `tokscale warp login` and `tokscale warp sync`"
+    };
+
+    vec![format!(
+        "Warp usage requires Tokscale's aggregate API cache at `{}`; {}. Tokscale does not parse local Warp/Oz session transcripts and does not infer tokens from request counts.",
+        cache_glob, action
+    )]
+}
+
+fn setup_warnings_for_report(
+    home_dir: &Option<String>,
+    clients: &Option<Vec<String>>,
+) -> Vec<String> {
+    let mut warnings = cursor_setup_warnings_for_report(home_dir, clients);
+    warnings.extend(warp_setup_warnings_for_report(home_dir, clients));
+    warnings
+}
+
 fn should_auto_sync_cursor_for_local_report(
     home_dir: &Option<String>,
     clients: &Option<Vec<String>>,
@@ -1295,7 +1406,7 @@ fn auto_sync_cursor_before_tui(
         had_cursor_cache,
         explicit_cursor_filter,
     );
-    let cursor_setup_warnings = cursor_setup_warnings_for_report(home_dir, clients);
+    let cursor_setup_warnings = setup_warnings_for_report(home_dir, clients);
     emit_cursor_setup_warnings(&cursor_setup_warnings);
     Ok(())
 }
@@ -1619,7 +1730,7 @@ fn run_models_report(
         Some(LightSpinner::start("Scanning session data..."))
     };
     let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
+    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let start = Instant::now();
     let rt = Runtime::new()?;
@@ -2391,7 +2502,7 @@ fn run_monthly_report(
         Some(LightSpinner::start("Scanning session data..."))
     };
     let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
+    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let start = Instant::now();
     let rt = Runtime::new()?;
@@ -2690,7 +2801,7 @@ fn run_hourly_report(
         Some(LightSpinner::start("Scanning session data..."))
     };
     let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
+    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let start = Instant::now();
     let rt = Runtime::new()?;
@@ -3382,6 +3493,7 @@ fn capitalize_client(client: &str) -> String {
         "openclaw" => "openclaw".to_string(),
         "hermes" => "Hermes Agent".to_string(),
         "goose" => "Goose".to_string(),
+        "warp" => "Warp".to_string(),
         "pi" => "Pi".to_string(),
         other => other.to_string(),
     }
@@ -4326,7 +4438,7 @@ fn run_time_metrics_report(
         Some(LightSpinner::start("Computing time metrics..."))
     };
     let cursor_sync_result = auto_sync_cursor_for_local_report(&home_dir, &clients);
-    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
+    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
     let use_env_roots = use_env_roots(&home_dir);
     let rt = Runtime::new()?;
     let report = rt
@@ -4442,7 +4554,7 @@ fn run_graph_command(
         let rt_sync = tokio::runtime::Runtime::new()?;
         cursor_sync_result = Some(rt_sync.block_on(async { cursor::sync_cursor_cache().await }));
     }
-    let cursor_setup_warnings = cursor_setup_warnings_for_report(&home_dir, &clients);
+    let cursor_setup_warnings = setup_warnings_for_report(&home_dir, &clients);
 
     if show_progress {
         eprintln!("  Scanning session data...");
@@ -4614,11 +4726,17 @@ fn is_legacy_tokenless_cursor_row(client: &tokscale_core::ClientContribution) ->
         && client_token_total(&client.tokens) == 0
 }
 
+fn is_aggregate_only_warp_row(client: &tokscale_core::ClientContribution) -> bool {
+    client.client == "warp"
+        && client.model_id == "aggregate-requests"
+        && client_token_total(&client.tokens) == 0
+}
+
 /// A row the server's "Cost submitted without tokens" sanity check would
 /// reject: real cost with every token bucket at zero, excluding the Cursor
 /// `premium-tool-call` carve-out above.
 fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
-    client.cost > 0.0
+    (is_aggregate_only_warp_row(client) || client.cost > 0.0)
         && client_token_total(&client.tokens) == 0
         && !is_legacy_tokenless_cursor_row(client)
 }
@@ -4628,13 +4746,10 @@ fn is_tokenless_costed_row(client: &tokscale_core::ClientContribution) -> bool {
 /// rejected wholesale.
 ///
 /// Cursor's usage export lists historical request/On-Demand charges (e.g.
-/// `auto`, `claude-3.5-sonnet`, `o3`) with empty token columns, which the
-/// parser turns into cost > 0 / tokens = 0 rows. The server rejects the entire
-/// submission when it sees any such row (see
-/// packages/frontend/src/lib/validation/submission.ts), permanently blocking
-/// users with that historical data. Rather than weaken the server check (which
-/// still guards against genuine parser regressions), we exclude the offending
-/// rows here and report them to the user.
+/// `auto`, `claude-3.5-sonnet`, `o3`) with empty token columns, and Warp/Oz
+/// only exposes aggregate request/spend counters. The server rejects cost with
+/// no tokens, and request counts must not be submitted as fabricated tokens, so
+/// we exclude the offending rows here and report them to the user.
 ///
 /// Excluded rows always carry zero tokens, so only cost/messages change; token
 /// totals, breakdowns, and intensities are untouched. Summary and year rollups
@@ -4696,7 +4811,7 @@ fn report_excluded_tokenless_rows(excluded: &[ExcludedTokenlessRow]) {
     println!(
         "{}",
         format!(
-            "  Excluded {} cost-only row(s) with no token data (Cursor historical billing):",
+            "  Excluded {} aggregate/cost-only row(s) with no token data:",
             excluded.len()
         )
         .yellow()
@@ -4772,6 +4887,7 @@ fn run_submit_command(
     println!("\n  {}\n", "Tokscale - Submit Usage Data".cyan());
 
     let explicit_cursor_filter = client_filter_explicitly_requests_cursor(&clients);
+    let explicit_warp_filter = client_filter_explicitly_requests_warp(&clients);
     let clients = clients.or_else(|| Some(default_submit_clients()));
 
     let include_cursor = clients
@@ -4797,8 +4913,8 @@ fn run_submit_command(
             }
         }
     }
-    if explicit_cursor_filter {
-        let cursor_setup_warnings = cursor_setup_warnings_for_report(&report_home, &clients);
+    if explicit_cursor_filter || explicit_warp_filter {
+        let cursor_setup_warnings = setup_warnings_for_report(&report_home, &clients);
         emit_cursor_setup_warnings(&cursor_setup_warnings);
     }
 
@@ -5339,6 +5455,15 @@ fn run_trae_command(subcommand: TraeSubcommand) -> Result<()> {
     }
 }
 
+fn run_warp_command(subcommand: WarpSubcommand) -> Result<()> {
+    match subcommand {
+        WarpSubcommand::Login { token, cookie } => warp::run_warp_login(token, cookie),
+        WarpSubcommand::Logout { purge_cache } => warp::run_warp_logout(purge_cache),
+        WarpSubcommand::Status { json } => warp::run_warp_status(json),
+        WarpSubcommand::Sync { json } => warp::run_warp_sync(json),
+    }
+}
+
 fn format_tokens_with_commas(n: i64) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
@@ -5727,6 +5852,7 @@ mod tests {
             zed: true,
             kiro: true,
             trae: true,
+            warp: true,
             synthetic: true,
             ..ClientFlags::default()
         };
@@ -5761,6 +5887,7 @@ mod tests {
             "zed",
             "kiro",
             "trae",
+            "warp",
             "synthetic",
         ] {
             assert!(
@@ -6827,6 +6954,31 @@ mod tests {
     }
 
     #[test]
+    fn test_exclude_tokenless_cost_drops_warp_aggregate_requests() {
+        let mut graph = graph_result_with_contributions(vec![day_with_clients(
+            "2026-01-02",
+            0,
+            vec![client_contribution(
+                "warp",
+                "aggregate-requests",
+                "warp",
+                0,
+                12.34,
+                42,
+            )],
+        )]);
+
+        let excluded = exclude_tokenless_cost_contributions(&mut graph);
+
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].client, "warp");
+        assert_eq!(excluded[0].model_id, "aggregate-requests");
+        assert!(graph.contributions[0].clients.is_empty());
+        assert_eq!(graph.summary.total_tokens, 0);
+        assert_eq!(graph.summary.total_cost, 0.0);
+    }
+
+    #[test]
     fn test_submit_payload_includes_device_when_provided() {
         let graph = graph_result_with_contributions(vec![daily_contribution(
             "2026-12-31",
@@ -7015,6 +7167,50 @@ mod tests {
     fn clap_accepts_cursor_sync_command() {
         assert!(Cli::try_parse_from(["tokscale", "cursor", "sync"]).is_ok());
         assert!(Cli::try_parse_from(["tokscale", "cursor", "sync", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn clap_accepts_warp_status_and_sync_commands() {
+        assert!(Cli::try_parse_from(["tokscale", "warp", "status"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "warp", "status", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "warp", "sync"]).is_ok());
+        assert!(Cli::try_parse_from(["tokscale", "warp", "sync", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn client_filter_round_trips_warp() {
+        assert_eq!(
+            ClientFilter::from_filter_str("warp"),
+            Some(ClientFilter::Warp)
+        );
+        assert_eq!(ClientFilter::Warp.as_filter_str(), "warp");
+        assert_eq!(
+            ClientFilter::Warp.to_client_id(),
+            Some(tokscale_core::ClientId::Warp)
+        );
+        assert_eq!(
+            ClientFilter::from_client_id(tokscale_core::ClientId::Warp),
+            ClientFilter::Warp
+        );
+    }
+
+    #[test]
+    fn default_submit_clients_excludes_warp_aggregate_source() {
+        let clients = default_submit_clients();
+        assert!(!clients.contains(&"warp".to_string()));
+    }
+
+    #[test]
+    fn warp_setup_warning_explains_missing_aggregate_cache() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let warnings = warp_setup_warnings_for_report(
+            &Some(temp.path().to_string_lossy().to_string()),
+            &Some(vec!["warp".to_string()]),
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("tokscale warp"));
+        assert!(warnings[0].contains("does not infer tokens from request counts"));
     }
 
     #[test]
