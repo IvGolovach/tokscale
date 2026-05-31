@@ -23,6 +23,7 @@ export const SUPPORTED_CLIENT_TYPES = [
   "kiro",
   "zed",
   "trae",
+  "warp",
   "synthetic",
 ] as const;
 
