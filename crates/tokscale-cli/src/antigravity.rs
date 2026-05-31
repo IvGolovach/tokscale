@@ -2239,6 +2239,138 @@ mod tests {
     }
 
     #[test]
+    fn windows_parse_port_from_address_ipv4() {
+        assert_eq!(
+            parse_port_from_windows_address("127.0.0.1:49321"),
+            Some(49321)
+        );
+        assert_eq!(parse_port_from_windows_address("0.0.0.0:8080"), Some(8080));
+    }
+
+    #[test]
+    fn windows_parse_port_from_address_ipv6() {
+        assert_eq!(parse_port_from_windows_address("[::1]:49322"), Some(49322));
+        assert_eq!(parse_port_from_windows_address("[::]:0"), Some(0));
+    }
+
+    #[test]
+    fn windows_parse_port_from_address_invalid() {
+        assert_eq!(parse_port_from_windows_address("no-colon"), None);
+        assert_eq!(parse_port_from_windows_address("127.0.0.1:notaport"), None);
+        assert_eq!(parse_port_from_windows_address(""), None);
+    }
+
+    #[test]
+    fn windows_executable_path_looks_antigravity_matches_case_insensitively() {
+        assert!(executable_path_looks_antigravity(
+            r"C:\Users\me\AppData\Local\Programs\Antigravity\language_server.exe"
+        ));
+        assert!(executable_path_looks_antigravity(
+            r"C:\ANTIGRAVITY\LANGUAGE_SERVER.EXE"
+        ));
+        assert!(executable_path_looks_antigravity(
+            r"D:\tools\antigravity\app.exe"
+        ));
+        assert!(executable_path_looks_antigravity(
+            r"C:\path\to\language_server.exe"
+        ));
+    }
+
+    #[test]
+    fn windows_executable_path_rejects_unrelated_programs() {
+        assert!(!executable_path_looks_antigravity(
+            r"C:\Windows\System32\notepad.exe"
+        ));
+        assert!(!executable_path_looks_antigravity(
+            r"C:\Program Files\SomeApp\app.exe"
+        ));
+        assert!(!executable_path_looks_antigravity(""));
+    }
+
+    #[test]
+    fn windows_command_line_executable_extracts_quoted_path() {
+        assert!(command_line_executable_looks_antigravity(
+            r#""C:\Antigravity\language_server.exe" --port=1234"#
+        ));
+        assert!(!command_line_executable_looks_antigravity(
+            r#""C:\Windows\System32\notepad.exe" somefile.txt"#
+        ));
+    }
+
+    #[test]
+    fn windows_command_line_executable_extracts_unquoted_path() {
+        assert!(command_line_executable_looks_antigravity(
+            r"C:\Antigravity\language_server.exe --flag"
+        ));
+        assert!(!command_line_executable_looks_antigravity(
+            r"notepad.exe file.txt"
+        ));
+    }
+
+    #[test]
+    fn windows_candidate_executable_ok_prefers_path_when_available() {
+        assert!(windows_candidate_executable_ok(
+            Some(r"C:\Programs\Antigravity\language_server.exe"),
+            r#"notepad.exe --csrf_token=abc"#
+        ));
+        assert!(!windows_candidate_executable_ok(
+            Some(r"C:\Windows\notepad.exe"),
+            r#""C:\Antigravity\language_server.exe" --flag"#
+        ));
+    }
+
+    #[test]
+    fn windows_candidate_executable_ok_falls_back_to_command_line() {
+        assert!(windows_candidate_executable_ok(
+            None,
+            r#""C:\Antigravity\language_server.exe" --csrf_token=abc"#
+        ));
+        assert!(windows_candidate_executable_ok(
+            Some(""),
+            r#""C:\path\language_server.exe" --flag"#
+        ));
+        assert!(windows_candidate_executable_ok(
+            Some("   "),
+            r#"C:\antigravity\app.exe"#
+        ));
+        assert!(!windows_candidate_executable_ok(
+            None,
+            r"notepad.exe file.txt"
+        ));
+    }
+
+    #[test]
+    fn is_antigravity_process_matches_language_server_variants() {
+        assert!(is_antigravity_process(
+            "language_server.exe --app_data_dir antigravity --port=1234"
+        ));
+        assert!(is_antigravity_process(
+            "/Applications/Antigravity.app/Contents/MacOS/language_server --flag"
+        ));
+        assert!(is_antigravity_process(
+            r"C:\Users\me\AppData\Local\Antigravity\language_server.exe --flag"
+        ));
+    }
+
+    #[test]
+    fn is_antigravity_process_matches_directory_patterns() {
+        assert!(is_antigravity_process(
+            "/home/user/.config/antigravity/server"
+        ));
+        assert!(is_antigravity_process(
+            r"C:\Programs\antigravity\server.exe"
+        ));
+    }
+
+    #[test]
+    fn is_antigravity_process_rejects_unrelated_commands() {
+        assert!(!is_antigravity_process("notepad.exe somefile.txt"));
+        assert!(!is_antigravity_process("language_server --other_app"));
+        assert!(!is_antigravity_process("some_other_gravity_app"));
+        assert!(!is_antigravity_process(""));
+    }
+
+    #[test]
     fn normalize_trajectory_summary_prefers_expected_fields() {
         let value = serde_json::json!({
             "cascadeId": "session-123",
