@@ -27,6 +27,11 @@ permissions:
   contents: write
   pull-requests: read
 
+env:
+  MACOSX_DEPLOYMENT_TARGET: "10.13"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
 jobs:
   bump-versions:
     name: Bump versions
@@ -36,6 +41,9 @@ jobs:
       base_version: ${{ steps.bump.outputs.base_version }}
     steps:
       - uses: actions/checkout@v5
+
+      - name: Check release workflow safety
+        run: python3 scripts/check-release-workflow-safety.py
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -180,14 +188,14 @@ jobs:
             artifact_name: cli-binary-aarch64-unknown-linux-gnu
             bin_name: tokscale
             build: cargo zigbuild --release -p tokscale-cli --target aarch64-unknown-linux-gnu
-            strip: aarch64-linux-gnu-strip target/aarch64-unknown-linux-gnu/release/tokscale
+            strip: ""
           - host: ubuntu-latest
             target: aarch64-unknown-linux-musl
             package_dir: cli-linux-arm64-musl
             artifact_name: cli-binary-aarch64-unknown-linux-musl
             bin_name: tokscale
             build: cargo zigbuild --release -p tokscale-cli --target aarch64-unknown-linux-musl
-            strip: aarch64-linux-gnu-strip target/aarch64-unknown-linux-musl/release/tokscale
+            strip: ""
           - host: windows-latest
             target: x86_64-pc-windows-msvc
             package_dir: cli-win32-x64-msvc
