@@ -1244,7 +1244,12 @@ fn parser_version(client: ClientId) -> u32 {
         // session-scoped dedup key, so a fork without `seedLength` counted the
         // copied summary twice. The key now falls back to `seq`, so v2 entries
         // carry keys that no longer match and must be reparsed.
-        ClientId::Dsh => 3,
+        // v3->v4: usage now prefers the concrete model reported by the
+        // provider (`replayState.response.responseModel`) over the configured
+        // request model. Finished DSH transcripts are append-only and keep the
+        // same fingerprint, so only this bump replaces cached alias/substitute
+        // attribution and its derived pricing.
+        ClientId::Dsh => 4,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -3304,6 +3309,90 @@ mod tests {
         // its fingerprint keeps matching and only the version bump discards the
         // v1 lock-timestamp anchor.
         assert_eq!(parser_version(ClientId::Droid), 7);
+    }
+
+    #[test]
+    fn test_dsh_served_model_parser_version_invalidates_v3_entries() {
+        // A finished transcript is never rewritten when attribution starts
+        // preferring the provider-reported response model, so its fingerprint
+        // remains valid and only the parser version can retire the old row.
+        assert_eq!(parser_version(ClientId::Dsh), 4);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dsh_v3_shards_are_reparsed_with_the_concrete_served_model() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(
+            br#"{"type":"session","id":"session-served","createdAt":1,"cwd":"/work"}
+{"type":"assistant/message","seq":42,"time":1787122684043,"data":{"turn":1,"message":{"id":"m-served","source":{"kind":"model","provider":"zai-coding-cn","model":"glm-5.2","replayState":{"response":{"responseModel":"glm-5.3"}}}},"usage":{"inputTokens":8425,"outputTokens":207,"cacheReadTokens":576}}}
+"#,
+        );
+        let current_identity = CacheIdentity::for_client(ClientId::Dsh);
+        assert_eq!(current_identity.parser_version, 4);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 3,
+        };
+        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            source.path(),
+            fingerprint.clone(),
+            vec![UnifiedMessage::new(
+                current_identity.namespace,
+                "glm-5.2",
+                "zai-coding-cn",
+                "session-served",
+                1787122684043,
+                crate::TokenBreakdown {
+                    input: 999,
+                    output: 0,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+            )],
+            Vec::new(),
+            None,
+        );
+        let stale_path = cache_shard_path(current_identity, source.path());
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_path,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(cache.get(current_identity, source.path()).is_none());
+        assert_eq!(
+            SourceFingerprint::from_path(source.path()).unwrap(),
+            fingerprint
+        );
+
+        let rebuilt = crate::sessions::dsh::parse_dsh_file(source.path());
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(rebuilt[0].model_id, "glm-5.3");
+        assert_ne!(rebuilt[0].tokens.input, 999);
+        cache.insert(CachedSourceEntry::new(
+            current_identity,
+            source.path(),
+            fingerprint,
+            rebuilt.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(current_identity, source.path()).unwrap();
+        assert_eq!(cached.parser_version, 4);
+        assert_eq!(cached.messages, rebuilt);
     }
 
     #[test]
