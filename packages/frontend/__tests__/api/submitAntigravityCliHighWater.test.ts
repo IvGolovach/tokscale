@@ -534,6 +534,54 @@ describe("POST /api/submit antigravity-cli re-attribution high-water", () => {
     ).toBe(55_000);
   });
 
+  it("credits later growth even when the original stored cell is still larger", async () => {
+    const { store } = await submitOldThenNew("antigravity-cli");
+    const grown = submissionBody("antigravity-cli", [
+      { date: "2026-08-07", tokens: 60_000, messages: 3 },
+      { date: "2026-08-08", tokens: 120_000, messages: 6 },
+      { date: "2026-08-09", tokens: 80_000, messages: 4 },
+    ]);
+
+    installTx(store);
+    mockSubmit(grown);
+    const response = await post(grown);
+    expect(response.status).toBe(200);
+    const json = await response.json();
+
+    expect(json.metrics.totalTokens).toBe(260_000);
+    expect(storedTokens(store)).toBe(260_000);
+    expect(
+      store.days.find((day) => day.date === "2026-08-07")?.sourceBreakdown[
+        "antigravity-cli"
+      ].tokens,
+    ).toBe(240_000);
+
+    const state = store.device.parserStates["antigravity-cli"] as {
+      aggregate: { tokens: number };
+      days: Record<string, { tokens: number }>;
+      observedDays: Record<string, { tokens: number }>;
+    };
+    expect(state.aggregate.tokens).toBe(260_000);
+    expect(
+      Object.values(state.days).reduce((sum, day) => sum + day.tokens, 0),
+    ).toBe(260_000);
+    expect(state.observedDays["2026-08-07"].tokens).toBe(60_000);
+
+    // The credited ledger, not the parser's cellwise envelope, is the next
+    // lifetime baseline. Replaying the same snapshot therefore adds nothing.
+    installTx(store);
+    mockSubmit(grown);
+    const replay = await post(grown);
+    expect(replay.status).toBe(200);
+    expect((await replay.json()).metrics.totalTokens).toBe(260_000);
+    expect(storedTokens(store)).toBe(260_000);
+    expect(
+      (store.device.parserStates["antigravity-cli"] as {
+        aggregate: { tokens: number };
+      }).aggregate.tokens,
+    ).toBe(260_000);
+  });
+
   it("still inflates for a client that is legitimately not registered", async () => {
     // Claude's parser does not re-attribute submitted history, so it is not in
     // SUPPORTED_VERSIONED_PARSERS and takes the plain day-by-day merge path.

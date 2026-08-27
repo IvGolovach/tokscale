@@ -49,6 +49,12 @@ const TOKEN_FIELDS = [
   "reasoning",
 ] as const;
 type TokenField = (typeof TOKEN_FIELDS)[number];
+const AGGREGATE_FIELDS = [
+  "tokens",
+  ...TOKEN_FIELDS,
+  "messages",
+  "inputIncludingCacheRead",
+] as const;
 
 export interface ParserAggregateHighWater {
   tokens: number;
@@ -63,12 +69,16 @@ export interface ParserAggregateHighWater {
 }
 
 export interface ParserClientHighWaterState {
+  /** Server-side allocation-state schema; absent identifies the legacy envelope. */
+  stateVersion?: number;
   version: number;
   /** False when identity was accepted from a partial scan but no baseline exists. */
   baselineEstablished?: boolean;
   aggregate: ParserAggregateHighWater;
-  /** Cellwise maxima for attribution of bounded aggregate growth. */
+  /** Stored/credited cells available for attribution of bounded aggregate growth. */
   days: Record<string, ClientBreakdownData>;
+  /** Last complete parser snapshot, used only to locate the next positive delta. */
+  observedDays?: Record<string, ClientBreakdownData>;
 }
 
 export type DeviceParserStates = Record<string, ParserClientHighWaterState>;
@@ -103,16 +113,26 @@ export interface ParserHighWaterPlan {
   nextState?: ParserClientHighWaterState;
 }
 
-function copyDictionary<T>(source?: Record<string, T>): Record<string, T> {
-  return Object.assign(createSafeRecord<T>(), source);
-}
-
 function copyModels(
   source?: Record<string, ModelBreakdownData>
 ): Record<string, ModelBreakdownData> {
   const result = createSafeRecord<ModelBreakdownData>();
   for (const [modelId, model] of Object.entries(source ?? {})) {
-    result[modelId] = { ...model };
+    const normalized = emptyModel();
+    for (const field of TOKEN_FIELDS) {
+      normalized[field] = positive(model[field] ?? 0);
+    }
+    normalized.tokens = TOKEN_FIELDS.reduce(
+      (sum, field) => sum + normalized[field],
+      0
+    );
+    normalized.cost = quantizeCost(model.cost ?? 0);
+    normalized.messages = positive(model.messages ?? 0);
+    normalized.inputIncludingCacheRead = positive(
+      model.inputIncludingCacheRead ??
+        normalized.input + normalized.cacheRead
+    );
+    result[modelId] = normalized;
   }
   return result;
 }
@@ -121,22 +141,45 @@ function modelsForHighWater(
   breakdown?: ClientBreakdownData
 ): Record<string, ModelBreakdownData> {
   const models = copyModels(breakdown?.models);
-  if (
-    breakdown?.modelId &&
-    Object.keys(models).length === 0
-  ) {
-    models[breakdown.modelId] = {
-      tokens: positive(breakdown.tokens || 0),
-      cost: positive(breakdown.cost || 0),
-      input: positive(breakdown.input || 0),
-      output: positive(breakdown.output || 0),
-      cacheRead: positive(breakdown.cacheRead || 0),
-      cacheWrite: positive(breakdown.cacheWrite || 0),
-      reasoning: positive(breakdown.reasoning || 0),
-      messages: positive(breakdown.messages || 0),
-      inputIncludingCacheRead:
-        positive(breakdown.input || 0) + positive(breakdown.cacheRead || 0),
-    };
+  if (!breakdown) return models;
+
+  // Legacy rows can carry a scalar total alongside a partial nested model
+  // breakdown. Preserve the unrepresented remainder as a real model cell;
+  // otherwise normalizing the credited ledger would silently shrink it and a
+  // later replay could re-credit tokens or messages that are already stored.
+  const represented = emptyModel();
+  for (const model of Object.values(models)) {
+    for (const field of TOKEN_FIELDS) represented[field] += model[field] || 0;
+    represented.cost += model.cost || 0;
+    represented.messages += model.messages || 0;
+  }
+  const remainder = emptyModel();
+  for (const field of TOKEN_FIELDS) {
+    remainder[field] = positive((breakdown[field] || 0) - represented[field]);
+  }
+  remainder.tokens = TOKEN_FIELDS.reduce(
+    (sum, field) => sum + remainder[field],
+    0
+  );
+  remainder.cost = quantizeCost(
+    positive((breakdown.cost || 0) - represented.cost)
+  );
+  remainder.messages = positive(
+    (breakdown.messages || 0) - represented.messages
+  );
+  if (remainder.tokens > 0 || remainder.cost > 0 || remainder.messages > 0) {
+    const remainderModel = breakdown.modelId || "unknown";
+    const prior = { ...(ownValue(models, remainderModel) ?? emptyModel()) };
+    const priorInclusiveInput = positive(
+      prior.inputIncludingCacheRead ?? prior.input + prior.cacheRead
+    );
+    for (const field of TOKEN_FIELDS) prior[field] += remainder[field];
+    prior.inputIncludingCacheRead =
+      priorInclusiveInput + remainder.input + remainder.cacheRead;
+    prior.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + prior[field], 0);
+    prior.cost = quantizeCost(prior.cost + remainder.cost);
+    prior.messages += remainder.messages;
+    models[remainderModel] = prior;
   }
   return models;
 }
@@ -255,77 +298,46 @@ function aggregateSnapshot(
   return aggregate;
 }
 
-function maxModel(
-  previous: ModelBreakdownData | undefined,
-  incoming: ModelBreakdownData
-): ModelBreakdownData {
-  const result = emptyModel();
-  let tokenHighWaterAdvanced = previous == null;
-  for (const field of TOKEN_FIELDS) {
-    const prior = previous?.[field] ?? 0;
-    const next = incoming[field] || 0;
-    result[field] = Math.max(prior, next);
-    tokenHighWaterAdvanced ||= next > prior;
+const PARSER_HIGH_WATER_STATE_VERSION = 2;
+
+function normalizeStateDays(
+  source: Record<string, ClientBreakdownData>
+): Record<string, ClientBreakdownData> {
+  const normalized = createSafeRecord<ClientBreakdownData>();
+  for (const [date, day] of Object.entries(source)) {
+    normalized[date] = breakdownFromModels(modelsForHighWater(day));
   }
-  const priorInclusiveInput = positive(
-    previous?.inputIncludingCacheRead ??
-      (previous?.input ?? 0) + (previous?.cacheRead ?? 0)
-  );
-  const incomingInclusiveInput = positive(
-    incoming.inputIncludingCacheRead ?? incoming.input + incoming.cacheRead
-  );
-  result.inputIncludingCacheRead = Math.max(
-    priorInclusiveInput,
-    incomingInclusiveInput
-  );
-  tokenHighWaterAdvanced ||= incomingInclusiveInput > priorInclusiveInput;
-  result.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + result[field], 0);
-  // Cost is contextual data for the token high-water snapshot, never its own
-  // monotonic signal: repricing alone must not authorize spend.
-  result.cost = quantizeCost(
-    tokenHighWaterAdvanced
-      ? Math.max(positive(previous?.cost ?? 0), positive(incoming.cost))
-      : previous?.cost ?? 0
-  );
-  result.messages = Math.max(
-    positive(previous?.messages ?? 0),
-    positive(incoming.messages)
-  );
-  return result;
+  return normalized;
 }
 
-function advanceDays(
+function applyCreditedIncrements(
   previous: Record<string, ClientBreakdownData>,
-  incoming: Record<string, ClientBreakdownData>
+  increments: Record<string, ClientBreakdownData>
 ): Record<string, ClientBreakdownData> {
-  const next = copyDictionary(previous);
-  for (const [date, day] of Object.entries(incoming)) {
-    const prior = ownValue(previous, date);
-    const models = modelsForHighWater(prior);
-    for (const [modelId, model] of Object.entries(day.models)) {
-      models[modelId] = maxModel(ownValue(models, modelId), model);
-    }
-    next[date] = breakdownFromModels(models);
+  const next = normalizeStateDays(previous);
+  for (const [date, increment] of Object.entries(increments)) {
+    next[date] = addClientBreakdownIncrement(
+      ownValue(next, date),
+      increment
+    );
   }
   return next;
 }
 
-function advanceAggregate(
-  previous: ParserAggregateHighWater,
-  incoming: ParserAggregateHighWater
-): ParserAggregateHighWater {
+function stateAfterCreditedIncrements(
+  version: number,
+  previousDays: Record<string, ClientBreakdownData>,
+  increments: Record<string, ClientBreakdownData>,
+  observedDays: Record<string, ClientBreakdownData>
+): ParserClientHighWaterState {
+  const days = applyCreditedIncrements(previousDays, increments);
   return {
-    tokens: Math.max(previous.tokens, incoming.tokens),
-    input: Math.max(previous.input, incoming.input),
-    output: Math.max(previous.output, incoming.output),
-    cacheRead: Math.max(previous.cacheRead, incoming.cacheRead),
-    cacheWrite: Math.max(previous.cacheWrite, incoming.cacheWrite),
-    reasoning: Math.max(previous.reasoning, incoming.reasoning),
-    messages: Math.max(previous.messages, incoming.messages),
-    inputIncludingCacheRead: Math.max(
-      previous.inputIncludingCacheRead,
-      incoming.inputIncludingCacheRead
-    ),
+    stateVersion: PARSER_HIGH_WATER_STATE_VERSION,
+    version,
+    baselineEstablished: true,
+    aggregate: aggregateSnapshot(days),
+    days,
+    observedDays: normalizeStateDays(observedDays),
   };
 }
 
@@ -339,8 +351,40 @@ function positive(value: number): number {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
 }
 
+function tokenCandidates(
+  previous: ModelBreakdownData | undefined,
+  incoming: ModelBreakdownData
+): Record<TokenField, number> {
+  const candidates = Object.fromEntries(
+    TOKEN_FIELDS.map((field) => [
+      field,
+      positive(incoming[field] - (previous?.[field] ?? 0)),
+    ])
+  ) as Record<TokenField, number>;
+  // Submitted `input` is already exclusive of cache reads. Reconstruct the
+  // producer's inclusive input counter so a cache-composition shift is not
+  // itself growth, while a genuinely fully-cached request can still advance.
+  const inclusiveInputCandidate = positive(
+    positive(
+      incoming.inputIncludingCacheRead ??
+        incoming.input + incoming.cacheRead
+    ) -
+      positive(
+        previous?.inputIncludingCacheRead ??
+          (previous?.input ?? 0) + (previous?.cacheRead ?? 0)
+      )
+  );
+  candidates.cacheRead = Math.min(
+    candidates.cacheRead,
+    inclusiveInputCandidate
+  );
+  candidates.input = inclusiveInputCandidate - candidates.cacheRead;
+  return candidates;
+}
+
 function allocateIncrements(
-  previousDays: Record<string, ClientBreakdownData>,
+  previousCreditedDays: Record<string, ClientBreakdownData>,
+  previousObservedDays: Record<string, ClientBreakdownData>,
   incomingDays: Record<string, ClientBreakdownData>,
   previousAggregate: ParserAggregateHighWater,
   incomingAggregate: ParserAggregateHighWater
@@ -349,33 +393,48 @@ function allocateIncrements(
   let messageBudget = positive(
     incomingAggregate.messages - previousAggregate.messages
   );
+  const previousObservedAggregate = aggregateSnapshot(previousObservedDays);
   const inclusiveInputBudget = positive(
     incomingAggregate.inputIncludingCacheRead -
-      previousAggregate.inputIncludingCacheRead
+      previousObservedAggregate.inputIncludingCacheRead
   );
-  let supportedCellCacheReadGrowth = 0;
-  for (const [date, incomingDay] of Object.entries(incomingDays)) {
-    const previousDay = ownValue(previousDays, date);
-    const previousModels = modelsForHighWater(previousDay);
-    for (const [modelId, model] of Object.entries(incomingDay.models)) {
-      const prior = ownValue(previousModels, modelId);
-      const inclusiveGrowth = positive(
-        positive(
-          model.inputIncludingCacheRead ?? model.input + model.cacheRead
-        ) -
-          positive(
-            prior?.inputIncludingCacheRead ??
-              (prior?.input ?? 0) + (prior?.cacheRead ?? 0)
-          )
-      );
-      supportedCellCacheReadGrowth += Math.min(
-        positive(model.cacheRead - (prior?.cacheRead ?? 0)),
-        inclusiveGrowth
-      );
-    }
-  }
+  const dates = Object.keys(incomingDays).sort((a, b) => b.localeCompare(a));
+  const cells = dates.flatMap((date) => {
+    const incoming = incomingDays[date];
+    const creditedModels = modelsForHighWater(
+      ownValue(previousCreditedDays, date)
+    );
+    const observedModels = modelsForHighWater(
+      ownValue(previousObservedDays, date)
+    );
+    return Object.keys(incoming.models)
+      .sort()
+      .map((modelId) => {
+        const model = incoming.models[modelId];
+        const credited = ownValue(creditedModels, modelId);
+        return {
+          date,
+          modelId,
+          model,
+          credited,
+          observed: ownValue(observedModels, modelId),
+          increment: emptyModel(),
+          tokenCapacity: positive(model.tokens - (credited?.tokens ?? 0)),
+          messageCapacity: positive(
+            model.messages - (credited?.messages ?? 0)
+          ),
+        };
+      });
+  });
+  const supportedCellCacheReadGrowth = cells.reduce(
+    (sum, cell) =>
+      sum + tokenCandidates(cell.observed, cell.model).cacheRead,
+    0
+  );
   const cacheReadBudget = Math.min(
-    positive(incomingAggregate.cacheRead - previousAggregate.cacheRead),
+    positive(
+      incomingAggregate.cacheRead - previousObservedAggregate.cacheRead
+    ),
     supportedCellCacheReadGrowth,
     inclusiveInputBudget
   );
@@ -384,94 +443,128 @@ function allocateIncrements(
     // high-water and at least one cell's observed inclusive growth support it.
     // Unsupported cache moves reserve nothing, so the remainder flows to input.
     input: inclusiveInputBudget - cacheReadBudget,
-    output: positive(incomingAggregate.output - previousAggregate.output),
+    output: positive(
+      incomingAggregate.output - previousObservedAggregate.output
+    ),
     cacheRead: cacheReadBudget,
-    cacheWrite: positive(incomingAggregate.cacheWrite - previousAggregate.cacheWrite),
-    reasoning: positive(incomingAggregate.reasoning - previousAggregate.reasoning),
+    cacheWrite: positive(
+      incomingAggregate.cacheWrite - previousObservedAggregate.cacheWrite
+    ),
+    reasoning: positive(
+      incomingAggregate.reasoning - previousObservedAggregate.reasoning
+    ),
   };
-  const increments = createSafeRecord<ClientBreakdownData>();
-  const dates = Object.keys(incomingDays).sort((a, b) => b.localeCompare(a));
-  for (const date of dates) {
-    const incrementModels = createSafeRecord<ModelBreakdownData>();
-    const incoming = incomingDays[date];
-    const previous = ownValue(previousDays, date);
-    const previousModels = modelsForHighWater(previous);
-    for (const modelId of Object.keys(incoming.models).sort()) {
-      const model = incoming.models[modelId];
-      const prior = ownValue(previousModels, modelId);
-      const increment = emptyModel();
-      const candidates = Object.fromEntries(
-        TOKEN_FIELDS.map((field) => [
-          field,
-          positive(model[field] - (prior?.[field] ?? 0)),
-        ])
-      ) as Record<TokenField, number>;
-      // Submitted `input` is already exclusive of cache reads. Reconstruct the
-      // producer's inclusive input counter before bounding cache growth, so a
-      // cache-only composition shift cannot mint tokens while a genuinely
-      // fully-cached request (exclusive input 0) can still advance.
-      const inclusiveInputCandidate = positive(
-        positive(
-          model.inputIncludingCacheRead ?? model.input + model.cacheRead
-        ) -
-          positive(
-            prior?.inputIncludingCacheRead ??
-              (prior?.input ?? 0) + (prior?.cacheRead ?? 0)
-          )
+
+  const allocateTokenPass = (
+    candidatesFor: (cell: (typeof cells)[number]) => Record<TokenField, number>,
+    respectBucketBudgets: boolean
+  ) => {
+    for (const cell of cells) {
+      const candidates = candidatesFor(cell);
+      let cellBudget = positive(
+        cell.tokenCapacity - cell.increment.tokens
       );
-      const cacheReadCandidate = Math.min(
-        candidates.cacheRead,
-        inclusiveInputCandidate
-      );
-      // Inclusive input is the conserved producer counter. Allocate its growth
-      // between cache and exclusive input from the current observed snapshot;
-      // comparing exclusive input against its independent maximum would lose
-      // real growth after a cache-composition shift.
-      candidates.cacheRead = cacheReadCandidate;
-      candidates.input = inclusiveInputCandidate - cacheReadCandidate;
-      let candidateTokens = 0;
       for (const field of TOKEN_FIELDS) {
-        const candidate = candidates[field];
-        candidateTokens += candidate;
-        const accepted = Math.min(candidate, bucketBudgets[field], tokenBudget);
-        increment[field] = accepted;
-        bucketBudgets[field] -= accepted;
+        const accepted = Math.min(
+          candidates[field],
+          tokenBudget,
+          cellBudget,
+          respectBucketBudgets ? bucketBudgets[field] : Number.POSITIVE_INFINITY
+        );
+        cell.increment[field] += accepted;
+        cell.increment.tokens += accepted;
         tokenBudget -= accepted;
-      }
-      increment.tokens = TOKEN_FIELDS.reduce(
-        (sum, field) => sum + increment[field],
-        0
-      );
-
-      // Metadata is cumulative in a date/model cell, so only its marginal
-      // growth can accompany new usage. If moves make cell growth exceed the
-      // device-wide token budget, the deterministic date/model ordering above
-      // receives the same fraction of marginal cost; the rest is deliberately
-      // not credited because no safe cell attribution exists. Repricing alone
-      // still cannot authorize spend.
-      if (increment.tokens > 0) {
-        const acceptedFraction =
-          candidateTokens > 0 ? increment.tokens / candidateTokens : 0;
-        const marginalCost = positive(model.cost - (prior?.cost ?? 0));
-        increment.cost = quantizeCost(marginalCost * acceptedFraction);
-      }
-
-      // Counts have their own device/client lifetime high-water. That lets a
-      // one-token new session add one whole message without using a lossy
-      // token fraction, while pure date/model moves have zero count budget.
-      const candidateMessages = positive(
-        model.messages - (prior?.messages ?? 0)
-      );
-      increment.messages = Math.min(candidateMessages, messageBudget);
-      messageBudget -= increment.messages;
-
-      if (increment.tokens > 0 || increment.messages > 0) {
-        incrementModels[modelId] = increment;
+        cellBudget -= accepted;
+        if (respectBucketBudgets) bucketBudgets[field] -= accepted;
       }
     }
-    if (Object.keys(incrementModels).length > 0) {
-      increments[date] = breakdownFromModels(incrementModels);
+  };
+
+  // Observed deltas are the most faithful attribution signal. Run this as a
+  // global pass so a newer cell's residual capacity cannot pre-empt genuine
+  // growth observed in another date/model cell.
+  allocateTokenPass(
+    (cell) => tokenCandidates(cell.observed, cell.model),
+    true
+  );
+
+  const currentDeficits = (cell: (typeof cells)[number]) =>
+    Object.fromEntries(
+      TOKEN_FIELDS.map((field) => [
+        field,
+        positive(
+          cell.model[field] -
+            (cell.credited?.[field] ?? 0) -
+            cell.increment[field]
+        ),
+      ])
+    ) as Record<TokenField, number>;
+
+  // First keep residual attribution inside the aggregate bucket deltas. Then,
+  // if independent bucket moves made those caps jointly infeasible, spend the
+  // remaining provable lifetime growth on current per-field deficits. The
+  // second pass still cannot mint usage: total and per-cell capacity remain
+  // hard caps, and only successfully allocated increments advance the ledger.
+  allocateTokenPass(currentDeficits, true);
+  allocateTokenPass(currentDeficits, false);
+
+  const allocateMessagePass = (
+    candidateFor: (cell: (typeof cells)[number]) => number
+  ) => {
+    for (const cell of cells) {
+      const cellBudget = positive(
+        cell.messageCapacity - cell.increment.messages
+      );
+      const accepted = Math.min(
+        positive(candidateFor(cell)),
+        messageBudget,
+        cellBudget
+      );
+      cell.increment.messages += accepted;
+      messageBudget -= accepted;
     }
+  };
+
+  // Message counts use the same observed-first rule, with their own lifetime
+  // budget so a tiny-token new request can still add one complete message.
+  allocateMessagePass(
+    (cell) => cell.model.messages - (cell.observed?.messages ?? 0)
+  );
+  allocateMessagePass(
+    (cell) =>
+      cell.model.messages -
+      (cell.credited?.messages ?? 0) -
+      cell.increment.messages
+  );
+
+  const modelsByDate = createSafeRecord<
+    Record<string, ModelBreakdownData>
+  >();
+  for (const cell of cells) {
+    if (cell.increment.tokens > 0) {
+      const acceptedFraction =
+        cell.tokenCapacity > 0
+          ? cell.increment.tokens / cell.tokenCapacity
+          : 0;
+      const marginalCost = positive(
+        cell.model.cost - (cell.credited?.cost ?? 0)
+      );
+      cell.increment.cost = quantizeCost(
+        marginalCost * acceptedFraction
+      );
+    }
+    if (cell.increment.tokens > 0 || cell.increment.messages > 0) {
+      const models =
+        ownValue(modelsByDate, cell.date) ??
+        createSafeRecord<ModelBreakdownData>();
+      models[cell.modelId] = cell.increment;
+      modelsByDate[cell.date] = models;
+    }
+  }
+
+  const increments = createSafeRecord<ClientBreakdownData>();
+  for (const [date, models] of Object.entries(modelsByDate)) {
+    increments[date] = breakdownFromModels(models);
   }
   return increments;
 }
@@ -480,23 +573,35 @@ function validState(
   state: ParserClientHighWaterState | undefined,
   version: number
 ): state is ParserClientHighWaterState {
-  return Boolean(
-    state &&
-      state.version === version &&
-      state.aggregate &&
-      state.days &&
-      Number.isFinite(state.aggregate.tokens) &&
-      state.aggregate.tokens >= 0 &&
-      TOKEN_FIELDS.every(
-        (field) =>
-          Number.isFinite(state.aggregate[field]) &&
-          state.aggregate[field] >= 0
-      ) &&
-      Number.isFinite(state.aggregate.messages) &&
-      state.aggregate.messages >= 0 &&
-      Number.isFinite(state.aggregate.inputIncludingCacheRead) &&
-      state.aggregate.inputIncludingCacheRead >= 0
-  );
+  if (
+    state == null ||
+    state.version !== version ||
+    (state.stateVersion != null &&
+      state.stateVersion !== PARSER_HIGH_WATER_STATE_VERSION) ||
+    state.aggregate == null ||
+    state.days == null ||
+    (state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION &&
+      state.observedDays == null) ||
+    !AGGREGATE_FIELDS.every(
+      (field) =>
+        Number.isFinite(state.aggregate[field]) &&
+        state.aggregate[field] >= 0
+    )
+  ) {
+    return false;
+  }
+
+  // Allocation state v2 is an accounting ledger: its aggregate must describe
+  // exactly the credited cells. A mismatch would recreate the lost-growth bug
+  // by authorizing from one representation and persisting another, so freeze
+  // instead of trying to repair an ambiguous v2 state.
+  if (state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION) {
+    const creditedAggregate = aggregateSnapshot(state.days);
+    return AGGREGATE_FIELDS.every(
+      (field) => creditedAggregate[field] === state.aggregate[field]
+    );
+  }
+  return true;
 }
 
 /**
@@ -506,8 +611,11 @@ function validState(
  * preserved; only positive lifetime growth beyond their aggregate may be added
  * at transition. Later full snapshots may add only growth bounded BOTH by
  * positive per-cell deltas and by device/client-wide cumulative high-water
- * growth. Date/model reshuffles and deleted local history therefore add
- * nothing and can never erase or duplicate stored rows.
+ * growth. The latest observed parser layout locates real growth; when its cell
+ * is already covered by a preserved legacy row, a deterministic current cell
+ * with uncredited capacity receives the bounded remainder. Only increments
+ * actually written advance the credited ledger, so growth cannot be lost.
+ * Date/model reshuffles and deleted local history never erase stored rows.
  */
 export function planParserHighWaterSubmission(args: {
   client: string;
@@ -540,18 +648,24 @@ export function planParserHighWaterSubmission(args: {
       mode: "freeze",
       increments: {},
       nextState: {
+        stateVersion: PARSER_HIGH_WATER_STATE_VERSION,
         version: supportedVersion,
         baselineEstablished: false,
         aggregate: emptyAggregate(),
         days: createSafeRecord<ClientBreakdownData>(),
+        observedDays: createSafeRecord<ClientBreakdownData>(),
       },
     };
   }
 
   const incomingAggregate = aggregateSnapshot(args.incomingDays);
+  if (args.state && !validState(args.state, supportedVersion)) {
+    return { mode: "freeze", increments: {} };
+  }
   if (args.state == null || args.state.baselineEstablished === false) {
     const legacyAggregate = aggregateSnapshot(args.existingLegacyDays);
-    const hasLegacy = legacyAggregate.tokens > 0;
+    const hasLegacy =
+      legacyAggregate.tokens > 0 || legacyAggregate.messages > 0;
     // At transition, preserving all legacy rows and crediting at most positive
     // lifetime aggregate growth is non-destructive. With deleted old usage D
     // and genuinely new usage N, incoming - legacy = N - D <= N; the existing
@@ -560,41 +674,66 @@ export function planParserHighWaterSubmission(args: {
     const increments = hasLegacy
       ? allocateIncrements(
           args.existingLegacyDays,
+          args.existingLegacyDays,
           args.incomingDays,
           legacyAggregate,
           incomingAggregate
         )
       : createSafeRecord<ClientBreakdownData>();
-    const nextState: ParserClientHighWaterState = {
-      version: supportedVersion,
-      baselineEstablished: true,
-      aggregate: advanceAggregate(legacyAggregate, incomingAggregate),
-      days: advanceDays(args.existingLegacyDays, args.incomingDays),
-    };
+    const nextState = hasLegacy
+      ? stateAfterCreditedIncrements(
+          supportedVersion,
+          args.existingLegacyDays,
+          increments,
+          args.incomingDays
+        )
+      : {
+          stateVersion: PARSER_HIGH_WATER_STATE_VERSION,
+          version: supportedVersion,
+          baselineEstablished: true,
+          aggregate: incomingAggregate,
+          days: normalizeStateDays(args.incomingDays),
+          observedDays: normalizeStateDays(args.incomingDays),
+        };
     return {
       mode: hasLegacy ? "baseline-legacy" : "baseline-new",
       increments,
       nextState,
     };
   }
-  if (!validState(args.state, supportedVersion)) {
-    return { mode: "freeze", increments: {} };
-  }
+  // State written before allocation schema v2 stored every observed cell
+  // maximum and advanced its aggregate even when no cell could accept that
+  // growth. Rebuild that one-time migration baseline from the rows that were
+  // actually credited, otherwise already-suppressed usage remains lost.
+  const previousCreditedDays =
+    args.state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION
+      ? args.state.days
+      : args.existingLegacyDays;
+  const previousAggregate =
+    args.state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION
+      ? args.state.aggregate
+      : aggregateSnapshot(previousCreditedDays);
+  const previousObservedDays =
+    args.state.stateVersion === PARSER_HIGH_WATER_STATE_VERSION
+      ? args.state.observedDays!
+      : previousCreditedDays;
+  const increments = allocateIncrements(
+    previousCreditedDays,
+    previousObservedDays,
+    args.incomingDays,
+    previousAggregate,
+    incomingAggregate
+  );
 
   return {
     mode: "incremental",
-    increments: allocateIncrements(
-      args.state.days,
-      args.incomingDays,
-      args.state.aggregate,
-      incomingAggregate
+    increments,
+    nextState: stateAfterCreditedIncrements(
+      supportedVersion,
+      previousCreditedDays,
+      increments,
+      args.incomingDays
     ),
-    nextState: {
-      version: supportedVersion,
-      baselineEstablished: true,
-      aggregate: advanceAggregate(args.state.aggregate, incomingAggregate),
-      days: advanceDays(args.state.days, args.incomingDays),
-    },
   };
 }
 
@@ -603,32 +742,15 @@ export function addClientBreakdownIncrement(
   increment: ClientBreakdownData
 ): ClientBreakdownData {
   if (!existing) return increment;
-  const models = copyModels(existing.models);
-  const represented = breakdownFromModels(models);
-  const remainder = emptyModel();
-  for (const field of TOKEN_FIELDS) {
-    remainder[field] = positive((existing[field] || 0) - represented[field]);
-  }
-  remainder.tokens = TOKEN_FIELDS.reduce(
-    (sum, field) => sum + remainder[field],
-    0
-  );
-  remainder.cost = quantizeCost(
-    positive((existing.cost || 0) - represented.cost)
-  );
-  remainder.messages = positive((existing.messages || 0) - represented.messages);
-  if (remainder.tokens > 0 || remainder.cost > 0 || remainder.messages > 0) {
-    const remainderModel = existing.modelId || "unknown";
-    const prior = { ...(ownValue(models, remainderModel) ?? emptyModel()) };
-    for (const field of TOKEN_FIELDS) prior[field] += remainder[field];
-    prior.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + prior[field], 0);
-    prior.cost = quantizeCost(prior.cost + remainder.cost);
-    prior.messages += remainder.messages;
-    models[remainderModel] = prior;
-  }
+  const models = modelsForHighWater(existing);
   for (const [modelId, delta] of Object.entries(increment.models)) {
     const model = { ...(ownValue(models, modelId) ?? emptyModel()) };
+    const priorInclusiveInput = positive(
+      model.inputIncludingCacheRead ?? model.input + model.cacheRead
+    );
     for (const field of TOKEN_FIELDS) model[field] = (model[field] || 0) + delta[field];
+    model.inputIncludingCacheRead =
+      priorInclusiveInput + delta.input + delta.cacheRead;
     model.tokens = TOKEN_FIELDS.reduce((sum, field) => sum + model[field], 0);
     model.cost = quantizeCost((model.cost || 0) + delta.cost);
     model.messages = (model.messages || 0) + delta.messages;
