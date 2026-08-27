@@ -600,12 +600,15 @@ impl PricingLookup {
         // so for pricing lookup we resolve to the base model regardless of tier.
         // Mirrors the dash-suffix path (e.g. `-xhigh`), which is handled by
         // `try_strip_unknown_suffix` below.
-        let normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
+        let tier_normalized_owned = strip_parenthesized_reasoning_tier(&lower).map(str::to_owned);
 
         // A tier suffix does not turn a router into a model: `auto(high)`
         // normalizes to `auto` below and would otherwise reach the model-part
         // fallback and elect an unrelated vendor, exactly as the bare form did.
-        if normalized_owned.as_deref().is_some_and(is_routing_label) {
+        if tier_normalized_owned
+            .as_deref()
+            .is_some_and(is_routing_label)
+        {
             return None;
         }
 
@@ -615,7 +618,7 @@ impl PricingLookup {
         // `-` and could match a shorter, unrelated model id by peeling the
         // parenthesized fragment off (e.g. `gpt-5.2-codex(invalid)` would
         // strip `-codex(invalid)` and resolve to `gpt-5.2`).
-        if normalized_owned.is_none()
+        if tier_normalized_owned.is_none()
             && lower
                 .strip_suffix(')')
                 .and_then(|inner| inner.rsplit_once('('))
@@ -624,7 +627,12 @@ impl PricingLookup {
             return None;
         }
 
-        let lower_ref: &str = normalized_owned.as_deref().unwrap_or(&lower);
+        let tier_normalized_ref = tier_normalized_owned.as_deref().unwrap_or(&lower);
+        let fast_normalized_owned = normalize_openai_fast_mode(tier_normalized_ref, provider_id);
+        let lower_ref = fast_normalized_owned
+            .as_deref()
+            .unwrap_or(tier_normalized_ref);
+        let normalized = tier_normalized_owned.is_some() || fast_normalized_owned.is_some();
 
         if alias_applied && force_source.is_none() && aliases::uses_cursor_pricing(model_id) {
             if let Some(result) = self.exact_match_cursor(lower_ref) {
@@ -659,7 +667,7 @@ impl PricingLookup {
             if alias_applied {
                 result = result.with_alias();
             }
-            if normalized_owned.is_some() {
+            if normalized {
                 result = result.with_normalization();
             }
             if matches_inferred_model_provider(lower_ref, provider_id)
@@ -676,7 +684,7 @@ impl PricingLookup {
         };
 
         // 1. Try direct lookup
-        if let Some(result) = do_lookup(lower_ref).map(&annotate_direct) {
+        if let Some(result) = do_lookup(lower_ref).map(annotate_direct) {
             if unsafe_claude_resolution(&result) {
                 return None;
             }
@@ -689,7 +697,7 @@ impl PricingLookup {
 
         let guarded_lookup = |candidate: &str| {
             do_lookup(candidate)
-                .map(&annotate_direct)
+                .map(annotate_direct)
                 .map(LookupResult::with_stripping)
                 .filter(|result| !unsafe_claude_resolution(result))
         };
@@ -2780,14 +2788,6 @@ fn select_best_match(
         return None;
     }
 
-    let candidate_count = all_usable_matches.len();
-    let first_pricing = dataset.get(all_usable_matches[0].as_str())?;
-    let price_consensus = all_usable_matches.iter().skip(1).all(|key| {
-        dataset
-            .get(key.as_str())
-            .is_some_and(|pricing| pricing_rows_equal(first_pricing, pricing))
-    });
-
     let hint_tags: Vec<String> = provider_id
         .map(provider_identity::provider_tags)
         .unwrap_or_default();
@@ -2897,6 +2897,40 @@ fn select_best_match(
                 .or_else(|| candidates.first())
         };
         key.and_then(|k| {
+            // A provider's own top-level row is authoritative for that
+            // endpoint. Nested occurrences of the same provider name are
+            // gateway/reseller offers, not peer answers to the hinted billing
+            // identity. Keep the broader candidate set for every weaker
+            // selection so reseller-only and alias-only ambiguity remains
+            // submission-unsafe. Zero-priced subscription namespaces are also
+            // kept in evidence: their canonical provider alias is what makes
+            // the paid row reachable, but it does not prove that usage was
+            // billed outside the subscription.
+            let evidence_matches: Vec<&String> = if provider_id
+                .is_some_and(|hint| key_root_matches_provider_hint(k, hint))
+                && !all_usable_matches
+                    .iter()
+                    .any(|candidate| key_root_is_zero_priced_subscription_namespace(candidate))
+            {
+                all_usable_matches
+                    .iter()
+                    .copied()
+                    .filter(|candidate| {
+                        provider_id
+                            .is_some_and(|hint| key_root_matches_provider_hint(candidate, hint))
+                    })
+                    .collect()
+            } else {
+                all_usable_matches.clone()
+            };
+            let candidate_count = evidence_matches.len();
+            let first_pricing = dataset.get(evidence_matches.first()?.as_str())?;
+            let price_consensus = evidence_matches.iter().skip(1).all(|candidate| {
+                dataset
+                    .get(candidate.as_str())
+                    .is_some_and(|pricing| pricing_rows_equal(first_pricing, pricing))
+            });
+
             dataset.get(k.as_str()).map(|pricing| LookupResult {
                 pricing: pricing.clone(),
                 source: source.into(),
@@ -2995,6 +3029,39 @@ fn normalize_provider_hint(provider_id: Option<&str>) -> Option<&str> {
     provider_id
         .map(str::trim)
         .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("unknown"))
+}
+
+/// Strip OpenAI's request-speed mode from the model identity.
+///
+/// Codex records `-fast` on GPT ids when the request used OpenAI's fast mode,
+/// but the mode does not identify a separately priced model. Catalogs can
+/// still contain reseller rows whose literal id ends in `-fast`; applying this
+/// normalization only under an OpenAI provider hint prevents those rows from
+/// displacing OpenAI's base tariff while preserving literal lookups for every
+/// other provider.
+fn normalize_openai_fast_mode(model_id: &str, provider_id: Option<&str>) -> Option<String> {
+    if provider_id
+        .and_then(provider_identity::canonical_provider)
+        .as_deref()
+        != Some("openai")
+    {
+        return None;
+    }
+
+    let (prefix, terminal) = model_id
+        .rsplit_once('/')
+        .map_or((None, model_id), |(prefix, terminal)| {
+            (Some(prefix), terminal)
+        });
+    let base = terminal.strip_suffix("-fast")?;
+    if !base.starts_with("gpt-") || base.len() == "gpt-".len() {
+        return None;
+    }
+
+    Some(match prefix {
+        Some(prefix) => format!("{prefix}/{base}"),
+        None => base.to_string(),
+    })
 }
 
 fn matches_inferred_model_provider(model_id: &str, provider_id: Option<&str>) -> bool {
@@ -5649,6 +5716,144 @@ mod tests {
         let unhinted = lookup.lookup("claude-opus-4-6-fast").unwrap();
         assert_eq!(unhinted.matched_key, "anthropic/claude-opus-4.6-fast");
         assert_eq!(unhinted.pricing.input_cost_per_token, Some(30e-6));
+    }
+
+    /// Regression (#1211): a provider hint can match both the provider's own
+    /// row and gateway rows that merely contain the provider in a nested path.
+    /// Those gateways publish their own markups; they are not conflicting
+    /// answers for the provider's first-party endpoint.
+    #[test]
+    fn provider_root_price_is_not_tainted_by_nested_reseller_rows() {
+        let models_dev = HashMap::from([
+            (
+                "anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(5e-6),
+                    output_cost_per_token: Some(25e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-a/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(7e-6),
+                    output_cost_per_token: Some(35e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-b/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8e-6),
+                    output_cost_per_token: Some(40e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("claude-opus-4-8", Some("anthropic"))
+            .expect("the first-party Anthropic row should resolve");
+
+        assert_eq!(result.matched_key, "anthropic/claude-opus-4-8");
+        assert_eq!(result.evidence.kind, ResolutionKind::ProviderScoped);
+        assert_eq!(result.evidence.candidate_count, 1);
+        assert!(result.evidence.price_consensus);
+        assert!(result.evidence.is_submission_safe());
+    }
+
+    /// When no first-party root row exists, a provider name embedded in
+    /// multiple reseller paths still cannot establish which tariff applied.
+    #[test]
+    fn nested_reseller_disagreement_remains_submission_unsafe() {
+        let models_dev = HashMap::from([
+            (
+                "gateway-a/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(7e-6),
+                    output_cost_per_token: Some(35e-6),
+                    ..Default::default()
+                },
+            ),
+            (
+                "gateway-b/anthropic/claude-opus-4-8".to_string(),
+                ModelPricing {
+                    input_cost_per_token: Some(8e-6),
+                    output_cost_per_token: Some(40e-6),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let lookup = PricingLookup::new_with_models_dev(
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        let result = lookup
+            .lookup_with_provider("claude-opus-4-8", Some("anthropic"))
+            .expect("reporting should retain the best available estimate");
+
+        assert_eq!(result.evidence.kind, ResolutionKind::ModelPart);
+        assert_eq!(result.evidence.candidate_count, 2);
+        assert!(!result.evidence.price_consensus);
+        assert!(!result.evidence.is_submission_safe());
+    }
+
+    /// Regression (#1211): Codex's OpenAI `-fast` suffix describes request
+    /// service mode, not a separate model. An OpenAI hint must therefore use
+    /// the base model tariff instead of a reseller's literal `-fast` row.
+    #[test]
+    fn openai_fast_mode_normalizes_to_the_base_model() {
+        let litellm = HashMap::from([(
+            "openai/gpt-5.5".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(5e-6),
+                output_cost_per_token: Some(30e-6),
+                ..Default::default()
+            },
+        )]);
+        let models_dev = HashMap::from([(
+            "vercel/openai/gpt-5.5-fast".to_string(),
+            ModelPricing {
+                input_cost_per_token: Some(9e-6),
+                output_cost_per_token: Some(54e-6),
+                ..Default::default()
+            },
+        )]);
+        let lookup = PricingLookup::new_with_models_dev(
+            litellm,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            models_dev,
+        );
+
+        for model_id in ["gpt-5.5-fast", "openai/gpt-5.5-fast"] {
+            let result = lookup
+                .lookup_with_provider(model_id, Some("openai"))
+                .expect("OpenAI fast mode should resolve through the base id");
+            assert_eq!(result.matched_key, "openai/gpt-5.5");
+            assert_eq!(result.pricing.input_cost_per_token, Some(5e-6));
+            assert!(result.evidence.normalized);
+            assert!(result.evidence.is_submission_safe());
+        }
+
+        let reseller = lookup
+            .lookup_with_provider("gpt-5.5-fast", Some("vercel"))
+            .expect("non-OpenAI providers keep literal model identities");
+        assert_eq!(reseller.matched_key, "vercel/openai/gpt-5.5-fast");
+        assert_eq!(reseller.pricing.input_cost_per_token, Some(9e-6));
+        assert!(!reseller.evidence.normalized);
     }
 
     /// Regression (#1004 follow-up): a reseller provider hint must select the

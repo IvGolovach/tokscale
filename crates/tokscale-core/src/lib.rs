@@ -5463,10 +5463,11 @@ mod tests {
     use super::{
         aggregate_hourly_usage_entries, aggregate_model_usage_entries,
         aggregate_monthly_usage_v2_entries, apply_pricing_if_available, build_graph_from_messages,
-        dedupe_latest_trae_messages, filter_messages_for_report,
-        generate_graph_with_loaded_pricing, get_home_dir_string, is_generic_routing_label,
-        merge_claude_cross_file_duplicate, message_cache, normalize_model_for_grouping,
-        opencode_json_superseded_by_sqlite, parse_all_messages_with_pricing_with_cache_policy,
+        dedupe_latest_trae_messages, exclude_unpriced_submission_messages,
+        filter_messages_for_report, generate_graph_with_loaded_pricing, get_home_dir_string,
+        is_generic_routing_label, merge_claude_cross_file_duplicate, message_cache,
+        normalize_model_for_grouping, opencode_json_superseded_by_sqlite,
+        parse_all_messages_with_pricing_with_cache_policy,
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
@@ -11595,6 +11596,85 @@ mod tests {
             graph.unpriced_submission_exclusions[0].reason,
             AMBIGUOUS_MODEL_PRICING_REASON
         );
+    }
+
+    /// Regression (#1211): the reporting lookup and the stricter submission
+    /// filter must agree when a first-party provider row competes with nested
+    /// reseller prices, and when OpenAI fast mode decorates a base GPT id.
+    #[test]
+    fn submission_keeps_first_party_prices_and_openai_fast_mode() {
+        let pricing = pricing::PricingService::new_with_custom_and_models_dev(
+            pricing::custom::CustomPricing::default(),
+            HashMap::from([(
+                "openai/gpt-5.5".to_string(),
+                pricing::ModelPricing {
+                    input_cost_per_token: Some(5e-6),
+                    output_cost_per_token: Some(30e-6),
+                    ..Default::default()
+                },
+            )]),
+            HashMap::new(),
+            HashMap::from([
+                (
+                    "anthropic/claude-opus-4-8".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(5e-6),
+                        output_cost_per_token: Some(25e-6),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "gateway/anthropic/claude-opus-4-8".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(8e-6),
+                        output_cost_per_token: Some(40e-6),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "vercel/openai/gpt-5.5-fast".to_string(),
+                    pricing::ModelPricing {
+                        input_cost_per_token: Some(9e-6),
+                        output_cost_per_token: Some(54e-6),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        );
+        let messages = vec![
+            UnifiedMessage::new(
+                "synthetic",
+                "claude-opus-4-8",
+                "anthropic",
+                "first-party-provider-row",
+                1_736_510_400_000,
+                TokenBreakdown {
+                    input: 100,
+                    output: 50,
+                    ..Default::default()
+                },
+                0.0,
+            ),
+            UnifiedMessage::new(
+                "synthetic",
+                "gpt-5.5-fast",
+                "openai",
+                "openai-fast-mode",
+                1_736_510_400_001,
+                TokenBreakdown {
+                    input: 100,
+                    output: 50,
+                    ..Default::default()
+                },
+                0.0,
+            ),
+        ];
+
+        let (submitted, exclusions) =
+            exclude_unpriced_submission_messages(messages, Some(&pricing));
+
+        assert_eq!(submitted.len(), 2);
+        assert!(exclusions.is_empty());
     }
 
     #[test]
