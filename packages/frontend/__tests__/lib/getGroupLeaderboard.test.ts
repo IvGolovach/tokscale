@@ -5,6 +5,7 @@ import { expectNoNarrowedCostCast } from "../support/costCastWidths";
 const mockState = vi.hoisted(() => {
   const periodRows: Array<Record<string, unknown>> = [];
   const allTimeRows: Array<Record<string, unknown>> = [];
+  const scopedAllTimeRows: Array<Record<string, unknown>> = [];
   const statsRows: Array<Record<string, unknown>> = [];
   const countRows: Array<Record<string, unknown>> = [];
   const fromCalls: unknown[] = [];
@@ -16,6 +17,7 @@ const mockState = vi.hoisted(() => {
       username: "users.username",
       displayName: "users.displayName",
       avatarUrl: "users.avatarUrl",
+      leaderboardHidden: "users.leaderboardHidden",
     },
     submissions: {
       id: "submissions.id",
@@ -28,6 +30,7 @@ const mockState = vi.hoisted(() => {
       date: "dailyBreakdown.date",
       tokens: "dailyBreakdown.tokens",
       cost: "dailyBreakdown.cost",
+      sourceBreakdown: "dailyBreakdown.sourceBreakdown",
     },
     groupMembers: {
       groupId: "groupMembers.groupId",
@@ -40,7 +43,6 @@ const mockState = vi.hoisted(() => {
   const desc = vi.fn(() => "desc");
   const asc = vi.fn(() => "asc");
   const and = vi.fn(() => "and");
-  const or = vi.fn((...conditions: unknown[]) => ({ kind: "or", conditions }));
   const gte = vi.fn(() => "gte");
   const lte = vi.fn(() => "lte");
   const sql = Object.assign(
@@ -50,6 +52,11 @@ const mockState = vi.hoisted(() => {
       as: () => ({}),
     })),
     {
+      join: vi.fn((items: unknown[], separator: unknown) => ({
+        kind: "join",
+        items,
+        separator,
+      })),
       raw: vi.fn(),
     }
   );
@@ -68,6 +75,7 @@ const mockState = vi.hoisted(() => {
   }
 
   const db = {
+    execute: vi.fn(() => Promise.resolve([...scopedAllTimeRows])),
     select: vi.fn(() => {
       let selectedTable: unknown;
       const builder = {
@@ -102,26 +110,27 @@ const mockState = vi.hoisted(() => {
     desc,
     asc,
     and,
-    or,
     gte,
     lte,
     sql,
     reset() {
       periodRows.length = 0;
       allTimeRows.length = 0;
+      scopedAllTimeRows.length = 0;
       statsRows.length = 0;
       countRows.length = 0;
       fromCalls.length = 0;
       orderByCalls.length = 0;
       db.select.mockClear();
+      db.execute.mockClear();
       eq.mockClear();
       desc.mockClear();
       asc.mockClear();
       and.mockClear();
-      or.mockClear();
       gte.mockClear();
       lte.mockClear();
       sql.mockClear();
+      sql.join.mockClear();
       sql.raw.mockClear();
     },
     setPeriodRows(rows: Array<Record<string, unknown>>) {
@@ -131,6 +140,10 @@ const mockState = vi.hoisted(() => {
     setAllTimeRows(rows: Array<Record<string, unknown>>) {
       allTimeRows.length = 0;
       allTimeRows.push(...rows);
+    },
+    setScopedAllTimeRows(rows: Array<Record<string, unknown>>) {
+      scopedAllTimeRows.length = 0;
+      scopedAllTimeRows.push(...rows);
     },
   };
 });
@@ -152,7 +165,6 @@ vi.mock("drizzle-orm", () => ({
   desc: mockState.desc,
   asc: mockState.asc,
   and: mockState.and,
-  or: mockState.or,
   gte: mockState.gte,
   lte: mockState.lte,
   sql: mockState.sql,
@@ -167,6 +179,35 @@ function selectedKeys(callIndex: number): string[] {
     [Record<string, unknown> | undefined]
   >;
   return Object.keys(calls[callIndex]?.[0] ?? {});
+}
+
+function renderSql(value: unknown): string {
+  if (Array.isArray(value)) {
+    return value.map(renderSql).join("");
+  }
+  if (!value || typeof value !== "object") {
+    return String(value ?? "");
+  }
+
+  const join = value as { kind?: string; items?: unknown[]; separator?: unknown };
+  if (join.kind === "join") {
+    return (join.items ?? []).map(renderSql).join(renderSql(join.separator));
+  }
+
+  const query = value as { strings?: string[]; values?: unknown[] };
+  if (!query.strings) {
+    return String(value);
+  }
+  return query.strings.reduce(
+    (text, part, index) =>
+      `${text}${part}${index < (query.values?.length ?? 0) ? renderSql(query.values?.[index]) : ""}`,
+    ""
+  );
+}
+
+function scopedAllTimeQuery(): string {
+  const calls = mockState.db.execute.mock.calls as unknown as Array<[unknown]>;
+  return renderSql(calls.at(-1)?.[0]);
 }
 
 beforeAll(async () => {
@@ -273,6 +314,33 @@ describe("group leaderboard data", () => {
     expect(leaderboard.pagination.totalUsers).toBe(1);
   });
 
+  it("finds a period member by display name without changing their rank", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-03-07T18:45:00Z"));
+    mockState.setPeriodRows([
+      { ...rows[0], displayName: "Platform Engineer" },
+      rows[1],
+    ]);
+
+    const leaderboard = await getGroupLeaderboardData(
+      "group-1",
+      "week",
+      1,
+      50,
+      "tokens",
+      "ENGINEER"
+    );
+
+    expect(leaderboard.users).toHaveLength(1);
+    expect(leaderboard.users[0]).toMatchObject({
+      rank: 2,
+      username: "alice",
+      displayName: "Platform Engineer",
+    });
+    expect(leaderboard.pagination.totalUsers).toBe(1);
+    expect(leaderboard.stats).toMatchObject({ totalTokens: 800, activeUsers: 2 });
+  });
+
   it("adds deterministic SQL tie-breakers before assigning all-time ranks", async () => {
     mockState.setAllTimeRows([
       {
@@ -313,6 +381,47 @@ describe("group leaderboard data", () => {
     ]);
   });
 
+  it("finds an all-time member by display name and handles null display names", async () => {
+    mockState.setAllTimeRows([
+      {
+        userId: "user-bob",
+        username: "bob",
+        displayName: null,
+        avatarUrl: null,
+        role: "member",
+        totalTokens: 600,
+        totalCost: "6.0000",
+      },
+      {
+        userId: "user-alice",
+        username: "alice",
+        displayName: "Platform Engineer",
+        avatarUrl: null,
+        role: "owner",
+        totalTokens: 200,
+        totalCost: "2.0000",
+      },
+    ]);
+
+    const leaderboard = await getGroupLeaderboardData(
+      "group-1",
+      "all",
+      1,
+      50,
+      "tokens",
+      "platform ENGINEER"
+    );
+
+    expect(leaderboard.users).toEqual([
+      expect.objectContaining({
+        rank: 2,
+        username: "alice",
+        displayName: "Platform Engineer",
+      }),
+    ]);
+    expect(leaderboard.stats).toMatchObject({ totalTokens: 800, activeUsers: 2 });
+  });
+
   // submissions.total_cost is decimal(18,4); narrowing the cast to DECIMAL(12,4)
   // (max 99,999,999.9999) overflows for any row >= $100,000,000 and crashes the
   // all-time group leaderboard exactly like the global leaderboard.
@@ -332,8 +441,77 @@ describe("group leaderboard data", () => {
     expectNoNarrowedCostCast(sqlTexts);
   });
 
-  it("ORs repeated directives in all-time group leaderboards", async () => {
-    mockState.setAllTimeRows([]);
+  it("scopes all-time directives through per-client and per-model daily usage", async () => {
+    mockState.setScopedAllTimeRows([
+      {
+        userId: "user-dana",
+        username: "dana",
+        displayName: "Dana",
+        avatarUrl: null,
+        role: "member",
+        totalTokens: "300",
+        totalCost: "3.0000",
+      },
+    ]);
+
+    const leaderboard = await getGroupLeaderboardData(
+      "group-1",
+      "all",
+      1,
+      50,
+      "tokens",
+      "client:codex model:gpt-5"
+    );
+    const query = scopedAllTimeQuery();
+
+    expect(mockState.db.execute).toHaveBeenCalledTimes(1);
+    expect(query).toContain("FROM group_members gm");
+    expect(query).toContain("INNER JOIN daily_breakdown d");
+    expect(query).toContain("jsonb_each(COALESCE(d.source_breakdown");
+    expect(query).toContain("jsonb_each(COALESCE(client.value->'models'");
+    expect(query).toContain("LOWER(client.key) LIKE %codex% ESCAPE '!'");
+    expect(query).toContain("LOWER(model.key) LIKE %gpt-5% ESCAPE '!'");
+    expect(query).toContain("(model.value->>'tokens')::numeric");
+    expect(query).toContain("(model.value->>'cost')::numeric");
+    expect(query).toContain("gm.group_id = group-1");
+    expect(query).toContain("u.leaderboard_hidden = false");
+    expect(query).not.toContain("sources_used");
+    expect(query).not.toContain("models_used");
+    expect(query).not.toContain("SUM(s.total_tokens)");
+    expect(leaderboard.users[0]).toMatchObject({
+      rank: 1,
+      username: "dana",
+      totalTokens: 300,
+      totalCost: 3,
+    });
+    expect(leaderboard.stats).toMatchObject({
+      totalTokens: 300,
+      totalCost: 3,
+      activeUsers: 1,
+    });
+  });
+
+  it("avoids model expansion for a client-only all-time directive", async () => {
+    mockState.setScopedAllTimeRows([]);
+
+    await getGroupLeaderboardData(
+      "group-1",
+      "all",
+      1,
+      50,
+      "cost",
+      "client:codex"
+    );
+    const query = scopedAllTimeQuery();
+
+    expect(query).toContain("(client.value->>'tokens')::numeric");
+    expect(query).toContain("(client.value->>'cost')::numeric");
+    expect(query).not.toContain("client.value->'models'");
+    expect(query).toContain('ORDER BY "totalCost" DESC, "totalTokens" DESC');
+  });
+
+  it("ORs repeated all-time directives and treats LIKE metacharacters literally", async () => {
+    mockState.setScopedAllTimeRows([]);
 
     await getGroupLeaderboardData(
       "group-1",
@@ -341,18 +519,23 @@ describe("group leaderboard data", () => {
       1,
       50,
       "tokens",
-      "client:opencode client:claude model:gpt-5"
+      "client:open_code client:claude model:gpt_5 model:opus"
     );
+    const query = scopedAllTimeQuery();
 
-    expect(mockState.or).toHaveBeenCalledTimes(2);
-    expect(mockState.or.mock.calls.map((call) => call.length)).toEqual([2, 1]);
-    // The rankable-user predicate is ANDed ahead of the directive groups: a
-    // site-wide hide applies to group boards too.
-    expect(mockState.and).toHaveBeenLastCalledWith(
-      expect.anything(),
-      mockState.or.mock.results[0]?.value,
-      mockState.or.mock.results[1]?.value
-    );
+    expect(query).toContain("LOWER(client.key) LIKE %open!_code% ESCAPE '!'");
+    expect(query).toContain(" OR LOWER(client.key) LIKE %claude% ESCAPE '!'");
+    expect(query).toContain("LOWER(model.key) LIKE %gpt!_5% ESCAPE '!'");
+    expect(query).toContain(" OR LOWER(model.key) LIKE %opus% ESCAPE '!'");
+  });
+
+  it("keeps the unfiltered all-time path on aggregate submissions", async () => {
+    mockState.setAllTimeRows([]);
+
+    await getGroupLeaderboardData("group-1", "all", 1, 50, "tokens");
+
+    expect(mockState.fromCalls).toContain(mockState.tables.submissions);
+    expect(mockState.db.execute).not.toHaveBeenCalled();
   });
 });
 
@@ -417,6 +600,29 @@ describe("group period leaderboard directive scoping", () => {
       totalCost: 3,
       activeUsers: 1,
     });
+  });
+
+  it("combines directive scoping with a case-insensitive display-name search", async () => {
+    useWeekOf([{ ...mixedClientDay, displayName: "Staff Engineer" }]);
+
+    const leaderboard = await getGroupLeaderboardData(
+      "group-1",
+      "week",
+      1,
+      50,
+      "tokens",
+      "client:codex ENGINEER"
+    );
+
+    expect(leaderboard.users).toEqual([
+      expect.objectContaining({
+        rank: 1,
+        username: "dana",
+        displayName: "Staff Engineer",
+        totalTokens: 300,
+        totalCost: 3,
+      }),
+    ]);
   });
 
   it("counts only the filtered model's share, not every client in the row", async () => {
