@@ -1715,20 +1715,20 @@ fn should_prefer_openai_tiered_litellm(
 // silently dropping it. cache_read is now required present+valid like
 // input/output, symmetric with them, for this preference decision only.
 fn has_complete_openai_272k_pricing(pricing: &ModelPricing) -> bool {
-    let valid_pair = |base: Option<f64>, above: Option<f64>| {
-        base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
-    };
-
-    valid_pair(
+    has_valid_rate_pair(
         pricing.input_cost_per_token,
         pricing.input_cost_per_token_above_272k_tokens,
-    ) && valid_pair(
+    ) && has_valid_rate_pair(
         pricing.output_cost_per_token,
         pricing.output_cost_per_token_above_272k_tokens,
-    ) && valid_pair(
+    ) && has_valid_rate_pair(
         pricing.cache_read_input_token_cost,
         pricing.cache_read_input_token_cost_above_272k_tokens,
     )
+}
+
+fn has_valid_rate_pair(base: Option<f64>, above: Option<f64>) -> bool {
+    base.is_some_and(is_valid_price_value) && above.is_some_and(is_valid_price_value)
 }
 
 fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
@@ -1749,6 +1749,99 @@ fn uses_openai_full_request_272k_pricing(result: &LookupResult, provider_id: Opt
     is_openai_full_request_272k_model(&key)
 }
 
+/// Whether this is a direct xAI Grok row with the complete 200k tariff that
+/// xAI documents as request-wide.
+///
+/// Keep this deliberately narrower than "anything with an above-200k field":
+/// Google and other vendors use different boundary operators and progressive
+/// tiers, OpenRouter is a separate billing endpoint, and LiteLLM also carries
+/// xAI rows with unverified 128k tiers. The direct xAI 200k rows publish base
+/// and high rates for input, output, and cache reads, matching the vendor's
+/// pricing table: https://docs.x.ai/developers/pricing.
+fn uses_xai_full_request_200k_pricing(result: &LookupResult, provider_id: Option<&str>) -> bool {
+    let provider_id = normalize_provider_hint(provider_id);
+    if result.source != "LiteLLM"
+        || provider_id.is_some_and(|provider| {
+            provider_identity::canonical_provider(provider).as_deref() != Some("xai")
+        })
+    {
+        return false;
+    }
+
+    let key = result.matched_key.trim().to_ascii_lowercase();
+    let mut parts = key.split('/');
+    let (Some(provider), Some(model), None) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    if provider_identity::canonical_provider(provider).as_deref() != Some("xai")
+        || !model.starts_with("grok-")
+    {
+        return false;
+    }
+
+    let pricing = &result.pricing;
+    let has_complete_200k_tier = has_valid_rate_pair(
+        pricing.input_cost_per_token,
+        pricing.input_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.output_cost_per_token,
+        pricing.output_cost_per_token_above_200k_tokens,
+    ) && has_valid_rate_pair(
+        pricing.cache_read_input_token_cost,
+        pricing.cache_read_input_token_cost_above_200k_tokens,
+    );
+    let has_other_context_tier = [
+        pricing.input_cost_per_token_above_128k_tokens,
+        pricing.input_cost_per_token_above_256k_tokens,
+        pricing.input_cost_per_token_above_272k_tokens,
+        pricing.output_cost_per_token_above_128k_tokens,
+        pricing.output_cost_per_token_above_256k_tokens,
+        pricing.output_cost_per_token_above_272k_tokens,
+        pricing.cache_read_input_token_cost_above_272k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+    let has_cache_write_pricing = [
+        pricing.cache_creation_input_token_cost,
+        pricing.cache_creation_input_token_cost_above_200k_tokens,
+    ]
+    .into_iter()
+    .any(|rate| rate.is_some_and(is_valid_price_value));
+
+    has_complete_200k_tier && !has_other_context_tier && !has_cache_write_pricing
+}
+
+fn compute_xai_full_request_200k_cost(result: &LookupResult, usage: &TokenBreakdown) -> f64 {
+    let mut pricing = result.pricing.clone();
+    let prompt_tokens = usage.input.max(0).saturating_add(usage.cache_read.max(0));
+
+    // xAI's boundary is inclusive: a prompt that reaches 200k selects the
+    // high rates for the entire request. Its public usage schema and current
+    // LiteLLM rows publish no separate cache-write bucket, so an unpriced
+    // cache-write value deliberately cannot flip every priced bucket.
+    if prompt_tokens >= TIERED_PRICING_THRESHOLD_200K_TOKENS as i64 {
+        pricing.input_cost_per_token = pricing.input_cost_per_token_above_200k_tokens;
+        pricing.output_cost_per_token = pricing.output_cost_per_token_above_200k_tokens;
+        pricing.cache_read_input_token_cost = pricing.cache_read_input_token_cost_above_200k_tokens;
+    }
+
+    // Tier selection has already happened from the request prompt. Clearing
+    // these prevents `compute_cost` from independently tiering a large input,
+    // output, or cache bucket and from charging only the marginal remainder.
+    pricing.input_cost_per_token_above_200k_tokens = None;
+    pricing.output_cost_per_token_above_200k_tokens = None;
+    pricing.cache_read_input_token_cost_above_200k_tokens = None;
+
+    compute_cost(
+        &pricing,
+        usage.input,
+        usage.output,
+        usage.cache_read,
+        usage.cache_write,
+        usage.reasoning,
+    )
+}
+
 fn compute_cost_for_lookup(
     result: &LookupResult,
     provider_id: Option<&str>,
@@ -1764,6 +1857,10 @@ fn compute_cost_for_lookup(
             usage.reasoning,
         )
     };
+    if uses_xai_full_request_200k_pricing(result, provider_id) {
+        return compute_xai_full_request_200k_cost(result, usage);
+    }
+
     let total_input = usage
         .input
         .max(0)
@@ -6441,6 +6538,151 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn xai_200k_result(key: &str, source: &str) -> LookupResult {
+        LookupResult {
+            matched_key: key.into(),
+            source: source.into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000002),
+                input_cost_per_token_above_200k_tokens: Some(0.000004),
+                output_cost_per_token: Some(0.000006),
+                output_cost_per_token_above_200k_tokens: Some(0.000012),
+                cache_read_input_token_cost: Some(0.0000005),
+                cache_read_input_token_cost_above_200k_tokens: Some(0.000001),
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn xai_200k_full_request_pricing_is_inclusive_and_prompt_wide() {
+        let result = xai_200k_result("xai/grok-4.6", "LiteLLM");
+
+        let at_boundary = TokenBreakdown {
+            input: 150_000,
+            output: 10_000,
+            cache_read: 50_000,
+            reasoning: 5_000,
+            ..Default::default()
+        };
+        let cost = compute_cost_for_lookup(&result, Some("x-ai"), &at_boundary);
+        let expected = 150_000.0 * 0.000004 + (10_000.0 + 5_000.0) * 0.000012 + 50_000.0 * 0.000001;
+        assert!((cost - expected).abs() < 1e-12);
+
+        let below_boundary = TokenBreakdown {
+            input: 149_999,
+            ..at_boundary.clone()
+        };
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &below_boundary);
+        let expected =
+            149_999.0 * 0.000002 + (10_000.0 + 5_000.0) * 0.000006 + 50_000.0 * 0.0000005;
+        assert!((cost - expected).abs() < 1e-12);
+
+        // Output volume never selects the tier by itself. With a short prompt,
+        // even an output bucket above 200k remains entirely at the base rate.
+        let output_only = TokenBreakdown {
+            input: 1,
+            output: 250_000,
+            ..Default::default()
+        };
+        let cost = compute_cost_for_lookup(&result, None, &output_only);
+        let expected = 0.000002 + 250_000.0 * 0.000006;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn xai_200k_prompt_threshold_does_not_use_unpriced_cache_write() {
+        let result = xai_200k_result("xai/grok-build-0.1", "LiteLLM");
+        let usage = TokenBreakdown {
+            input: 149_999,
+            output: 1,
+            cache_read: 50_000,
+            cache_write: 1,
+            ..Default::default()
+        };
+
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &usage);
+        let expected = 149_999.0 * 0.000002 + 0.000006 + 50_000.0 * 0.0000005;
+        assert!((cost - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn xai_200k_full_request_pricing_scope_is_first_party_and_complete() {
+        for (key, provider) in [
+            ("xai/grok-4.6", None),
+            ("xai/grok-4.6", Some("xai")),
+            ("x-ai/grok-4.6", Some("x-ai")),
+            ("xai/grok-4.6", Some("unknown")),
+        ] {
+            assert!(
+                uses_xai_full_request_200k_pricing(&xai_200k_result(key, "LiteLLM"), provider),
+                "expected direct xAI request-wide pricing for {key} with {provider:?}"
+            );
+        }
+
+        for (key, source, provider) in [
+            ("xai/grok-4.6", "OpenRouter", None),
+            ("xai/grok-4.6", "Models.dev", None),
+            ("xai/grok-4.6", "Cursor", Some("xai")),
+            ("azure_ai/xai/grok-4.6", "LiteLLM", Some("xai")),
+            ("xai/not-grok", "LiteLLM", Some("xai")),
+            ("xai/grok-4.6", "LiteLLM", Some("openrouter")),
+        ] {
+            assert!(
+                !uses_xai_full_request_200k_pricing(&xai_200k_result(key, source), provider),
+                "expected generic pricing for {source}:{key} with {provider:?}"
+            );
+        }
+
+        let mut incomplete = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        incomplete
+            .pricing
+            .cache_read_input_token_cost_above_200k_tokens = None;
+        assert!(!uses_xai_full_request_200k_pricing(
+            &incomplete,
+            Some("xai")
+        ));
+
+        let mut ambiguous = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        ambiguous.pricing.input_cost_per_token_above_128k_tokens = Some(0.000003);
+        assert!(!uses_xai_full_request_200k_pricing(&ambiguous, Some("xai")));
+
+        let mut unverified_cache_write = xai_200k_result("xai/grok-4.6", "LiteLLM");
+        unverified_cache_write
+            .pricing
+            .cache_creation_input_token_cost = Some(0.000002);
+        assert!(!uses_xai_full_request_200k_pricing(
+            &unverified_cache_write,
+            Some("xai")
+        ));
+    }
+
+    #[test]
+    fn xai_128k_only_row_keeps_generic_progressive_pricing() {
+        let result = LookupResult {
+            matched_key: "xai/grok-4-fast".into(),
+            source: "LiteLLM".into(),
+            evidence: ResolutionEvidence::deterministic(ResolutionKind::Exact),
+            pricing: ModelPricing {
+                input_cost_per_token: Some(0.000001),
+                input_cost_per_token_above_128k_tokens: Some(0.000002),
+                output_cost_per_token: Some(0.000003),
+                output_cost_per_token_above_128k_tokens: Some(0.000004),
+                ..Default::default()
+            },
+        };
+        let usage = TokenBreakdown {
+            input: 128_001,
+            output: 1,
+            ..Default::default()
+        };
+
+        let cost = compute_cost_for_lookup(&result, Some("xai"), &usage);
+        let expected = 128_000.0 * 0.000001 + 0.000002 + 0.000003;
+        assert!((cost - expected).abs() < 1e-12);
     }
 
     #[test]
