@@ -343,18 +343,33 @@ pub fn parse_dsh_file(path: &Path) -> Vec<UnifiedMessage> {
                 // keys differ, and the cross-file pass -- which only collapses
                 // identical keys -- bills the summarize call twice.
                 //
-                // `seq` is the other field a fork copies verbatim (see the
-                // boundary check above), so it stands in for the missing id and
-                // stays identical across the copy. It is unique within a file,
-                // and pairing it with the timestamp, routing and buckets already
-                // in the key means an accidental merge would need two unrelated
-                // sessions to agree on all of them at millisecond resolution.
+                // Summaries carry their own per-call UUID on
+                // `data.compactionId`, and a fork copies it verbatim. Prefer it
+                // before `seq`: sequence numbers restart in every transcript,
+                // so unrelated summaries can otherwise collapse when their
+                // timestamp, routing and usage happen to agree (#1187).
+                //
+                // Keep `seq` as the final cross-file fallback for older or
+                // damaged summaries without a compaction id. It remains better
+                // than the session id for the seedLength-less fork handled by
+                // #1173, because the fork copies the sequence number too.
                 let identity = value
                     .pointer("/data/message/id")
                     .and_then(Value::as_str)
                     .map(str::trim)
                     .filter(|id| !id.is_empty())
                     .map(|id| format!("msg:{id}"))
+                    .or_else(|| {
+                        if !is_summary {
+                            return None;
+                        }
+                        value
+                            .pointer("/data/compactionId")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                            .map(|id| format!("cmp:{id}"))
+                    })
                     .or_else(|| {
                         value
                             .get("seq")
@@ -654,9 +669,6 @@ mod tests {
         assert!(first.is_turn_start);
         assert_eq!(first.workspace_key.as_deref(), Some("E:/repo/proj"));
         assert_eq!(first.workspace_label.as_deref(), Some("proj"));
-        // This row carries no `message.id`, so the key falls back to `seq`
-        // rather than the session id: a fork copies `seq` verbatim, so the key
-        // survives the copy and the cross-file pass can collapse the two.
         // This row carries no `message.id`, so the key falls back to `seq`
         // rather than the session id: a fork copies `seq` verbatim, so the key
         // survives the copy and the cross-file pass can still collapse the two.
@@ -1002,7 +1014,7 @@ mod tests {
         // `dsh:summary:sid:parent...` and `dsh:summary:sid:child...`; the
         // cross-file pass only collapses identical keys, so the summarize call
         // was billed twice.
-        let row = r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#;
+        let row = r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"1ad33c8f-5255-4158-b607-7555f3c26cd0","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#;
         let parent = write_zstd_session(&[
             r#"{"type":"session","id":"96cf59c9-b347-48b9-b234-a5200913ad05","createdAt":1,"cwd":"/work"}"#,
             row,
@@ -1024,11 +1036,59 @@ mod tests {
         );
         assert_eq!(
             parent_messages[0].dedup_key.as_deref(),
-            Some("dsh:summary:seq:4:1786669450002:p:m:10:20:0:0:0")
+            Some(
+                "dsh:summary:cmp:1ad33c8f-5255-4158-b607-7555f3c26cd0:1786669450002:p:m:10:20:0:0:0"
+            )
         );
         assert_eq!(
             parent_messages[0].dedup_key, child_messages[0].dedup_key,
             "a copied summary must collapse across the fork, or its cost is counted twice"
+        );
+    }
+
+    #[test]
+    fn distinct_compaction_ids_keep_otherwise_identical_summaries() {
+        let first = write_zstd_session(&[
+            r#"{"type":"session","id":"session-a","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-a","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20,"cacheReadTokens":30}}}"#,
+        ]);
+        let second = write_zstd_session(&[
+            r#"{"type":"session","id":"session-b","createdAt":2,"cwd":"/work"}"#,
+            r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-b","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20,"cacheReadTokens":30}}}"#,
+        ]);
+
+        let first_messages = parse_dsh_file(first.path());
+        let second_messages = parse_dsh_file(second.path());
+
+        assert_eq!(first_messages.len(), 1);
+        assert_eq!(second_messages.len(), 1);
+        assert_eq!(
+            first_messages[0].dedup_key.as_deref(),
+            Some("dsh:summary:cmp:compact-a:1786669450002:p:m:10:20:30:0:0")
+        );
+        assert_eq!(
+            second_messages[0].dedup_key.as_deref(),
+            Some("dsh:summary:cmp:compact-b:1786669450002:p:m:10:20:30:0:0")
+        );
+        assert_ne!(
+            first_messages[0].dedup_key, second_messages[0].dedup_key,
+            "globally distinct summarize calls must both survive lane dedup"
+        );
+    }
+
+    #[test]
+    fn summary_without_compaction_id_keeps_seq_fallback() {
+        let file = write_zstd_session(&[
+            r#"{"type":"session","id":"legacy-summary","createdAt":1,"cwd":"/work"}"#,
+            r#"{"type":"compaction/summary","seq":9,"time":1786669450002,"data":{"message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#,
+        ]);
+
+        let messages = parse_dsh_file(file.path());
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("dsh:summary:seq:9:1786669450002:p:m:10:20:0:0:0")
         );
     }
 

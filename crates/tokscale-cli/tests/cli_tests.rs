@@ -1505,6 +1505,48 @@ fn write_dsh_seeded_pair_without_seed_length(base: &Path) {
     }
 }
 
+/// Two unrelated summaries with identical local coordinates but distinct
+/// compaction UUIDs, plus one parent/child replay sharing a UUID. This is the
+/// complete #1187 collision boundary: retain two calls from the first leg and
+/// collapse the copied call from the second.
+fn write_dsh_compaction_identity_fixture(base: &Path) {
+    let fixtures = [
+        (
+            "unrelated-a",
+            r#"{"type":"session","id":"unrelated-a","createdAt":1,"cwd":"/tmp/dsh-workspace"}"#,
+            r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-a","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#,
+        ),
+        (
+            "unrelated-b",
+            r#"{"type":"session","id":"unrelated-b","createdAt":2,"cwd":"/tmp/dsh-workspace"}"#,
+            r#"{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-b","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}"#,
+        ),
+        (
+            "fork-parent",
+            r#"{"type":"session","id":"fork-parent","createdAt":3,"cwd":"/tmp/dsh-workspace"}"#,
+            r#"{"type":"compaction/summary","seq":9,"time":1786669450003,"data":{"compactionId":"compact-copied","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":30,"outputTokens":40}}}"#,
+        ),
+        (
+            "fork-child",
+            r#"{"type":"session","id":"fork-child","createdAt":4,"cwd":"/tmp/dsh-workspace","parentSession":"fork-parent"}"#,
+            r#"{"type":"compaction/summary","seq":9,"time":1786669450003,"data":{"compactionId":"compact-copied","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":30,"outputTokens":40}}}"#,
+        ),
+    ];
+
+    for (session_id, header, summary) in fixtures {
+        let dir = dsh_sessions_root(base)
+            .join("-tmp-dsh-workspace")
+            .join(session_id);
+        fs::create_dir_all(&dir).unwrap();
+        let payload = format!("{header}\n{summary}\n");
+        fs::write(
+            dir.join("session.jsonl.zstd"),
+            zstd::encode_all(payload.as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 fn write_jcode_session(base: &Path) {
     let sessions_dir = base.join(".jcode/sessions");
     fs::create_dir_all(&sessions_dir).unwrap();
@@ -2476,6 +2518,28 @@ fn test_dsh_repeated_message_ids_across_transcripts_count_once_cold_and_warm_cac
         assert_eq!(json["totalMessages"].as_i64(), Some(1), "{pass} cache pass");
         assert_eq!(json["totalInput"].as_i64(), Some(2885), "{pass} cache pass");
         assert_eq!(json["totalOutput"].as_i64(), Some(2), "{pass} cache pass");
+    }
+}
+
+#[test]
+fn test_dsh_compaction_identity_is_global_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    write_dsh_compaction_identity_fixture(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "dsh", "--no-spinner"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalMessages"].as_i64(), Some(3), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(50), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(80), "{pass} cache pass");
     }
 }
 

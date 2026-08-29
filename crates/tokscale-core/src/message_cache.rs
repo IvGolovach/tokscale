@@ -1254,7 +1254,11 @@ fn parser_version(client: ClientId) -> u32 {
         // request model. Finished DSH transcripts are append-only and keep the
         // same fingerprint, so only this bump replaces cached alias/substitute
         // attribution and its derived pricing.
-        ClientId::Dsh => 4,
+        // v4->v5: compaction summaries now use their globally stable
+        // `data.compactionId` before the per-transcript `seq` fallback. Reparse
+        // released v4 rows so unrelated summaries with otherwise identical
+        // call data are no longer collapsed across files (#1187).
+        ClientId::Dsh => 5,
         // First version of the fx (vercel-labs) usage-v2.json parser. Entries
         // are versioned from the start so later parser changes have an
         // obvious local counter to bump, like every other client here.
@@ -3377,11 +3381,11 @@ mod tests {
     }
 
     #[test]
-    fn test_dsh_served_model_parser_version_invalidates_v3_entries() {
+    fn test_dsh_compaction_identity_parser_version_invalidates_v4_entries() {
         // A finished transcript is never rewritten when attribution starts
-        // preferring the provider-reported response model, so its fingerprint
-        // remains valid and only the parser version can retire the old row.
-        assert_eq!(parser_version(ClientId::Dsh), 4);
+        // preferring compactionId, so its fingerprint remains valid and only
+        // the parser version can retire the seq-keyed row released in v4.14.0.
+        assert_eq!(parser_version(ClientId::Dsh), 5);
     }
 
     #[test]
@@ -3395,7 +3399,7 @@ mod tests {
 "#,
         );
         let current_identity = CacheIdentity::for_client(ClientId::Dsh);
-        assert_eq!(current_identity.parser_version, 4);
+        assert_eq!(current_identity.parser_version, 5);
         let stale_identity = CacheIdentity {
             namespace: current_identity.namespace,
             parser_version: 3,
@@ -3456,7 +3460,87 @@ mod tests {
 
         let warm = SourceMessageCache::load();
         let cached = warm.get(current_identity, source.path()).unwrap();
-        assert_eq!(cached.parser_version, 4);
+        assert_eq!(cached.parser_version, 5);
+        assert_eq!(cached.messages, rebuilt);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn dsh_v4_shards_are_reparsed_with_global_compaction_identity() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(
+            br#"{"type":"session","id":"session-summary","createdAt":1,"cwd":"/work"}
+{"type":"compaction/summary","seq":4,"time":1786669450002,"data":{"compactionId":"compact-global","message":{"source":{"provider":"p","model":"m"}},"usage":{"inputTokens":10,"outputTokens":20}}}
+"#,
+        );
+        let current_identity = CacheIdentity::for_client(ClientId::Dsh);
+        assert_eq!(current_identity.parser_version, 5);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 4,
+        };
+        let fingerprint = SourceFingerprint::from_path(source.path()).unwrap();
+        let mut stale_message = UnifiedMessage::new(
+            current_identity.namespace,
+            "m",
+            "p",
+            "session-summary",
+            1786669450002,
+            crate::TokenBreakdown {
+                input: 10,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+        stale_message.dedup_key =
+            Some("dsh:summary:seq:4:1786669450002:p:m:10:20:0:0:0".to_string());
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            source.path(),
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let stale_path = cache_shard_path(current_identity, source.path());
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_path,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(current_identity, source.path()).is_none(),
+            "a released v4 seq-keyed row must not survive the parser change"
+        );
+
+        let rebuilt = crate::sessions::dsh::parse_dsh_file(source.path());
+        assert_eq!(rebuilt.len(), 1);
+        assert_eq!(
+            rebuilt[0].dedup_key.as_deref(),
+            Some("dsh:summary:cmp:compact-global:1786669450002:p:m:10:20:0:0:0")
+        );
+        cache.insert(CachedSourceEntry::new(
+            current_identity,
+            source.path(),
+            fingerprint,
+            rebuilt.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(current_identity, source.path()).unwrap();
+        assert_eq!(cached.parser_version, 5);
         assert_eq!(cached.messages, rebuilt);
     }
 
