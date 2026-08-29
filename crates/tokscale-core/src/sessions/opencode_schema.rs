@@ -337,7 +337,7 @@ impl OpenCodeSchemaConfig {
 /// metadata table is absent.
 const OPENCODE_V2_QUERIES: &[&str] = &[
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title, 1 AS eligible
         FROM session_message sm
         LEFT JOIN session_v2 s ON s.id = sm.session_id
         WHERE sm.type = 'assistant'
@@ -345,7 +345,7 @@ const OPENCODE_V2_QUERIES: &[&str] = &[
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM session_message sm
         LEFT JOIN session_v2 s ON s.id = sm.session_id
         WHERE sm.type = 'assistant'
@@ -353,7 +353,7 @@ const OPENCODE_V2_QUERIES: &[&str] = &[
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title, 1 AS eligible
         FROM session_message sm
         LEFT JOIN session s ON s.id = sm.session_id
         WHERE sm.type = 'assistant'
@@ -361,7 +361,7 @@ const OPENCODE_V2_QUERIES: &[&str] = &[
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM session_message sm
         LEFT JOIN session s ON s.id = sm.session_id
         WHERE sm.type = 'assistant'
@@ -369,7 +369,7 @@ const OPENCODE_V2_QUERIES: &[&str] = &[
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULL AS workspace_root, NULL AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM session_message sm
         WHERE sm.type = 'assistant'
           AND json_extract(sm.data, '$.tokens') IS NOT NULL
@@ -382,7 +382,7 @@ const OPENCODE_V2_QUERIES: &[&str] = &[
 /// only; no `session` table at all (drops workspace and title).
 const OPENCODE_V1_QUERIES: &[&str] = &[
     r#"
-        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title, 1 AS eligible
         FROM message m
         LEFT JOIN session s ON s.id = m.session_id
         WHERE json_extract(m.data, '$.role') = 'assistant'
@@ -390,7 +390,7 @@ const OPENCODE_V1_QUERIES: &[&str] = &[
         ORDER BY m.id, m.session_id
     "#,
     r#"
-        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         LEFT JOIN session s ON s.id = m.session_id
         WHERE json_extract(m.data, '$.role') = 'assistant'
@@ -398,7 +398,7 @@ const OPENCODE_V1_QUERIES: &[&str] = &[
         ORDER BY m.id, m.session_id
     "#,
     r#"
-        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title
+        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         WHERE json_extract(m.data, '$.role') = 'assistant'
           AND json_extract(m.data, '$.tokens') IS NOT NULL
@@ -414,56 +414,48 @@ const OPENCODE_QUERY_GROUPS: &[&[&str]] = &[OPENCODE_V2_QUERIES, OPENCODE_V1_QUE
 /// Incremental spelling of [`OPENCODE_V2_QUERIES`], one variant per full
 /// variant and in the same order.
 ///
-/// The only difference is the leading `time_updated` bound. SQLite evaluates
-/// the conjuncts left to right, so an unchanged row is rejected on an integer
-/// comparison and its `data` payload is never parsed -- and parsing every
-/// payload is what the full scan spends its time on. `>=` and not `>`: a row
-/// written in the same millisecond the mark was taken must not be skipped,
-/// and re-reading the boundary rows costs nothing because the merge replaces
-/// by message id.
+/// These queries intentionally select every changed row, including rows that
+/// no longer qualify as assistant usage. Qualification belongs to the parser,
+/// not to a second SQL predicate that can drift away from it. A changed row
+/// that the parser rejects then has an explicit `Rejected` outcome in the row
+/// provenance map, so its previously cached message can be removed exactly.
+///
+/// `>=` and not `>`: a row written in the same millisecond the mark was taken
+/// must not be skipped, and re-reading the boundary rows costs nothing because
+/// the merge replaces by row provenance.
 const OPENCODE_V2_INCREMENTAL_QUERIES: &[&str] = &[
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title, sm.type = 'assistant' AS eligible
         FROM session_message sm
         LEFT JOIN session_v2 s ON s.id = sm.session_id
         WHERE sm.time_updated >= ?1
-          AND sm.type = 'assistant'
-          AND json_extract(sm.data, '$.tokens') IS NOT NULL
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, sm.type = 'assistant' AS eligible
         FROM session_message sm
         LEFT JOIN session_v2 s ON s.id = sm.session_id
         WHERE sm.time_updated >= ?1
-          AND sm.type = 'assistant'
-          AND json_extract(sm.data, '$.tokens') IS NOT NULL
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title, sm.type = 'assistant' AS eligible
         FROM session_message sm
         LEFT JOIN session s ON s.id = sm.session_id
         WHERE sm.time_updated >= ?1
-          AND sm.type = 'assistant'
-          AND json_extract(sm.data, '$.tokens') IS NOT NULL
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, sm.type = 'assistant' AS eligible
         FROM session_message sm
         LEFT JOIN session s ON s.id = sm.session_id
         WHERE sm.time_updated >= ?1
-          AND sm.type = 'assistant'
-          AND json_extract(sm.data, '$.tokens') IS NOT NULL
         ORDER BY sm.id, sm.session_id
     "#,
     r#"
-        SELECT sm.id, sm.session_id, sm.data, NULL AS workspace_root, NULL AS session_title
+        SELECT sm.id, sm.session_id, sm.data, NULL AS workspace_root, NULL AS session_title, sm.type = 'assistant' AS eligible
         FROM session_message sm
         WHERE sm.time_updated >= ?1
-          AND sm.type = 'assistant'
-          AND json_extract(sm.data, '$.tokens') IS NOT NULL
         ORDER BY sm.id, sm.session_id
     "#,
 ];
@@ -473,92 +465,38 @@ const OPENCODE_V2_INCREMENTAL_QUERIES: &[&str] = &[
 /// inclusive.
 const OPENCODE_V1_INCREMENTAL_QUERIES: &[&str] = &[
     r#"
-        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, s.title AS session_title, 1 AS eligible
         FROM message m
         LEFT JOIN session s ON s.id = m.session_id
         WHERE m.time_updated >= ?1
-          AND json_extract(m.data, '$.role') = 'assistant'
-          AND json_extract(m.data, '$.tokens') IS NOT NULL
         ORDER BY m.id, m.session_id
     "#,
     r#"
-        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         LEFT JOIN session s ON s.id = m.session_id
         WHERE m.time_updated >= ?1
-          AND json_extract(m.data, '$.role') = 'assistant'
-          AND json_extract(m.data, '$.tokens') IS NOT NULL
         ORDER BY m.id, m.session_id
     "#,
     r#"
-        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title
+        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         WHERE m.time_updated >= ?1
-          AND json_extract(m.data, '$.role') = 'assistant'
-          AND json_extract(m.data, '$.tokens') IS NOT NULL
         ORDER BY m.id, m.session_id
     "#,
 ];
 
-/// The cheap invariants one query group's table exposes, read in a single
-/// pass that never touches the `data` column.
+/// Every row id and its own update marker, without touching the JSON payload.
 ///
-/// `?1` is the `time_created` high-water the cached scan recorded, so the last
-/// aggregate counts exactly the rows inserted since. That is what lets the row
-/// count tell an insert apart from a delete: an incremental scan sees new rows
-/// but cannot see removed ones, and OpenCode drops a session's messages with
-/// `ON DELETE CASCADE`.
-const OPENCODE_V2_STATS_QUERY: &str = r#"
-    SELECT COUNT(*),
-           MAX(time_created),
-           MAX(time_updated),
-           COUNT(CASE WHEN time_created > ?1 THEN 1 END)
-    FROM session_message
-"#;
-
-const OPENCODE_V1_STATS_QUERY: &str = r#"
-    SELECT COUNT(*),
-           MAX(time_created),
-           MAX(time_updated),
-           COUNT(CASE WHEN time_created > ?1 THEN 1 END)
-    FROM message
-"#;
-
-/// Changed rows the usage queries no longer select.
-///
-/// The row count is a deletion test, but a row that is rewritten until it stops
-/// being priceable usage -- its role moves off `assistant`, or its `tokens`
-/// object goes away -- leaves the count untouched while dropping out of the
-/// incremental result. The merge only replaces keys it is handed, so without
-/// this probe that row's cached message would stay counted for as long as the
-/// mark survives, and a cold scan would disagree with the cache indefinitely.
-///
-/// Only the ids are read: the caller needs to know whether a *cached* message
-/// came from the row, not what the row says now. Bounded by the same
-/// `time_updated` mark as the usage queries, so it reads the delta rather than
-/// the table -- unlike folding the predicate into the stats query, which costs
-/// a `json_extract` per row on every rescan (measured at +14.6s on a 14 GB
-/// database, against 5.1s for the whole stats pass).
-///
-/// The `COALESCE` matters: `json_extract` returns SQL NULL for an absent
-/// `$.role`, and an unguarded `NOT (NULL = 'assistant' AND ...)` evaluates to
-/// NULL, which `WHERE` drops -- silently exempting exactly the malformed rows
-/// this is meant to catch.
-const OPENCODE_V2_DISQUALIFIED_QUERY: &str = r#"
-    SELECT sm.id, json_extract(sm.data, '$.id')
-    FROM session_message sm
-    WHERE sm.time_updated >= ?1
-      AND NOT (sm.type = 'assistant'
-               AND json_extract(sm.data, '$.tokens') IS NOT NULL)
-"#;
-
-const OPENCODE_V1_DISQUALIFIED_QUERY: &str = r#"
-    SELECT m.id, json_extract(m.data, '$.id')
-    FROM message m
-    WHERE m.time_updated >= ?1
-      AND NOT (COALESCE(json_extract(m.data, '$.role'), '') = 'assistant'
-               AND json_extract(m.data, '$.tokens') IS NOT NULL)
-"#;
+/// This inventory is the source of truth for incremental safety. A missing id
+/// is a deletion, a new id is an insertion, and a changed marker names exactly
+/// the rows the delta query must have returned. The previous implementation
+/// inferred those facts from counts and several JSON probes; every new schema
+/// variation needed another inference. Keeping the row provenance makes the
+/// decisions explicit while preserving the cheap, index-only table walk.
+const OPENCODE_V2_ROW_INVENTORY_QUERY: &str =
+    "SELECT id, time_updated FROM session_message ORDER BY id";
+const OPENCODE_V1_ROW_INVENTORY_QUERY: &str = "SELECT id, time_updated FROM message ORDER BY id";
 
 /// Session metadata that changed since a mark, one query per full variant and
 /// in the same order. An empty entry means that variant joins no metadata
@@ -598,35 +536,6 @@ const OPENCODE_V1_METADATA_STATS: &[&str] = &[
     "",
 ];
 
-/// Changed rows that now key themselves by an embedded id different from their
-/// SQLite row id.
-///
-/// The dedup key is the payload's `$.id` when it has one and the row id
-/// otherwise, so a row that *gains* an id changes key. The merge looks the new
-/// key up, does not find it, and appends -- leaving the message keyed by the row
-/// id in place and counting the row twice, while a cold parse counts it once.
-///
-/// The merge's content digest catches this only when the rewrite changed nothing
-/// else; a rewrite that also moved the token counts has a different digest and
-/// slips through. Nothing in a cached message records which row produced it, so
-/// the two cannot be linked after the fact -- the collision is detected here and
-/// answered with a full scan.
-const OPENCODE_V2_REKEYED_QUERY: &str = r#"
-    SELECT sm.id
-    FROM session_message sm
-    WHERE sm.time_updated >= ?1
-      AND json_extract(sm.data, '$.id') IS NOT NULL
-      AND json_extract(sm.data, '$.id') <> sm.id
-"#;
-
-const OPENCODE_V1_REKEYED_QUERY: &str = r#"
-    SELECT m.id
-    FROM message m
-    WHERE m.time_updated >= ?1
-      AND json_extract(m.data, '$.id') IS NOT NULL
-      AND json_extract(m.data, '$.id') <> m.id
-"#;
-
 /// Incremental support for one entry of [`OpenCodeSchemaConfig::query_groups`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct OpenCodeIncrementalGroup {
@@ -634,14 +543,8 @@ pub(crate) struct OpenCodeIncrementalGroup {
     /// same order, so a variant index resolved against the full list also
     /// selects the incremental spelling of that same variant.
     queries: &'static [&'static str],
-    /// Row-population invariants for the group's base table.
-    stats: &'static str,
-    /// Changed rows the group's usage queries no longer select. One query for
-    /// the whole group rather than one per variant: the variants differ only
-    /// in the metadata join, which this does not read.
-    disqualified: &'static str,
-    /// Changed rows whose dedup key moved off their row id.
-    rekeyed: &'static str,
+    /// Every row id and update marker in the group's base table.
+    inventory: &'static str,
     /// Session metadata changed since the mark, per variant.
     metadata: &'static [&'static str],
     /// Metadata-table high-water, per variant.
@@ -652,17 +555,13 @@ pub(crate) struct OpenCodeIncrementalGroup {
 const OPENCODE_INCREMENTAL_GROUPS: &[OpenCodeIncrementalGroup] = &[
     OpenCodeIncrementalGroup {
         queries: OPENCODE_V2_INCREMENTAL_QUERIES,
-        stats: OPENCODE_V2_STATS_QUERY,
-        disqualified: OPENCODE_V2_DISQUALIFIED_QUERY,
-        rekeyed: OPENCODE_V2_REKEYED_QUERY,
+        inventory: OPENCODE_V2_ROW_INVENTORY_QUERY,
         metadata: OPENCODE_V2_METADATA_QUERIES,
         metadata_stats: OPENCODE_V2_METADATA_STATS,
     },
     OpenCodeIncrementalGroup {
         queries: OPENCODE_V1_INCREMENTAL_QUERIES,
-        stats: OPENCODE_V1_STATS_QUERY,
-        disqualified: OPENCODE_V1_DISQUALIFIED_QUERY,
-        rekeyed: OPENCODE_V1_REKEYED_QUERY,
+        inventory: OPENCODE_V1_ROW_INVENTORY_QUERY,
         metadata: OPENCODE_V1_METADATA_QUERIES,
         metadata_stats: OPENCODE_V1_METADATA_STATS,
     },
@@ -672,7 +571,7 @@ const OPENCODE_INCREMENTAL_GROUPS: &[OpenCodeIncrementalGroup] = &[
 /// that predate it.
 const MICODE_QUERIES: &[&str] = &[
     r#"
-        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title
+        SELECT m.id, m.session_id, m.data, NULLIF(s.directory, '') AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         LEFT JOIN session s ON s.id = m.session_id
         WHERE json_extract(m.data, '$.role') = 'assistant'
@@ -680,7 +579,7 @@ const MICODE_QUERIES: &[&str] = &[
         ORDER BY m.id, m.session_id
     "#,
     r#"
-        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title
+        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         WHERE json_extract(m.data, '$.role') = 'assistant'
           AND json_extract(m.data, '$.tokens') IS NOT NULL
@@ -696,7 +595,7 @@ const MICODE_QUERY_GROUPS: &[&[&str]] = &[MICODE_QUERIES];
 /// other clients: without it a single malformed `data` blob makes SQLite's
 /// `json_extract` abort the whole statement rather than skip the row.
 const KILO_QUERIES: &[&str] = &[r#"
-        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title
+        SELECT m.id, m.session_id, m.data, NULL AS workspace_root, NULL AS session_title, 1 AS eligible
         FROM message m
         WHERE json_valid(m.data)
           AND json_extract(m.data, '$.role') = 'assistant'
@@ -843,9 +742,17 @@ struct SchemaDedupState {
     has_workspace_conflict: bool,
 }
 
-/// Column layout shared by every query variant:
-/// `(row_id, session_id, data_json, workspace_root, session_title)`.
-type OpenCodeSchemaRow = (String, String, String, Option<String>, Option<String>);
+/// Column layout shared by every query variant.
+struct OpenCodeSchemaRow {
+    row_id: String,
+    session_id: String,
+    data_json: String,
+    workspace_root: Option<String>,
+    session_title: Option<String>,
+    /// False for a v2 row whose SQL `type` is not `assistant`. V1 carries the
+    /// role inside JSON and therefore passes true here and is checked below.
+    eligible: bool,
+}
 
 #[derive(Default)]
 struct SchemaAccumulator {
@@ -864,13 +771,34 @@ struct SchemaAccumulator {
 
 impl SchemaAccumulator {
     /// Decode one row's JSON payload and merge it into the accumulator.
-    fn ingest(&mut self, row: OpenCodeSchemaRow, cfg: &OpenCodeSchemaConfig, db_namespace: &str) {
-        let (row_id, row_session_id, data_json, row_workspace_root, row_session_title) = row;
+    ///
+    /// Returns the message slot this physical row backs, or `None` when the
+    /// parser rejects it. Keeping that outcome is what lets an incremental
+    /// scan remove a previously accepted row without guessing which message it
+    /// produced.
+    fn ingest(
+        &mut self,
+        row: OpenCodeSchemaRow,
+        cfg: &OpenCodeSchemaConfig,
+        db_namespace: &str,
+    ) -> Option<usize> {
+        let OpenCodeSchemaRow {
+            row_id,
+            session_id: row_session_id,
+            data_json,
+            workspace_root: row_workspace_root,
+            session_title: row_session_title,
+            eligible,
+        } = row;
+
+        if !eligible {
+            return None;
+        }
 
         let mut bytes = data_json.into_bytes();
         let msg: OpenCodeSchemaMessage = match simd_json::from_slice(&mut bytes) {
             Ok(m) => m,
-            Err(_) => return,
+            Err(_) => return None,
         };
 
         // v1 rows carry an explicit role; v2 rows omit it and are pre-filtered
@@ -882,28 +810,21 @@ impl SchemaAccumulator {
             msg.role.as_deref() == Some("assistant")
         };
         if !is_assistant {
-            return;
+            return None;
         }
 
         let tokens = match msg.tokens {
             Some(ref tokens) => tokens,
-            None => return,
+            None => return None,
         };
-        let Some((cache_read, cache_write)) =
-            resolve_cache(tokens.cache.as_ref(), cfg.strict_cache)
-        else {
-            return;
-        };
+        let (cache_read, cache_write) = resolve_cache(tokens.cache.as_ref(), cfg.strict_cache)?;
 
         let resolved_model_id = if cfg.dual_schema {
             msg.resolve_model_id()
         } else {
             msg.model_id.clone()
         };
-        let model_id = match resolved_model_id {
-            Some(model_id) => model_id,
-            None => return,
-        };
+        let model_id = resolved_model_id?;
 
         let provider_id = resolve_provider(&msg, &model_id, cfg);
 
@@ -917,7 +838,7 @@ impl SchemaAccumulator {
             ),
             None => match cfg.fallback_timestamp {
                 Some(fallback) => (fallback as f64, None),
-                None => return,
+                None => return None,
             },
         };
 
@@ -1010,8 +931,9 @@ impl SchemaAccumulator {
         }
 
         if cfg.dedup == DedupMode::Off {
+            let index = self.messages.len();
             self.messages.push(unified);
-            return;
+            return Some(index);
         }
 
         let fingerprint = OpenCodeSchemaFingerprint {
@@ -1081,7 +1003,7 @@ impl SchemaAccumulator {
                     self.merged_dedup_keys.insert(key);
                 }
             }
-            return;
+            return Some(index);
         }
 
         let new_index = self.messages.len();
@@ -1094,6 +1016,7 @@ impl SchemaAccumulator {
             .or_default()
             .push(new_index);
         self.messages.push(unified);
+        Some(new_index)
     }
 }
 
@@ -1122,7 +1045,15 @@ fn collect_rows(
         let data_json: String = row.get(2)?;
         let workspace_root: Option<String> = row.get(3)?;
         let session_title: Option<String> = row.get(4)?;
-        on_row((id, session_id, data_json, workspace_root, session_title));
+        let eligible: bool = row.get(5)?;
+        on_row(OpenCodeSchemaRow {
+            row_id: id,
+            session_id,
+            data_json,
+            workspace_root,
+            session_title,
+            eligible,
+        });
         Ok(())
     })
 }
@@ -1143,7 +1074,15 @@ fn collect_rows_since(
             let data_json: String = row.get(2)?;
             let workspace_root: Option<String> = row.get(3)?;
             let session_title: Option<String> = row.get(4)?;
-            on_row((id, session_id, data_json, workspace_root, session_title));
+            let eligible: bool = row.get(5)?;
+            on_row(OpenCodeSchemaRow {
+                row_id: id,
+                session_id,
+                data_json,
+                workspace_root,
+                session_title,
+                eligible,
+            });
             Ok(())
         });
     // `ran()`, not `prepared()`: the delta is only complete if the statement
@@ -1151,46 +1090,6 @@ fn collect_rows_since(
     // stepping -- json_extract on a malformed payload, say -- and a truncated
     // delta read as a complete one keeps cached messages a cold parse drops.
     scan.completed()
-}
-
-/// Whether any row that stopped qualifying as usage backs a cached message.
-///
-/// Returns `None` if the probe could not run, which the caller treats the same
-/// as a hit: an unverifiable delta is not a safe one.
-///
-/// Both candidate dedup keys are tested for every row -- the embedded id and
-/// the row id -- rather than reproducing [`SchemaAccumulator::ingest`]'s choice
-/// between them. The two spellings cannot collide across different rows in
-/// practice, and the failure directions are not symmetric: an extra key costs
-/// one unnecessary full scan, while a missed one leaves a stale message counted
-/// for the life of the mark.
-fn disqualified_row_backs_cached_message(
-    db_path: &Path,
-    conn: &rusqlite::Connection,
-    query: &str,
-    since: i64,
-    db_namespace: &str,
-    cached_keys: &std::collections::HashSet<&str>,
-) -> Option<bool> {
-    let mut hit = false;
-    let scan =
-        sqlite_for_each_row_on_with_params(conn, db_path, query, &[&since], None, &mut |row| {
-            if hit {
-                return Ok(());
-            }
-            let row_id: String = row.get(0)?;
-            let embedded_id: Option<String> = row.get(1)?;
-            let namespaced = format!("{db_namespace}:{row_id}");
-            hit = cached_keys.contains(row_id.as_str())
-                || cached_keys.contains(namespaced.as_str())
-                || embedded_id
-                    .as_deref()
-                    .is_some_and(|id| cached_keys.contains(id));
-            Ok(())
-        });
-    // Completion required for the same reason as the delta: a probe that
-    // stopped early has not proved the absence of a disqualified row.
-    scan.completed().then_some(hit)
 }
 
 /// Highest `time_updated` in a variant's metadata table, or `i64::MIN` when the
@@ -1278,31 +1177,6 @@ fn refresh_changed_session_metadata(
     read_metadata_high_water(db_path, conn, stats_query)
 }
 
-/// Whether a row that re-keyed itself still has a cached message under its old
-/// row-id key. See [`OPENCODE_V1_REKEYED_QUERY`] for why that is unsafe.
-fn rekeyed_row_backs_cached_message(
-    db_path: &Path,
-    conn: &rusqlite::Connection,
-    query: &str,
-    since: i64,
-    db_namespace: &str,
-    cached_keys: &std::collections::HashSet<&str>,
-) -> Option<bool> {
-    let mut hit = false;
-    let scan =
-        sqlite_for_each_row_on_with_params(conn, db_path, query, &[&since], None, &mut |row| {
-            if hit {
-                return Ok(());
-            }
-            let row_id: String = row.get(0)?;
-            let namespaced = format!("{db_namespace}:{row_id}");
-            hit =
-                cached_keys.contains(row_id.as_str()) || cached_keys.contains(namespaced.as_str());
-            Ok(())
-        });
-    scan.completed().then_some(hit)
-}
-
 /// Parse assistant turns out of a SQLite database that uses the OpenCode
 /// message schema, applying `cfg`'s per-client policy.
 ///
@@ -1332,17 +1206,56 @@ pub(crate) struct OpenCodeGroupMark {
     /// the SQL changes it, which discards the mark rather than pairing new SQL
     /// with rows the old SQL produced.
     pub query_digest: u64,
-    /// Rows the group's table held.
-    pub row_count: i64,
-    /// Highest `time_created`. Rows above it on a later scan are exactly the
-    /// inserts, which is what makes the row count a deletion test.
-    pub created_high_water: i64,
     /// Highest `time_updated`. The incremental scan reads from here.
     pub updated_high_water: i64,
     /// Highest `time_updated` in the joined metadata table. A rename moves this
     /// without touching a single message row, so the message high-water cannot
     /// stand in for it. `i64::MIN` when the variant joins no metadata.
     pub metadata_high_water: i64,
+    /// Every physical row and the cached message it currently backs.
+    ///
+    /// Rows rejected by the parser are retained too. That makes a later
+    /// accepted/rejected transition explicit and lets the rescan remove a
+    /// stale cached message without a SQL predicate that tries to duplicate
+    /// parser semantics.
+    pub rows: Vec<OpenCodeRowProvenance>,
+}
+
+/// How one physical SQLite row contributes to the parsed message list.
+///
+/// `RowId` avoids storing the overwhelmingly common dedup key twice. On the
+/// profiled OpenCode database no row carried an embedded `$.id`, so this keeps
+/// the map close to the measured 13 MB of row-id bytes rather than doubling it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum OpenCodeRowMessageKey {
+    Rejected,
+    RowId,
+    Override(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OpenCodeRowProvenance {
+    pub row_id: String,
+    pub updated_at: i64,
+    pub message_key: OpenCodeRowMessageKey,
+}
+
+impl OpenCodeRowProvenance {
+    fn dedup_key(&self) -> Option<&str> {
+        match &self.message_key {
+            OpenCodeRowMessageKey::Rejected => None,
+            OpenCodeRowMessageKey::RowId => Some(self.row_id.as_str()),
+            OpenCodeRowMessageKey::Override(key) => Some(key.as_str()),
+        }
+    }
+
+    fn set_dedup_key(&mut self, key: Option<&str>) {
+        self.message_key = match key {
+            None => OpenCodeRowMessageKey::Rejected,
+            Some(key) if key == self.row_id => OpenCodeRowMessageKey::RowId,
+            Some(key) => OpenCodeRowMessageKey::Override(key.to_string()),
+        };
+    }
 }
 
 /// One mark per query group, in [`OpenCodeSchemaConfig::query_groups`] order.
@@ -1350,9 +1263,10 @@ pub(crate) struct OpenCodeGroupMark {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct OpenCodeIncrementalState {
     pub groups: Vec<Option<OpenCodeGroupMark>>,
-    /// Dedup keys of the rows that took part in a fingerprint merge. A rescan
-    /// that re-reads one of them cannot reproduce the collapse -- the merged
-    /// entry is the only trace the other row left -- so it re-parses instead.
+    /// Dedup keys backed by more than one physical row, including fingerprint
+    /// merges and repeated embedded ids. A rescan that re-reads only one side
+    /// cannot reconstruct which message a full scan would retain, so it falls
+    /// back instead.
     pub merged_dedup_keys: Vec<String>,
 }
 
@@ -1401,57 +1315,31 @@ fn query_digest(query: &str) -> u64 {
     digest
 }
 
-struct TableStats {
-    row_count: i64,
-    created_high_water: i64,
-    updated_high_water: i64,
-    /// Rows whose `time_created` is above the value bound to `?1`.
-    created_after_mark: i64,
-}
-
-/// Read a group's invariants, or `None` when the group's table is absent.
-///
-/// `MAX` over an empty table is NULL; both high-waters then collapse to
-/// `i64::MIN`, which makes the next incremental scan read everything rather
-/// than nothing.
-fn read_table_stats(
+/// Read every physical row id and its own update marker without parsing JSON.
+/// `None` means the table is absent or the scan stopped before completion.
+fn read_row_inventory(
     db_path: &Path,
     conn: &rusqlite::Connection,
     query: &str,
-    created_mark: i64,
-) -> Option<TableStats> {
-    let mut stats = None;
-    let scan = sqlite_for_each_row_on_with_params(
-        conn,
-        db_path,
-        query,
-        &[&created_mark],
-        None,
-        &mut |row| {
-            stats = Some(TableStats {
-                row_count: row.get(0)?,
-                created_high_water: row.get::<_, Option<i64>>(1)?.unwrap_or(i64::MIN),
-                updated_high_water: row.get::<_, Option<i64>>(2)?.unwrap_or(i64::MIN),
-                created_after_mark: row.get(3)?,
-            });
-            Ok(())
-        },
-    );
-    // A truncated stats read yields a row count and high-waters that describe
-    // a prefix of the table, which is exactly the shape of a silent undercount.
-    if scan.completed() {
-        stats
-    } else {
-        None
-    }
+) -> Option<Vec<OpenCodeRowProvenance>> {
+    let mut rows = Vec::new();
+    let scan = sqlite_for_each_row_on(conn, db_path, query, None, &mut |row| {
+        rows.push(OpenCodeRowProvenance {
+            row_id: row.get(0)?,
+            updated_at: row.get(1)?,
+            message_key: OpenCodeRowMessageKey::Rejected,
+        });
+        Ok(())
+    });
+    scan.completed().then_some(rows)
 }
 
 /// Full scan, also recording the state an incremental rescan resumes from.
 ///
-/// The invariants are read *before* the rows on purpose. A mark taken after
-/// the rows could name a row the scan never saw, and the next incremental scan
-/// would then skip that row forever. Taken first, the worst case is a row that
-/// lands between the two reads and gets read twice, which the merge collapses.
+/// The inventory is read *before* the messages on purpose. A mark taken after
+/// the messages could name a row the scan never saw, and the next incremental
+/// scan would then skip that row forever. A row that lands between the two
+/// reads is parsed but deliberately prevents a resumable mark.
 pub(crate) fn scan_opencode_schema_sqlite(
     db_path: &Path,
     cfg: OpenCodeSchemaConfig,
@@ -1468,6 +1356,7 @@ pub(crate) fn scan_opencode_schema_sqlite(
 
     let mut acc = SchemaAccumulator::default();
     let mut marks: Vec<Option<OpenCodeGroupMark>> = Vec::with_capacity(cfg.query_groups.len());
+    let mut parsed_rows: Vec<Vec<(String, usize)>> = Vec::with_capacity(cfg.query_groups.len());
     // A group that produced rows but no invariants -- an older database whose
     // table predates the `time_updated` column -- has no way to be rescanned
     // incrementally, and a mark that silently skipped it would serve those rows
@@ -1478,10 +1367,8 @@ pub(crate) fn scan_opencode_schema_sqlite(
         let incremental = cfg
             .incremental_groups
             .and_then(|groups| groups.get(group_index));
-        // `i64::MAX` leaves the insert count at zero: nothing resumes from a
-        // full scan's own reading of it.
-        let stats = incremental
-            .and_then(|incremental| read_table_stats(db_path, &conn, incremental.stats, i64::MAX));
+        let inventory = incremental
+            .and_then(|incremental| read_row_inventory(db_path, &conn, incremental.inventory));
 
         // `prepared()` selects the variant -- it is the schema probe, and a
         // variant that prepared is the one this database understands, so
@@ -1491,9 +1378,13 @@ pub(crate) fn scan_opencode_schema_sqlite(
         // that prefix would tell the next rescan those rows were already seen.
         let mut chosen = None;
         let mut read_every_row = false;
+        let mut group_parsed_rows = Vec::new();
         for (index, query) in group.iter().enumerate() {
             let scan = collect_rows(db_path, &conn, query, &mut |row| {
-                acc.ingest(row, &cfg, &db_namespace)
+                let row_id = row.row_id.clone();
+                if let Some(message_index) = acc.ingest(row, &cfg, &db_namespace) {
+                    group_parsed_rows.push((row_id, message_index));
+                }
             });
             if scan.prepared() {
                 chosen = Some(index);
@@ -1504,9 +1395,10 @@ pub(crate) fn scan_opencode_schema_sqlite(
         if chosen.is_some() && !read_every_row {
             resumable = false;
         }
+        parsed_rows.push(group_parsed_rows);
 
-        marks.push(match (chosen, stats) {
-            (Some(index), Some(stats)) if read_every_row => {
+        marks.push(match (chosen, inventory) {
+            (Some(index), Some(rows)) if read_every_row => {
                 let metadata_high_water = cfg
                     .incremental_groups
                     .and_then(|groups| groups.get(group_index))
@@ -1515,10 +1407,13 @@ pub(crate) fn scan_opencode_schema_sqlite(
                 match metadata_high_water {
                     Some(metadata_high_water) => Some(OpenCodeGroupMark {
                         query_digest: query_digest(group[index]),
-                        row_count: stats.row_count,
-                        created_high_water: stats.created_high_water,
-                        updated_high_water: stats.updated_high_water,
+                        updated_high_water: rows
+                            .iter()
+                            .map(|row| row.updated_at)
+                            .max()
+                            .unwrap_or(i64::MIN),
                         metadata_high_water,
+                        rows,
                     }),
                     // Without a metadata high-water a later rescan cannot tell
                     // whether a rename happened, so this scan is not resumable.
@@ -1528,12 +1423,56 @@ pub(crate) fn scan_opencode_schema_sqlite(
                     }
                 }
             }
-            (Some(_), None) => {
+            (Some(_), None) if incremental.is_some() => {
                 resumable = false;
                 None
             }
             _ => None,
         });
+    }
+
+    // Resolve each physical row to the final message slot after all
+    // fingerprint merges and cross-generation promotions have completed.
+    for (group_index, group_rows) in parsed_rows.into_iter().enumerate() {
+        let Some(Some(mark)) = marks.get_mut(group_index) else {
+            continue;
+        };
+        let row_index: HashMap<String, usize> = mark
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(index, row)| (row.row_id.clone(), index))
+            .collect();
+        for (row_id, message_index) in group_rows {
+            let Some(&index) = row_index.get(row_id.as_str()) else {
+                // The row landed between the inventory and message reads. The
+                // messages are correct, but a mark that omitted its source
+                // could not update or delete it safely on the next scan.
+                resumable = false;
+                continue;
+            };
+            let key = acc.messages[message_index].dedup_key.as_deref();
+            mark.rows[index].set_dedup_key(key);
+        }
+    }
+
+    // Any key backed by several rows has the same reconstruction problem as a
+    // fingerprint merge: changing one source cannot reveal what another source
+    // contributed. Keep the conservative full-scan fallback for those keys.
+    let mut backing_counts: HashMap<String, usize> = HashMap::new();
+    for row in marks
+        .iter()
+        .filter_map(Option::as_ref)
+        .flat_map(|mark| mark.rows.iter())
+    {
+        if let Some(key) = row.dedup_key() {
+            *backing_counts.entry(key.to_string()).or_default() += 1;
+        }
+    }
+    for (key, count) in backing_counts {
+        if count > 1 {
+            acc.merged_dedup_keys.insert(key);
+        }
     }
 
     resumable &= acc.merged_dedup_keys.len() <= MAX_MERGED_DEDUP_KEYS;
@@ -1557,9 +1496,10 @@ pub(crate) fn scan_opencode_schema_sqlite(
 /// then runs [`scan_opencode_schema_sqlite`] instead. That covers a database
 /// that will not open, a schema variant that no longer matches the one the
 /// mark came from, a query variant whose SQL has since been edited, and -- the
-/// case that matters for correctness -- a table that lost rows. Deletions are
-/// invisible to an incremental scan, so anything short of a clean insert-only
-/// delta re-reads everything.
+/// case that matters for correctness -- a changed row the delta did not return.
+/// Deletions and parser rejections are handled directly through row provenance;
+/// a non-monotonic update that falls below the SQL high-water is detected and
+/// answered with a full scan rather than silently omitted.
 pub(crate) fn rescan_opencode_schema_sqlite(
     db_path: &Path,
     cfg: OpenCodeSchemaConfig,
@@ -1580,30 +1520,27 @@ pub(crate) fn rescan_opencode_schema_sqlite(
 
     let mut acc = SchemaAccumulator::default();
     let mut marks: Vec<Option<OpenCodeGroupMark>> = Vec::with_capacity(cached_state.groups.len());
-    // Borrowed for the disqualification probe below; `cached_messages` is not
-    // consumed until the merge at the end of this function.
     // (mark index, metadata query, metadata stats query, previous high-water)
     let mut pending_metadata: Vec<(usize, &'static str, &'static str, i64)> = Vec::new();
-    let cached_keys: std::collections::HashSet<&str> = cached_messages
+    // Per group: `(row slot in the new inventory, message slot in `acc`)`.
+    let mut parsed_row_slots: Vec<Vec<(usize, usize)>> =
+        Vec::with_capacity(cached_state.groups.len());
+    let previously_merged: std::collections::HashSet<&str> = cached_state
+        .merged_dedup_keys
         .iter()
-        .filter_map(|message| message.dedup_key.as_deref())
+        .map(String::as_str)
         .collect();
 
     for (group_index, group) in cfg.query_groups.iter().enumerate() {
         let incremental = incremental_groups.get(group_index)?;
         let cached_mark = cached_state.groups[group_index].as_ref();
-        let stats = read_table_stats(
-            db_path,
-            &conn,
-            incremental.stats,
-            cached_mark.map_or(i64::MAX, |mark| mark.created_high_water),
-        );
+        let inventory = read_row_inventory(db_path, &conn, incremental.inventory);
 
-        let (mark, stats) = match (cached_mark, stats) {
-            (Some(mark), Some(stats)) => (mark, stats),
+        let (mark, mut rows) = match (cached_mark, inventory) {
+            (Some(mark), Some(rows)) => (mark, rows),
             // The group's table was absent when the cache was written, and the
-            // stats query still does not run. That is *usually* the same table
-            // still missing -- but the stats query also fails on a table that
+            // inventory query still does not run. That is *usually* the same
+            // table still missing -- but the inventory also fails on a table that
             // exists without `time_created`/`time_updated`, and the usage
             // queries do not need those columns. Skipping such a table would
             // omit its rows from every warm scan while a cold parse reads them,
@@ -1613,6 +1550,7 @@ pub(crate) fn rescan_opencode_schema_sqlite(
                     return None;
                 }
                 marks.push(None);
+                parsed_row_slots.push(Vec::new());
                 continue;
             }
             // The table appeared or vanished, or no variant prepared when the
@@ -1620,14 +1558,6 @@ pub(crate) fn rescan_opencode_schema_sqlite(
             // this database.
             _ => return None,
         };
-
-        // Deletion guard. Every row added since the mark carries a
-        // `time_created` above it, so a table that is insert-only holds
-        // exactly `row_count + created_after_mark` rows. Anything less is a row
-        // that went away, and an incremental scan has no way to notice it.
-        if Some(stats.row_count) != mark.row_count.checked_add(stats.created_after_mark) {
-            return None;
-        }
 
         // A full scan takes the first variant that prepares; the cached rows
         // carry that variant's workspace and title columns, so the mark is
@@ -1637,45 +1567,88 @@ pub(crate) fn rescan_opencode_schema_sqlite(
             return None;
         }
 
-        // Rows that stopped being usage are invisible to the query above, so
-        // they are probed for separately. A hit means the cache holds a message
-        // whose row no longer backs it, and only a full scan can drop it.
-        if disqualified_row_backs_cached_message(
-            db_path,
-            &conn,
-            incremental.disqualified,
-            mark.updated_high_water,
-            &db_namespace,
-            &cached_keys,
-        ) != Some(false)
-        {
-            return None;
+        // Both inventories are ordered by id. Diff them in one linear pass so
+        // the safety check does not allocate a second 434k-entry hash map (or,
+        // worse, turn into an O(n^2) lookup on large databases).
+        let mut expected_changed: HashMap<String, usize> = HashMap::new();
+        let mut old_index = 0;
+        for (row_slot, row) in rows.iter_mut().enumerate() {
+            while old_index < mark.rows.len()
+                && mark.rows[old_index].row_id.as_str() < row.row_id.as_str()
+            {
+                let deleted = &mark.rows[old_index];
+                if deleted
+                    .dedup_key()
+                    .is_some_and(|key| previously_merged.contains(key))
+                {
+                    return None;
+                }
+                old_index += 1;
+            }
+
+            if old_index < mark.rows.len() && mark.rows[old_index].row_id == row.row_id {
+                let old = &mark.rows[old_index];
+                if old.updated_at == row.updated_at {
+                    row.message_key = old.message_key.clone();
+                } else {
+                    if old
+                        .dedup_key()
+                        .is_some_and(|key| previously_merged.contains(key))
+                    {
+                        return None;
+                    }
+                    expected_changed.insert(row.row_id.clone(), row_slot);
+                }
+                old_index += 1;
+            } else {
+                expected_changed.insert(row.row_id.clone(), row_slot);
+            }
+        }
+        for deleted in &mark.rows[old_index..] {
+            if deleted
+                .dedup_key()
+                .is_some_and(|key| previously_merged.contains(key))
+            {
+                return None;
+            }
         }
 
-        // A row whose key moved off its row id would be appended beside the
-        // message still keyed by that row id, counting it twice.
-        if rekeyed_row_backs_cached_message(
-            db_path,
-            &conn,
-            incremental.rekeyed,
-            mark.updated_high_water,
-            &db_namespace,
-            &cached_keys,
-        ) != Some(false)
-        {
-            return None;
-        }
+        let mut seen_changed = std::collections::HashSet::new();
+        let mut group_parsed_slots = Vec::new();
+        let mut unsafe_delta = false;
 
         let query = incremental.queries.get(chosen)?;
         if !collect_rows_since(db_path, &conn, query, mark.updated_high_water, &mut |row| {
-            acc.ingest(row, &cfg, &db_namespace)
+            // Inclusive boundary rows are intentionally re-read by SQL. Their
+            // per-row marker proves they did not change, so they need no merge.
+            let Some(&row_slot) = expected_changed.get(&row.row_id) else {
+                if rows
+                    .binary_search_by(|candidate| candidate.row_id.cmp(&row.row_id))
+                    .is_err()
+                {
+                    // Inserted after the inventory read. This scan cannot
+                    // persist a map that omits the source it just observed.
+                    unsafe_delta = true;
+                }
+                return;
+            };
+            seen_changed.insert(row.row_id.clone());
+            if let Some(message_slot) = acc.ingest(row, &cfg, &db_namespace) {
+                group_parsed_slots.push((row_slot, message_slot));
+            }
         }) {
             return None;
         }
+        if unsafe_delta || seen_changed.len() != expected_changed.len() {
+            // A new or changed row whose own timestamp fell below the global
+            // high-water is real but not incrementally readable. The inventory
+            // detects it; a full scan recovers it.
+            return None;
+        }
+        parsed_row_slots.push(group_parsed_slots);
 
-        // The metadata refresh needs `cached_messages` mutably, and the
-        // disqualification probe borrows it immutably for the whole loop, so
-        // the refresh is deferred until both borrows can be released.
+        // Defer metadata refresh until every row group has been validated, so
+        // a later unsafe delta cannot leave a partially re-stamped result.
         pending_metadata.push((
             marks.len(),
             incremental.metadata.get(chosen).copied().unwrap_or(""),
@@ -1689,16 +1662,31 @@ pub(crate) fn rescan_opencode_schema_sqlite(
 
         marks.push(Some(OpenCodeGroupMark {
             query_digest: mark.query_digest,
-            row_count: stats.row_count,
-            created_high_water: stats.created_high_water,
-            updated_high_water: stats.updated_high_water,
+            updated_high_water: rows
+                .iter()
+                .map(|row| row.updated_at)
+                .max()
+                .unwrap_or(i64::MIN),
             metadata_high_water: mark.metadata_high_water,
+            rows,
         }));
     }
 
-    // `cached_keys` borrowed `cached_messages` for the probe above and is dead
-    // from here, so the refresh can take it mutably.
-    drop(cached_keys);
+    // Resolve parsed physical rows after all changed-row fingerprint merges
+    // have chosen their final message slots.
+    for (group_index, slots) in parsed_row_slots.iter().enumerate() {
+        let Some(Some(mark)) = marks.get_mut(group_index) else {
+            continue;
+        };
+        for &(row_slot, message_slot) in slots {
+            let key = acc.messages[message_slot].dedup_key.as_deref();
+            mark.rows[row_slot].set_dedup_key(key);
+            if key.is_some_and(|key| previously_merged.contains(key)) {
+                return None;
+            }
+        }
+    }
+
     // Both generations are scanned into one message list, and a cached message
     // does not record which group produced it. So a session id that exists in
     // more than one generation's metadata table cannot be re-stamped safely:
@@ -1725,15 +1713,40 @@ pub(crate) fn rescan_opencode_schema_sqlite(
         }
     }
 
-    // A merge among the changed rows themselves is reproducible -- a full scan
-    // sees the same rows and collapses them the same way -- but it still leaves
-    // an entry a later rescan must not re-read piecemeal, so it joins the set.
-    let mut merged_dedup_keys = acc.merged_dedup_keys.clone();
-    merged_dedup_keys.extend(cached_state.merged_dedup_keys.iter().cloned());
-    if merged_dedup_keys.len() > MAX_MERGED_DEDUP_KEYS {
+    let mut backing_counts: HashMap<String, usize> = HashMap::new();
+    let mut active_keys = std::collections::HashSet::new();
+    for row in marks
+        .iter()
+        .filter_map(Option::as_ref)
+        .flat_map(|mark| mark.rows.iter())
+    {
+        if let Some(key) = row.dedup_key() {
+            active_keys.insert(key.to_string());
+            *backing_counts.entry(key.to_string()).or_default() += 1;
+        }
+    }
+
+    // A newly introduced multi-row key needs one full scan to establish its
+    // canonical merged message and provenance. Existing multi-row keys were
+    // already rejected above if any of their sources changed.
+    if backing_counts
+        .iter()
+        .any(|(key, &count)| count > 1 && !previously_merged.contains(key.as_str()))
+    {
         return None;
     }
 
+    // Deletions, parser rejections, and A -> B key changes all become the same
+    // operation: remove cached messages no physical row backs in the new map.
+    cached_messages.retain(|message| {
+        message
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| active_keys.contains(key))
+    });
+
+    let merged_dedup_keys: std::collections::HashSet<String> =
+        cached_state.merged_dedup_keys.iter().cloned().collect();
     let messages = merge_incremental_messages(cached_messages, acc.messages, &merged_dedup_keys)?;
     #[cfg(test)]
     INCREMENTAL_RESCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

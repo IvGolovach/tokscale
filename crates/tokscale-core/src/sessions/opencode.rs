@@ -1828,6 +1828,25 @@ mod tests {
         )
     }
 
+    fn timed_v1_payload_without_id(output: i64) -> String {
+        format!(
+            r#"{{
+                "role": "assistant",
+                "sessionID": "ses_1",
+                "modelID": "claude-sonnet-4",
+                "providerID": "anthropic",
+                "cost": 0.5,
+                "tokens": {{
+                    "input": 10,
+                    "output": {output},
+                    "reasoning": 0,
+                    "cache": {{ "read": 0, "write": 0 }}
+                }},
+                "time": {{ "created": 1783882279705, "completed": 1783882279943 }}
+            }}"#
+        )
+    }
+
     fn insert_timed_v1_message(conn: &Connection, id: &str, created: i64, output: i64) {
         conn.execute(
             "INSERT INTO message (id, session_id, time_created, time_updated, data)
@@ -1882,7 +1901,12 @@ mod tests {
 
         let conn = Connection::open(&db_path).unwrap();
         touch_timed_v1_message(&conn, "msg_a", 9_000, 111);
-        insert_timed_v1_message(&conn, "msg_c", 9_500, 33);
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('msg_c', 'ses_1', 500, 9500, ?1)",
+            rusqlite::params![timed_v1_payload("msg_c", 33)],
+        )
+        .unwrap();
         drop(conn);
 
         let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
@@ -1936,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn test_incremental_rescan_refuses_a_database_that_lost_a_row() {
+    fn test_incremental_rescan_removes_a_deleted_row_by_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("opencode.db");
         let conn = create_timed_v1_db(&db_path);
@@ -1947,27 +1971,24 @@ mod tests {
         let cold = scan_opencode_sqlite(&db_path);
         let state = cold.incremental.clone().unwrap();
 
-        // OpenCode cascades a session delete onto its messages; the row is
-        // simply gone, and no incremental query can report its absence.
+        // OpenCode cascades a session delete onto its messages. The row
+        // inventory makes that absence explicit even though no delta query can
+        // return the deleted row.
         let conn = Connection::open(&db_path).unwrap();
         conn.execute("DELETE FROM message WHERE id = 'msg_b'", [])
             .unwrap();
         drop(conn);
 
-        assert!(
-            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
-            "a lost row must force a full re-parse instead of keeping a stale count"
-        );
-
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("an ordinary deletion is exact from row provenance");
         let full = scan_opencode_sqlite(&db_path);
+        assert_eq!(by_dedup_key(&warm.messages), by_dedup_key(&full.messages));
         assert_eq!(full.messages.len(), 1);
         assert_eq!(full.messages[0].dedup_key.as_deref(), Some("msg_a"));
     }
 
     #[test]
-    fn test_incremental_rescan_refuses_a_delete_masked_by_an_insert() {
-        // The row count alone cannot tell this apart from "nothing happened",
-        // which is why the mark also records the `time_created` high-water.
+    fn test_incremental_rescan_handles_a_delete_masked_by_an_insert() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("opencode.db");
         let conn = create_timed_v1_db(&db_path);
@@ -1981,13 +2002,22 @@ mod tests {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute("DELETE FROM message WHERE id = 'msg_b'", [])
             .unwrap();
-        insert_timed_v1_message(&conn, "msg_c", 9_500, 33);
+        // The replacement's creation time moves backwards, so the old
+        // count/high-water inference sees neither an insert nor a deletion.
+        // Its own update marker is current, and row provenance identifies both
+        // physical changes directly.
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('msg_c', 'ses_1', 500, 9500, ?1)",
+            rusqlite::params![timed_v1_payload("msg_c", 33)],
+        )
+        .unwrap();
         drop(conn);
 
-        assert!(
-            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
-            "an equal row count is not evidence that nothing was deleted"
-        );
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("row identity distinguishes the deletion from the insert");
+        let full = scan_opencode_sqlite(&db_path);
+        assert_eq!(by_dedup_key(&warm.messages), by_dedup_key(&full.messages));
     }
 
     /// Rewrite a row so the usage queries stop selecting it, without changing
@@ -2100,15 +2130,15 @@ mod tests {
         );
     }
 
-    /// A row that gains an embedded `$.id` changes dedup key, so the merge
-    /// cannot find the message it should replace. Appending instead would count
-    /// the same row twice while a cold parse counts it once.
+    /// A row whose embedded `$.id` changes has a new dedup key. Row provenance
+    /// links both identities to the same physical source, so the old message is
+    /// removed and the new one replaces it rather than being appended beside it.
     ///
     /// Two shapes, because the merge's content digest only catches one of them:
     /// an identity-only rewrite has the same digest as the cached message, but
     /// one that also changes usage does not.
     #[test]
-    fn test_incremental_rescan_refuses_a_row_that_gained_an_embedded_id() {
+    fn test_incremental_rescan_replaces_a_row_whose_embedded_id_changes() {
         for (label, output) in [("identity only", 11), ("identity and usage", 99)] {
             let dir = tempfile::tempdir().unwrap();
             let db_path = dir.path().join("opencode.db");
@@ -2134,22 +2164,51 @@ mod tests {
             let full = scan_opencode_sqlite(&db_path);
             assert_eq!(full.messages.len(), 1, "{label}: a cold parse sees one row");
 
-            match rescan_opencode_sqlite(&db_path, &state, cold.messages) {
-                None => {}
-                Some(warm) => assert_eq!(
-                    by_dedup_key(&warm.messages),
-                    by_dedup_key(&full.messages),
-                    "{label}: a warm scan that proceeds must match a cold parse"
-                ),
-            }
+            let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+                .unwrap_or_else(|| panic!("{label}: a key change should stay incremental"));
+            assert_eq!(
+                by_dedup_key(&warm.messages),
+                by_dedup_key(&full.messages),
+                "{label}: a warm scan must replace the old physical row"
+            );
         }
     }
 
     #[test]
-    fn test_incremental_rescan_refuses_a_row_that_lost_its_tokens() {
-        // The row is still there, so the count guard sees nothing wrong, and
-        // the usage query no longer returns it, so the merge is never told to
-        // drop it. Only the disqualification probe can catch this.
+    fn test_incremental_rescan_replaces_an_embedded_id_with_the_row_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        conn.execute(
+            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+             VALUES ('row_a', 'ses_1', 1000, 1000, ?1)",
+            rusqlite::params![timed_v1_payload("embedded_a", 11)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let state = cold.incremental.clone().unwrap();
+        assert_eq!(cold.messages[0].dedup_key.as_deref(), Some("embedded_a"));
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "UPDATE message SET data = ?1, time_updated = 9000 WHERE id = 'row_a'",
+            rusqlite::params![timed_v1_payload_without_id(22)],
+        )
+        .unwrap();
+        drop(conn);
+
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("losing an embedded id should stay incremental");
+        let full = scan_opencode_sqlite(&db_path);
+        assert_eq!(by_dedup_key(&warm.messages), by_dedup_key(&full.messages));
+        assert_eq!(warm.messages[0].dedup_key.as_deref(), Some("row_a"));
+        assert_eq!(warm.messages[0].tokens.output, 22);
+    }
+
+    #[test]
+    fn test_incremental_rescan_removes_a_row_that_lost_its_tokens() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("opencode.db");
         let conn = create_timed_v1_db(&db_path);
@@ -2170,18 +2229,16 @@ mod tests {
         );
         drop(conn);
 
-        assert!(
-            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
-            "a row that stopped carrying tokens must force a full re-parse"
-        );
-
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("the parser's rejected outcome removes the old message");
         let full = scan_opencode_sqlite(&db_path);
+        assert_eq!(by_dedup_key(&warm.messages), by_dedup_key(&full.messages));
         assert_eq!(full.messages.len(), 1);
         assert_eq!(full.messages[0].dedup_key.as_deref(), Some("msg_a"));
     }
 
     #[test]
-    fn test_incremental_rescan_refuses_a_row_that_stopped_being_an_assistant_turn() {
+    fn test_incremental_rescan_removes_a_row_that_stopped_being_an_assistant_turn() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("opencode.db");
         let conn = create_timed_v1_db(&db_path);
@@ -2202,10 +2259,41 @@ mod tests {
         );
         drop(conn);
 
-        assert!(
-            rescan_opencode_sqlite(&db_path, &state, cold.messages).is_none(),
-            "a row whose role moved off assistant must force a full re-parse"
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("the changed-row parser owns qualification semantics");
+        let full = scan_opencode_sqlite(&db_path);
+        assert_eq!(by_dedup_key(&warm.messages), by_dedup_key(&full.messages));
+    }
+
+    #[test]
+    fn test_incremental_rescan_uses_parser_qualification_for_changed_rows() {
+        // SQL still sees an assistant row with a tokens object. The parser
+        // rejects it because the model identity disappeared. A duplicated SQL
+        // qualification predicate cannot express that rule without drifting.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("opencode.db");
+        let conn = create_timed_v1_db(&db_path);
+        insert_timed_v1_message(&conn, "msg_a", 1_000, 11);
+        drop(conn);
+
+        let cold = scan_opencode_sqlite(&db_path);
+        let state = cold.incremental.clone().unwrap();
+
+        let conn = Connection::open(&db_path).unwrap();
+        disqualify_timed_v1_message(
+            &conn,
+            "msg_a",
+            9_000,
+            r#"{"id":"msg_a","sessionID":"ses_1","role":"assistant",
+                "tokens":{"input":1,"output":2,"cache":{"read":0,"write":0}},
+                "time":{"created":1783882279705}}"#,
         );
+        drop(conn);
+
+        let warm = rescan_opencode_sqlite(&db_path, &state, cold.messages)
+            .expect("a parser rejection should be an explicit row outcome");
+        assert!(warm.messages.is_empty());
+        assert!(scan_opencode_sqlite(&db_path).messages.is_empty());
     }
 
     #[test]

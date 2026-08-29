@@ -32,9 +32,13 @@ use std::time::UNIX_EPOCH;
 // Both older layouts have wire migrations below, so nothing is discarded --
 // which matters most for Claude, whose entries are the only copy of compacted
 // history.
-const CACHE_FORMAT_VERSION: u32 = 6;
+// 7: OpenCode incremental marks record row provenance. Version-6 shards have a
+// wire migration below: unrelated clients retain their cache, while OpenCode
+// keeps its parsed messages and takes one full scan to acquire the new map.
+const CACHE_FORMAT_VERSION: u32 = 7;
 const LEGACY_CACHE_FORMAT_VERSION_V4: u32 = 4;
 const LEGACY_CACHE_FORMAT_VERSION_V5: u32 = 5;
+const LEGACY_CACHE_FORMAT_VERSION_V6: u32 = 6;
 // V2 intentionally starts cold and leaves source-message-cache.bin untouched:
 // the monolith did not record a trustworthy parser owner for migration.
 const CACHE_SHARD_DIRNAME: &str = "source-message-cache-v2";
@@ -1429,6 +1433,54 @@ impl From<LegacyCachedSourceEntryV5> for CachedSourceEntry {
     }
 }
 
+/// Exact version-6 OpenCode mark layout. The aggregate/probe-based state has
+/// no trustworthy row provenance to synthesize during migration, so OpenCode
+/// entries keep their parsed messages but drop only this mark and rebuild it
+/// on the next changed-database scan.
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyOpenCodeGroupMarkV6 {
+    query_digest: u64,
+    row_count: i64,
+    created_high_water: i64,
+    updated_high_water: i64,
+    metadata_high_water: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyOpenCodeIncrementalStateV6 {
+    groups: Vec<Option<LegacyOpenCodeGroupMarkV6>>,
+    merged_dedup_keys: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LegacyCachedSourceEntryV6 {
+    parser_namespace: String,
+    parser_version: u32,
+    path: CachedPath,
+    fingerprint: SourceFingerprint,
+    messages: Vec<UnifiedMessage>,
+    fallback_timestamp_indices: Vec<usize>,
+    codex_incremental: Option<CodexIncrementalCache>,
+    prime_accounting: Option<crate::sessions::prime_agent::PrimeFileAccounting>,
+    opencode_incremental: Option<LegacyOpenCodeIncrementalStateV6>,
+}
+
+impl From<LegacyCachedSourceEntryV6> for CachedSourceEntry {
+    fn from(entry: LegacyCachedSourceEntryV6) -> Self {
+        Self {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages,
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: None,
+        }
+    }
+}
+
 impl CachedSourceEntry {
     pub(crate) fn new(
         identity: CacheIdentity,
@@ -2298,6 +2350,17 @@ fn read_shard_with_limit(
         return match bincode::options()
             .with_limit(max_shard_bytes)
             .deserialize::<Vec<LegacyCachedSourceEntryV5>>(&envelope.payload)
+        {
+            Ok(entries) => ShardReadStatus::Migrated(
+                entries.into_iter().map(CachedSourceEntry::from).collect(),
+            ),
+            Err(error) => ShardReadStatus::Invalid(error.to_string()),
+        };
+    }
+    if envelope.format_version == LEGACY_CACHE_FORMAT_VERSION_V6 {
+        return match bincode::options()
+            .with_limit(max_shard_bytes)
+            .deserialize::<Vec<LegacyCachedSourceEntryV6>>(&envelope.payload)
         {
             Ok(entries) => ShardReadStatus::Migrated(
                 entries.into_iter().map(CachedSourceEntry::from).collect(),
@@ -4587,6 +4650,71 @@ mod tests {
             cache.get(identity, source.path()).unwrap().messages[0].session_id,
             "legacy-opencode"
         );
+        assert!(cache.has_rewrite_shard(&shard_key));
+        cache.save_if_dirty();
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Loaded(entries) if entries.len() == 1
+        ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_v6_shard_migrates_messages_and_rebuilds_row_provenance() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source = write_temp_file(b"{}\n");
+        let identity = CacheIdentity::for_client(ClientId::OpenCode);
+        let entry = test_entry(identity, source.path(), "v6-opencode");
+        let key = CacheKey::from_entry(&entry);
+        let shard_key = key.shard();
+        let legacy_path = shard_path(&cache_shard_dir().unwrap(), &shard_key);
+        ensure_cache_dir(legacy_path.parent().unwrap()).unwrap();
+        let legacy_entry = LegacyCachedSourceEntryV6 {
+            parser_namespace: entry.parser_namespace,
+            parser_version: entry.parser_version,
+            path: entry.path,
+            fingerprint: entry.fingerprint,
+            messages: entry.messages,
+            fallback_timestamp_indices: entry.fallback_timestamp_indices,
+            codex_incremental: entry.codex_incremental,
+            prime_accounting: entry.prime_accounting,
+            opencode_incremental: Some(LegacyOpenCodeIncrementalStateV6 {
+                groups: vec![Some(LegacyOpenCodeGroupMarkV6 {
+                    query_digest: 7,
+                    row_count: 1,
+                    created_high_water: 10,
+                    updated_high_water: 20,
+                    metadata_high_water: 30,
+                })],
+                merged_dedup_keys: vec!["old-key".to_string()],
+            }),
+        };
+        let envelope = CachedShardEnvelope {
+            format_version: LEGACY_CACHE_FORMAT_VERSION_V6,
+            parser_namespace: identity.namespace.to_string(),
+            parser_version: identity.parser_version,
+            payload: bincode::options().serialize(&vec![legacy_entry]).unwrap(),
+        };
+        let mut writer = BufWriter::new(File::create(&legacy_path).unwrap());
+        bincode::options()
+            .serialize_into(&mut writer, &envelope)
+            .unwrap();
+        writer.flush().unwrap();
+        drop(writer);
+
+        assert!(matches!(
+            read_shard(&legacy_path, identity),
+            ShardReadStatus::Migrated(entries)
+                if entries.len() == 1
+                    && entries[0].messages[0].session_id == "v6-opencode"
+                    && entries[0].opencode_incremental.is_none()
+        ));
+
+        let mut cache = SourceMessageCache::load();
+        let migrated = cache.get(identity, source.path()).unwrap();
+        assert_eq!(migrated.messages[0].session_id, "v6-opencode");
+        assert!(migrated.opencode_incremental.is_none());
         assert!(cache.has_rewrite_shard(&shard_key));
         cache.save_if_dirty();
         assert!(matches!(

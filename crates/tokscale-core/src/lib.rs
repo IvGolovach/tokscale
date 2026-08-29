@@ -9889,7 +9889,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_opencode_warm_scan_re_parses_after_a_row_is_deleted() {
+    fn test_opencode_warm_scan_removes_a_deleted_row_incrementally() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let source_home = tempfile::TempDir::new().unwrap();
         let _cache_env = redirect_cache_home(cache_home.path());
@@ -9908,9 +9908,8 @@ mod tests {
         );
         assert_eq!(cold.len(), 2);
 
-        // OpenCode cascades a session delete onto its messages. An incremental
-        // scan cannot see the row that went away, so the guard has to force a
-        // full re-parse rather than keep counting it.
+        // OpenCode cascades a session delete onto its messages. The persisted
+        // row provenance lets the warm scan remove exactly that cached source.
         conn.execute("DELETE FROM message WHERE id = 'msg-zzz'", [])
             .unwrap();
 
@@ -9924,8 +9923,8 @@ mod tests {
         assert_eq!(
             sessions::opencode_schema::INCREMENTAL_RESCANS
                 .load(std::sync::atomic::Ordering::Relaxed),
-            rescans_before,
-            "a deletion must not be served by an incremental scan"
+            rescans_before + 1,
+            "an ordinary deletion should stay incremental"
         );
         assert_eq!(warm.len(), 1);
         assert_eq!(warm[0].dedup_key.as_deref(), Some("msg-aaa"));
