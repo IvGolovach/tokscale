@@ -813,10 +813,7 @@ impl SchemaAccumulator {
             return None;
         }
 
-        let tokens = match msg.tokens {
-            Some(ref tokens) => tokens,
-            None => return None,
-        };
+        let tokens = msg.tokens.as_ref()?;
         let (cache_read, cache_write) = resolve_cache(tokens.cache.as_ref(), cfg.strict_cache)?;
 
         let resolved_model_id = if cfg.dual_schema {
@@ -836,10 +833,7 @@ impl SchemaAccumulator {
                 time.completed
                     .map(|completed| normalize_epoch(completed, cfg)),
             ),
-            None => match cfg.fallback_timestamp {
-                Some(fallback) => (fallback as f64, None),
-                None => return None,
-            },
+            None => (cfg.fallback_timestamp? as f64, None),
         };
 
         let agent_or_mode = if cfg.prefer_mode_over_agent {
