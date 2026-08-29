@@ -1883,6 +1883,201 @@ mod tests {
             .output
     }
 
+    /// SplitMix64 keeps this stress test deterministic without adding a
+    /// production dependency just to choose fixture mutations.
+    fn next_mutation_word(state: &mut u64) -> u64 {
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut word = *state;
+        word = (word ^ (word >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        word = (word ^ (word >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        word ^ (word >> 31)
+    }
+
+    fn mutation_index(state: &mut u64, len: usize) -> usize {
+        (next_mutation_word(state) % len as u64) as usize
+    }
+
+    struct RandomizedFixtureRow {
+        row_id: String,
+        dedup_key: String,
+        qualified: bool,
+    }
+
+    #[test]
+    fn test_randomized_incremental_mutations_match_a_full_parse() {
+        const SEEDS: usize = 48;
+        const MUTATIONS_PER_SEED: usize = 4;
+        const MUTATION_NAMES: [&str; 5] = ["insert", "delete", "rewrite", "re-key", "disqualify"];
+
+        let mut mutation_counts = [0_usize; MUTATION_NAMES.len()];
+        let mut resumed = 0_usize;
+        let mut fell_back = 0_usize;
+
+        for seed in 0..SEEDS {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("opencode.db");
+            let conn = create_timed_v1_db(&db_path);
+            let mut rows = Vec::new();
+            for row_index in 0..6 {
+                let row_id = format!("row_{row_index}");
+                let dedup_key = format!("msg_{row_index}");
+                conn.execute(
+                    "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                     VALUES (?1, 'ses_1', ?2, ?2, ?3)",
+                    rusqlite::params![
+                        row_id,
+                        1_000 + row_index,
+                        timed_v1_payload(&dedup_key, 10 + row_index)
+                    ],
+                )
+                .unwrap();
+                rows.push(RandomizedFixtureRow {
+                    row_id,
+                    dedup_key,
+                    qualified: true,
+                });
+            }
+            drop(conn);
+
+            let baseline = scan_opencode_sqlite(&db_path);
+            let state = baseline
+                .incremental
+                .clone()
+                .expect("the timed fixture must produce an incremental mark");
+            let mut random = (seed as u64 + 1).wrapping_mul(0xd134_2543_de82_ef95);
+            let conn = Connection::open(&db_path).unwrap();
+
+            for step in 0..MUTATIONS_PER_SEED {
+                let mutation = mutation_index(&mut random, MUTATION_NAMES.len());
+                mutation_counts[mutation] += 1;
+                let updated = 10_000 + step as i64;
+
+                match mutation {
+                    0 => {
+                        let row_id = format!("inserted_row_{seed}_{step}");
+                        let dedup_key = format!("inserted_msg_{seed}_{step}");
+                        let output = (next_mutation_word(&mut random) % 900 + 1) as i64;
+                        conn.execute(
+                            "INSERT INTO message (id, session_id, time_created, time_updated, data)
+                             VALUES (?1, 'ses_1', ?2, ?2, ?3)",
+                            rusqlite::params![
+                                row_id,
+                                updated,
+                                timed_v1_payload(&dedup_key, output)
+                            ],
+                        )
+                        .unwrap();
+                        rows.push(RandomizedFixtureRow {
+                            row_id,
+                            dedup_key,
+                            qualified: true,
+                        });
+                    }
+                    1 => {
+                        let row = rows.remove(mutation_index(&mut random, rows.len()));
+                        let changed = conn
+                            .execute(
+                                "DELETE FROM message WHERE id = ?1",
+                                rusqlite::params![row.row_id],
+                            )
+                            .unwrap();
+                        assert_eq!(changed, 1, "seed {seed}: delete target should exist");
+                    }
+                    2 => {
+                        let row_index = mutation_index(&mut random, rows.len());
+                        let output = (next_mutation_word(&mut random) % 900 + 1) as i64;
+                        let row = &mut rows[row_index];
+                        let changed = conn
+                            .execute(
+                                "UPDATE message SET data = ?2, time_updated = ?3 WHERE id = ?1",
+                                rusqlite::params![
+                                    row.row_id,
+                                    timed_v1_payload(&row.dedup_key, output),
+                                    updated
+                                ],
+                            )
+                            .unwrap();
+                        assert_eq!(changed, 1, "seed {seed}: rewrite target should exist");
+                        row.qualified = true;
+                    }
+                    3 => {
+                        let row_index = mutation_index(&mut random, rows.len());
+                        let collision_keys: Vec<String> = rows
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, row)| *index != row_index && row.qualified)
+                            .map(|(_, row)| row.dedup_key.clone())
+                            .collect();
+                        let use_existing_key =
+                            next_mutation_word(&mut random) & 3 == 0 && !collision_keys.is_empty();
+                        let dedup_key = if use_existing_key {
+                            collision_keys[mutation_index(&mut random, collision_keys.len())]
+                                .clone()
+                        } else {
+                            format!("rekeyed_msg_{seed}_{step}")
+                        };
+                        let output = (next_mutation_word(&mut random) % 900 + 1) as i64;
+                        let row = &mut rows[row_index];
+                        let changed = conn
+                            .execute(
+                                "UPDATE message SET data = ?2, time_updated = ?3 WHERE id = ?1",
+                                rusqlite::params![
+                                    row.row_id,
+                                    timed_v1_payload(&dedup_key, output),
+                                    updated
+                                ],
+                            )
+                            .unwrap();
+                        assert_eq!(changed, 1, "seed {seed}: re-key target should exist");
+                        row.dedup_key = dedup_key;
+                        row.qualified = true;
+                    }
+                    4 => {
+                        let row_index = mutation_index(&mut random, rows.len());
+                        let row = &mut rows[row_index];
+                        let payload = format!(
+                            r#"{{"id":"{}","sessionID":"ses_1","role":"user"}}"#,
+                            row.dedup_key
+                        );
+                        disqualify_timed_v1_message(&conn, &row.row_id, updated, &payload);
+                        row.qualified = false;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            drop(conn);
+
+            let effective_warm = match rescan_opencode_sqlite(&db_path, &state, baseline.messages) {
+                Some(warm) => {
+                    resumed += 1;
+                    warm.messages
+                }
+                None => {
+                    fell_back += 1;
+                    scan_opencode_sqlite(&db_path).messages
+                }
+            };
+            let full = scan_opencode_sqlite(&db_path);
+            assert_eq!(
+                by_dedup_key(&effective_warm),
+                by_dedup_key(&full.messages),
+                "seed {seed}: a warm rescan or its conservative fallback must match a full parse"
+            );
+        }
+
+        for (name, count) in MUTATION_NAMES.into_iter().zip(mutation_counts) {
+            assert!(count > 0, "the deterministic corpus must exercise {name}");
+        }
+        assert!(
+            resumed >= SEEDS * 3 / 4,
+            "the optimization must remain useful across mixed mutations: resumed {resumed}/{SEEDS}"
+        );
+        assert!(
+            fell_back > 0,
+            "the corpus must also exercise a conservative full-scan fallback"
+        );
+    }
+
     #[test]
     fn test_incremental_rescan_matches_a_full_parse_of_the_same_state() {
         let dir = tempfile::tempdir().unwrap();
