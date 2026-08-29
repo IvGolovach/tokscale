@@ -7,18 +7,36 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 pub fn parse_copilot_vscode_sessions(paths: &[PathBuf]) -> Vec<UnifiedMessage> {
-    paths.iter().flat_map(|path| parse_file(path)).collect()
+    let mut messages = Vec::new();
+    parse_copilot_vscode_sessions_into(paths, &mut |message| messages.push(message));
+    messages
 }
 
-fn parse_file(path: &Path) -> Vec<UnifiedMessage> {
+/// Parse VS Code Copilot sessions into an incremental consumer.
+///
+/// The production submit path folds each message as it arrives. Keeping that
+/// consumer here, at the parser boundary, avoids materialising a second vector
+/// containing one `UnifiedMessage` per request after the request projection has
+/// already accumulated the session. The collecting wrapper above remains for
+/// callers that genuinely need ownership of the complete result.
+pub(crate) fn parse_copilot_vscode_sessions_into(
+    paths: &[PathBuf],
+    on_message: &mut dyn FnMut(UnifiedMessage),
+) {
+    for path in paths {
+        parse_file_into(path, on_message);
+    }
+}
+
+fn parse_file_into(path: &Path, on_message: &mut dyn FnMut(UnifiedMessage)) {
     let session_id = match path.file_stem().and_then(|s| s.to_str()) {
         Some(stem) => stem.to_string(),
-        None => return Vec::new(),
+        None => return,
     };
 
     let file = match std::fs::File::open(path) {
         Ok(f) => f,
-        Err(_) => return Vec::new(),
+        Err(_) => return,
     };
 
     let workspace = read_workspace_for_file(path);
@@ -95,10 +113,14 @@ fn parse_file(path: &Path) -> Vec<UnifiedMessage> {
         }
     }
 
-    requests
-        .iter()
-        .filter_map(|req| request_to_message(req, &session_id, &workspace))
-        .collect()
+    // Consume requests instead of borrowing the whole vector while building a
+    // second corpus-sized result. Each projected JSON value is released as
+    // soon as its message has been folded by the caller.
+    for request in requests {
+        if let Some(message) = request_to_message(&request, &session_id, &workspace) {
+            on_message(message);
+        }
+    }
 }
 
 /// Drop everything from a request that [`request_to_message`] does not read.
@@ -517,6 +539,44 @@ mod tests {
         assert_eq!(
             m.dedup_key.as_deref(),
             Some(format!("copilot-vscode:{}:1783918304896", uuid).as_str())
+        );
+    }
+
+    #[test]
+    fn streaming_parser_preserves_path_and_request_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join("chatSessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let first = sessions_dir.join("first.jsonl");
+        let second = sessions_dir.join("second.jsonl");
+
+        write_jsonl(
+            &first,
+            &[
+                r#"{"kind":0,"v":{"requests":[{"timestamp":1000,"modelId":"copilot/gpt-4o","promptTokens":11},{"timestamp":2000,"modelId":"copilot/gpt-4o","promptTokens":22}]}}"#,
+            ],
+        );
+        write_jsonl(
+            &second,
+            &[
+                r#"{"kind":2,"k":["requests"],"v":[{"timestamp":3000,"modelId":"copilot/gpt-4o","promptTokens":33}]}"#,
+            ],
+        );
+
+        let mut emitted = Vec::new();
+        parse_copilot_vscode_sessions_into(&[first, second], &mut |message| {
+            // Keep only a tiny projection: the streaming API must not require
+            // its consumer to retain each full message.
+            emitted.push((message.session_id, message.timestamp, message.tokens.input));
+        });
+
+        assert_eq!(
+            emitted,
+            vec![
+                ("first".to_string(), 1000, 11),
+                ("first".to_string(), 2000, 22),
+                ("second".to_string(), 3000, 33),
+            ]
         );
     }
 

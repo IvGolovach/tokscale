@@ -835,31 +835,43 @@ fn flush_lane<S: MessageSink>(
     context: &FlushContext<'_>,
     sink: &mut S,
 ) {
-    for mut message in buffer.drain(..) {
-        if !context.include_all
-            && !retain_for_requested_clients(
-                &message.client,
-                &message.model_id,
-                &message.provider_id,
-                &context.requested,
-            )
-        {
-            continue;
-        }
-
-        if context.include_synthetic {
-            sessions::synthetic::normalize_synthetic_gateway_fields(
-                &mut message.model_id,
-                &mut message.provider_id,
-            );
-        }
-
-        if let Some(timezone) = &context.timezone {
-            message.rebucket_date(timezone);
-        }
-
-        sink.accept(message);
+    for message in buffer.drain(..) {
+        flush_message(message, context, sink);
     }
+}
+
+/// Apply the parse tail to one message and release it into the consumer.
+///
+/// Most parsers still hand back a lane buffer, but sources with their own
+/// streaming boundary can call this directly without rebuilding that buffer.
+fn flush_message<S: MessageSink>(
+    mut message: UnifiedMessage,
+    context: &FlushContext<'_>,
+    sink: &mut S,
+) {
+    if !context.include_all
+        && !retain_for_requested_clients(
+            &message.client,
+            &message.model_id,
+            &message.provider_id,
+            &context.requested,
+        )
+    {
+        return;
+    }
+
+    if context.include_synthetic {
+        sessions::synthetic::normalize_synthetic_gateway_fields(
+            &mut message.model_id,
+            &mut message.provider_id,
+        );
+    }
+
+    if let Some(timezone) = &context.timezone {
+        message.rebucket_date(timezone);
+    }
+
+    sink.accept(message);
 }
 
 fn parse_all_messages_with_pricing_with_cache_policy(
@@ -2102,31 +2114,37 @@ fn parse_all_messages_streaming<S: MessageSink>(
             .filter(|m| m.client == "copilot")
             .filter_map(|m| m.dedup_key.clone())
             .collect();
-        let existing_copilot_session_timestamps: HashSet<(String, i64)> = all_messages
-            .iter()
-            .filter(|m| m.client == "copilot")
-            .map(|m| (m.session_id.clone(), m.timestamp))
-            .collect();
-        let vscode_msgs = sessions::copilot_vscode::parse_copilot_vscode_sessions(
+        let mut existing_copilot_session_timestamps: HashMap<String, HashSet<i64>> = HashMap::new();
+        for message in all_messages.iter().filter(|m| m.client == "copilot") {
+            existing_copilot_session_timestamps
+                .entry(message.session_id.clone())
+                .or_default()
+                .insert(message.timestamp);
+        }
+
+        // These are the only rows the VS Code lane consults. Once their keys
+        // and timestamps are projected above, keeping the full OTEL/desktop
+        // messages alive serves no purpose. Release them before parsing the
+        // request-heavy source, then feed each VS Code message through the same
+        // tail instead of rebuilding `all_messages`.
+        flush_lane(&mut all_messages, &flush_context, sink);
+        sessions::copilot_vscode::parse_copilot_vscode_sessions_into(
             &scan_result.copilot_vscode_sessions,
-        );
-        all_messages.extend(
-            vscode_msgs
-                .into_iter()
-                .filter(|m| {
-                    let key_unique = m
-                        .dedup_key
-                        .as_deref()
-                        .map(|k| !existing_dedup_keys.contains(k))
-                        .unwrap_or(true);
-                    let session_ts_unique = !existing_copilot_session_timestamps
-                        .contains(&(m.session_id.clone(), m.timestamp));
-                    key_unique && session_ts_unique
-                })
-                .map(|mut message| {
-                    apply_pricing_if_available(&mut message, pricing);
-                    message
-                }),
+            &mut |mut message| {
+                let key_unique = message
+                    .dedup_key
+                    .as_deref()
+                    .is_none_or(|key| !existing_dedup_keys.contains(key));
+                let session_timestamp_unique = existing_copilot_session_timestamps
+                    .get(message.session_id.as_str())
+                    .is_none_or(|timestamps| !timestamps.contains(&message.timestamp));
+                if !key_unique || !session_timestamp_unique {
+                    return;
+                }
+
+                apply_pricing_if_available(&mut message, pricing);
+                flush_message(message, &flush_context, sink);
+            },
         );
     }
 
@@ -4047,7 +4065,11 @@ async fn generate_graph_with_loaded_pricing(
 /// `validate_priced_messages` verbatim rather than reimplementing their pricing
 /// rules, which is the part that would quietly diverge. Peak cost is one batch,
 /// not the corpus.
-const GRAPH_SINK_BATCH: usize = 65_536;
+// A batch holds full `UnifiedMessage` values, including their separately
+// allocated strings. 65,536 made the buffer itself hundreds of megabytes on
+// Copilot-heavy profiles. 4,096 amortises the existing pricing validators
+// while placing a small, corpus-independent ceiling on this part of submit.
+const GRAPH_SINK_BATCH: usize = 4_096;
 
 /// Folds a graph report as messages arrive instead of collecting them.
 ///
@@ -5872,11 +5894,12 @@ mod tests {
         parse_all_messages_with_pricing_with_env_strategy, parse_local_clients, parsed_to_unified,
         paths, pricing, retain_for_requested_clients, scanner, select_local_parse_pricing,
         sessions, unified_to_parsed, validate_priced_messages, ClientId, GraphPricingRequirement,
-        GroupBy, LocalParseOptions, MonthlyReportV2, MonthlyUsage, MonthlyUsageV2, ReportOptions,
-        SourceCachePolicy, TokenBreakdown, UnifiedMessage, UnpricedSubmissionExclusion,
-        AMBIGUOUS_MODEL_PRICING_REASON, INCOMPLETE_MODEL_PRICING_REASON,
-        MISSING_MODEL_PRICING_REASON, ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL,
-        UNVERIFIED_MODEL_IDENTITY_REASON, UNVERIFIED_PROVIDER_IDENTITY_REASON,
+        GraphSink, GroupBy, LocalParseOptions, MessageSink, MonthlyReportV2, MonthlyUsage,
+        MonthlyUsageV2, ReportOptions, SourceCachePolicy, TokenBreakdown, UnifiedMessage,
+        UnpricedSubmissionExclusion, AMBIGUOUS_MODEL_PRICING_REASON, GRAPH_SINK_BATCH,
+        INCOMPLETE_MODEL_PRICING_REASON, MISSING_MODEL_PRICING_REASON,
+        ROUTING_LABEL_UNPRICED_REASON, UNKNOWN_WORKSPACE_LABEL, UNVERIFIED_MODEL_IDENTITY_REASON,
+        UNVERIFIED_PROVIDER_IDENTITY_REASON,
     };
     // Kept as its own statement rather than folded into the list above: that list
     // is edited by nearly every PR that touches this file, and sharing it made
@@ -5885,6 +5908,70 @@ mod tests {
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use std::io::Write;
+
+    #[test]
+    fn graph_sink_keeps_only_one_bounded_pricing_batch() {
+        let mut sink = GraphSink::new(None, None, GraphPricingRequirement::Lenient);
+        for timestamp in 1..=(GRAPH_SINK_BATCH * 2 + 1) {
+            sink.accept(UnifiedMessage::new(
+                "copilot",
+                "gpt-4o",
+                "openai",
+                "bounded",
+                timestamp as i64,
+                TokenBreakdown {
+                    input: 1,
+                    ..Default::default()
+                },
+                0.0,
+            ));
+        }
+
+        assert_eq!(sink.buffer.len(), 1);
+        assert_eq!(sink.spans.len(), GRAPH_SINK_BATCH * 2);
+    }
+
+    #[test]
+    fn submission_merges_exclusions_across_bounded_batches() {
+        let messages: Vec<UnifiedMessage> = (0..=GRAPH_SINK_BATCH)
+            .map(|offset| {
+                UnifiedMessage::new(
+                    "copilot",
+                    "unlisted-model",
+                    "github-copilot",
+                    "bounded",
+                    1_736_510_400_000 + offset as i64,
+                    TokenBreakdown {
+                        input: 2,
+                        output: 1,
+                        ..Default::default()
+                    },
+                    0.0,
+                )
+            })
+            .collect();
+        let pricing = pricing::PricingService::new(unrelated_litellm_dataset(), HashMap::new());
+
+        let graph = build_graph_from_messages(
+            messages,
+            Some(&pricing),
+            GraphPricingRequirement::Submission,
+            std::time::Instant::now(),
+            &crate::bucket_tz::BucketTimezone::Local,
+        )
+        .expect("unpriced rows should be excluded across every batch");
+
+        assert!(graph.contributions.is_empty());
+        assert_eq!(graph.unpriced_submission_exclusions.len(), 1);
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0].message_count,
+            GRAPH_SINK_BATCH + 1
+        );
+        assert_eq!(
+            graph.unpriced_submission_exclusions[0].total_tokens,
+            (GRAPH_SINK_BATCH as i64 + 1) * 3
+        );
+    }
 
     #[test]
     fn token_breakdown_add_assign_includes_every_field() {
