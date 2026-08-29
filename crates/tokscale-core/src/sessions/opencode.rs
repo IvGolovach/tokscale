@@ -88,12 +88,15 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
 
     let session_id = msg.session_id.unwrap_or_else(|| "unknown".to_string());
 
-    // Use message ID from JSON or derive from filename for deduplication
-    let dedup_key = msg.id.or_else(|| {
-        path.file_stem()
-            .and_then(|s| s.to_str())
-            .map(|s| s.to_string())
-    });
+    // Embedded message ids are globally stable across the legacy JSON and
+    // SQLite representations, so keep them unnamespaced for overlap and fork
+    // dedup. A filename is only unique inside its session directory; make the
+    // no-id fallback path-scoped so same-named files in separate sessions do
+    // not silently collapse (#1198). Canonicalization also keeps one physical
+    // file reached through two path spellings on one key. If a non-UTF-8 path
+    // cannot be represented, leave the key absent: retaining both candidates
+    // is safer than inventing a lossy identity that can undercount.
+    let dedup_key = msg.id.or_else(|| legacy_json_path_dedup_key(path));
     let cost = reported_cost(msg.cost).unwrap_or(0.0);
 
     let mut unified = UnifiedMessage::new_with_agent(
@@ -127,6 +130,13 @@ pub fn parse_opencode_file(path: &Path) -> Option<UnifiedMessage> {
         unified.mark_provider_reported_cost();
     }
     Some(unified)
+}
+
+fn legacy_json_path_dedup_key(path: &Path) -> Option<String> {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical
+        .to_str()
+        .map(|path| format!("legacy-json-path:{path}"))
 }
 
 // =============================================================================
@@ -838,9 +848,9 @@ mod tests {
         assert_eq!(msg.duration_ms, Some(1234));
     }
 
-    /// JSON dedup_key falls back to file stem when msg.id is absent
+    /// JSON dedup_key falls back to a path-scoped identity when msg.id is absent.
     #[test]
-    fn test_dedup_key_falls_back_to_file_stem() {
+    fn test_dedup_key_falls_back_to_canonical_file_path() {
         let json = r#"{
             "sessionID": "ses_001",
             "role": "assistant",
@@ -863,9 +873,44 @@ mod tests {
         let msg = parse_opencode_file(&file_path).expect("Should parse");
         assert_eq!(
             msg.dedup_key,
-            Some("msg_fallback_999".to_string()),
-            "dedup_key should fall back to file stem when id is missing"
+            legacy_json_path_dedup_key(&file_path),
+            "an id-less message must use the file's canonical location"
         );
+        assert!(msg
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("legacy-json-path:")));
+    }
+
+    #[test]
+    fn same_named_idless_files_in_different_sessions_have_distinct_keys() {
+        let json = r#"{
+            "sessionID": "embedded-session-is-not-the-fallback",
+            "role": "assistant",
+            "modelID": "claude-sonnet-4",
+            "providerID": "anthropic",
+            "tokens": {
+                "input": 100,
+                "output": 50,
+                "reasoning": 0,
+                "cache": { "read": 0, "write": 0 }
+            },
+            "time": { "created": 1700000000000.0 }
+        }"#;
+        let root = tempfile::tempdir().unwrap();
+        let first = root.path().join("session-a/same-name.json");
+        let second = root.path().join("session-b/same-name.json");
+        std::fs::create_dir_all(first.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(second.parent().unwrap()).unwrap();
+        std::fs::write(&first, json).unwrap();
+        std::fs::write(&second, json).unwrap();
+
+        let first = parse_opencode_file(&first).unwrap();
+        let second = parse_opencode_file(&second).unwrap();
+
+        assert_ne!(first.dedup_key, second.dedup_key);
+        assert!(first.dedup_key.is_some());
+        assert!(second.dedup_key.is_some());
     }
 
     /// Non-assistant messages are skipped (no dedup_key produced)

@@ -1166,6 +1166,21 @@ fn add_reasoning_only_opencode_message(base: &Path) {
     fs::write(session.join("reasoning-msg.json"), message).unwrap();
 }
 
+fn add_same_named_idless_opencode_messages(base: &Path) {
+    let root = base.join(".local/share/opencode/storage/message");
+    for (session_id, input, output) in [("idless-session-a", 13, 2), ("idless-session-b", 17, 3)] {
+        let session = root.join(session_id);
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("same-name.json"),
+            format!(
+                r#"{{"sessionID":"{session_id}","role":"assistant","modelID":"gpt-4o","providerID":"openai","tokens":{{"input":{input},"output":{output},"reasoning":0,"cache":{{"read":0,"write":0}}}},"time":{{"created":1700000000000}}}}"#
+            ),
+        )
+        .unwrap();
+    }
+}
+
 fn write_fireworks_pricing_cache(base: &Path) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2213,6 +2228,28 @@ fn test_models_with_client_filter_opencode() {
     let entries = json["entries"].as_array().unwrap();
     for entry in entries {
         assert_eq!(entry["client"].as_str().unwrap(), "opencode");
+    }
+}
+
+#[test]
+fn test_opencode_same_named_idless_files_survive_cold_and_warm_cache() {
+    let tmp = create_empty_fixture_dir();
+    add_same_named_idless_opencode_messages(tmp.path());
+
+    for pass in ["cold", "warm"] {
+        let output = cmd_with_home(tmp.path())
+            .args(["models", "--json", "--client", "opencode", "--no-spinner"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{pass} cache pass failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(json["totalMessages"].as_i64(), Some(2), "{pass} cache pass");
+        assert_eq!(json["totalInput"].as_i64(), Some(30), "{pass} cache pass");
+        assert_eq!(json["totalOutput"].as_i64(), Some(5), "{pass} cache pass");
     }
 }
 

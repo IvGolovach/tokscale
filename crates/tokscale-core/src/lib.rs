@@ -770,14 +770,28 @@ fn parse_all_messages_with_pricing_with_env_strategy(
 /// lanes are scanned and the SQLite lane runs first, so every migrated file is
 /// parsed only for its message to be dropped by the dedup filter that follows.
 ///
-/// The file stem is the message id, which is exactly the dedup key the SQLite
-/// lane inserted, so the duplicate can be recognized from the path alone —
-/// before the file is opened. On a migrated install that skips nearly the whole
-/// directory (#1209); unmigrated files miss the set and are still parsed.
-fn opencode_json_superseded_by_sqlite(path: &Path, sqlite_keys: &HashSet<String>) -> bool {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .is_some_and(|stem| sqlite_keys.contains(stem))
+/// The file stem is the message id and its parent directory is the session id.
+/// Requiring both preserves the pre-open migration fast path from #1209 while
+/// preventing an id-less file in another session from being suppressed merely
+/// because its local filename matches an unrelated SQLite id (#1198).
+fn opencode_json_superseded_by_sqlite(
+    path: &Path,
+    sqlite_locations: &HashMap<String, HashSet<String>>,
+) -> bool {
+    let Some(message_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
+        return false;
+    };
+    let Some(session_id) = path
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+    else {
+        return false;
+    };
+
+    sqlite_locations
+        .get(session_id)
+        .is_some_and(|message_ids| message_ids.contains(message_id))
 }
 
 /// Receives fully-transformed messages as each client lane finishes, so the
@@ -1866,6 +1880,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     // Parse OpenCode: prefer SQLite, collapse forked SQLite history there, then
     // suppress legacy JSON overlap by message identity.
     let mut opencode_seen: HashSet<String> = HashSet::new();
+    let mut opencode_sqlite_locations: HashMap<String, HashSet<String>> = HashMap::new();
 
     for db_path in &scan_result.opencode_dbs {
         let CachedParseOutcome {
@@ -1878,12 +1893,18 @@ fn parse_all_messages_streaming<S: MessageSink>(
         // both `opencode.db` and `opencode-<channel>.db` if the user
         // switches channels mid-session. `discover_opencode_dbs` returns
         // paths in sorted order, so the first-seen copy is deterministic.
-        all_messages.extend(messages.into_iter().filter(|message| {
-            message
-                .dedup_key
-                .as_ref()
-                .is_none_or(|key| opencode_seen.insert(key.clone()))
-        }));
+        for message in messages {
+            if let Some(key) = message.dedup_key.as_ref() {
+                opencode_sqlite_locations
+                    .entry(message.session_id.clone())
+                    .or_default()
+                    .insert(key.clone());
+                if !opencode_seen.insert(key.clone()) {
+                    continue;
+                }
+            }
+            all_messages.push(message);
+        }
 
         if let Some(entry) = cache_entry {
             source_cache.insert(entry);
@@ -1893,7 +1914,7 @@ fn parse_all_messages_streaming<S: MessageSink>(
     let opencode_outcomes: Vec<CachedParseOutcome> = scan_result
         .get(ClientId::OpenCode)
         .par_iter()
-        .filter(|path| !opencode_json_superseded_by_sqlite(path, &opencode_seen))
+        .filter(|path| !opencode_json_superseded_by_sqlite(path, &opencode_sqlite_locations))
         .filter_map(|path| {
             Some(load_or_parse_source(
                 message_cache::CacheIdentity::for_client(ClientId::OpenCode),
@@ -4776,6 +4797,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
 
     let opencode_count: i32 = {
         let mut seen: HashSet<String> = HashSet::new();
+        let mut sqlite_locations: HashMap<String, HashSet<String>> = HashMap::new();
         let mut count: i32 = 0;
 
         for db_path in &scan_result.opencode_dbs {
@@ -4784,6 +4806,12 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
                     .into_iter()
                     .filter_map(|msg| {
                         let key = msg.dedup_key.clone().unwrap_or_default();
+                        if !key.is_empty() {
+                            sqlite_locations
+                                .entry(msg.session_id.clone())
+                                .or_default()
+                                .insert(key.clone());
+                        }
                         // Dedup across multiple channel-suffixed dbs: the
                         // same session can end up in both `opencode.db` and
                         // `opencode-<channel>.db` if the user switches
@@ -4803,7 +4831,7 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
         let json_msgs: Vec<(String, ParsedMessage)> = scan_result
             .get(ClientId::OpenCode)
             .par_iter()
-            .filter(|path| !opencode_json_superseded_by_sqlite(path, &seen))
+            .filter(|path| !opencode_json_superseded_by_sqlite(path, &sqlite_locations))
             .filter_map(|path| {
                 let msg = sessions::opencode::parse_opencode_file(path)?;
                 let key = msg.dedup_key.clone().unwrap_or_default();
@@ -10264,32 +10292,43 @@ mod tests {
 
     #[test]
     fn test_opencode_json_superseded_by_sqlite_matches_on_message_id() {
-        let mut sqlite_keys: HashSet<String> = HashSet::new();
-        sqlite_keys.insert("msg_migrated".to_string());
+        let mut sqlite_locations: HashMap<String, HashSet<String>> = HashMap::new();
+        sqlite_locations.insert(
+            "ses_1".to_string(),
+            HashSet::from(["msg_migrated".to_string()]),
+        );
 
         // The legacy file is named after the message id the migration copied
         // into SQLite, so the duplicate is recognizable from the path alone.
         assert!(opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/ses_1/msg_migrated.json"),
-            &sqlite_keys
+            &sqlite_locations
         ));
 
         // A file the migration never reached has no row to shadow it.
         assert!(!opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/ses_1/msg_unmigrated.json"),
-            &sqlite_keys
+            &sqlite_locations
+        ));
+
+        // A stem is not globally unique. Another session's id-less file must
+        // be parsed and receive its path-scoped fallback instead of being
+        // discarded by the migration fast path.
+        assert!(!opencode_json_superseded_by_sqlite(
+            std::path::Path::new("/s/storage/message/ses_2/msg_migrated.json"),
+            &sqlite_locations
         ));
 
         // Without any SQLite db every file has to be read.
         assert!(!opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/ses_1/msg_migrated.json"),
-            &HashSet::new()
+            &HashMap::new()
         ));
 
-        // Only the stem participates: the session directory is not a message id.
+        // Neither coordinate may be borrowed from a different path level.
         assert!(!opencode_json_superseded_by_sqlite(
             std::path::Path::new("/s/storage/message/msg_migrated/other.json"),
-            &sqlite_keys
+            &sqlite_locations
         ));
     }
 
@@ -10336,6 +10375,126 @@ mod tests {
             r#"{"id":"msg_unmigrated","sessionID":"ses_1","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","cost":0.02,"tokens":{"input":7,"output":3,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000001000}}"#,
         )
         .unwrap();
+    }
+
+    /// SQLite holds one globally identified message. Two different legacy
+    /// sessions reuse that id as a local filename but omit the embedded id,
+    /// while a third JSON file carries the real embedded id and is a true
+    /// duplicate of SQLite.
+    fn write_opencode_idless_collision_fixture(source_home: &std::path::Path) {
+        let db_dir = source_home.join(".local/share/opencode");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        let conn = create_opencode_sqlite_db(&db_dir.join("opencode.db"));
+        conn.execute(
+            "INSERT INTO message (id, session_id, data) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "shared-id",
+                "sqlite-session",
+                build_opencode_sqlite_payload(
+                    1_700_000_000_000.0,
+                    1_700_000_000_500.0,
+                    100,
+                    10,
+                    0,
+                    0,
+                    0,
+                    0.01,
+                )
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let root = source_home.join(".local/share/opencode/storage/message");
+        for (session, input) in [("legacy-a", 7), ("legacy-b", 11)] {
+            let dir = root.join(session);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("shared-id.json"),
+                format!(
+                    r#"{{"sessionID":"{session}","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","tokens":{{"input":{input},"output":1,"reasoning":0,"cache":{{"read":0,"write":0}}}},"time":{{"created":1700000001000}}}}"#
+                ),
+            )
+            .unwrap();
+        }
+
+        let embedded_dir = root.join("legacy-embedded-copy");
+        std::fs::create_dir_all(&embedded_dir).unwrap();
+        std::fs::write(
+            embedded_dir.join("different-filename.json"),
+            r#"{"id":"shared-id","sessionID":"legacy-embedded-copy","role":"assistant","modelID":"claude-sonnet-4","providerID":"anthropic","tokens":{"input":100,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000000000}}"#,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_all_messages_keeps_same_named_idless_opencode_files() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        write_opencode_idless_collision_fixture(source_home.path());
+
+        for pass in ["cold", "warm"] {
+            let messages = parse_all_messages_with_pricing(
+                source_home.path().to_str().unwrap(),
+                &["opencode".to_string()],
+                None,
+            );
+
+            assert_eq!(messages.len(), 3, "{pass} cache pass");
+            assert_eq!(
+                messages
+                    .iter()
+                    .map(|message| message.tokens.input)
+                    .sum::<i64>(),
+                118,
+                "{pass} cache pass"
+            );
+            let keys: HashSet<&str> = messages
+                .iter()
+                .filter_map(|message| message.dedup_key.as_deref())
+                .collect();
+            assert!(keys.contains("shared-id"), "{pass} cache pass");
+            assert_eq!(
+                keys.iter()
+                    .filter(|key| key.starts_with("legacy-json-path:"))
+                    .count(),
+                2,
+                "{pass} cache pass"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_keeps_same_named_idless_opencode_files() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _cache_env = redirect_cache_home(cache_home.path());
+        write_opencode_idless_collision_fixture(source_home.path());
+
+        let parsed = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+            use_env_roots: false,
+            clients: Some(vec!["opencode".to_string()]),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+        })
+        .unwrap();
+
+        assert_eq!(parsed.counts.get(ClientId::OpenCode), 3);
+        assert_eq!(parsed.messages.len(), 3);
+        assert_eq!(
+            parsed
+                .messages
+                .iter()
+                .map(|message| message.input)
+                .sum::<i64>(),
+            118
+        );
     }
 
     #[test]

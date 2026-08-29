@@ -1273,7 +1273,11 @@ fn parser_version(client: ClientId) -> u32 {
         // the legacy `session` join for workspace and title. A database that
         // carries both tables is byte-identical before and after, so only the
         // version bump discards entries still holding the old attribution.
-        ClientId::OpenCode => 2,
+        // v2 -> v3: id-less legacy JSON messages now carry a canonical
+        // path-scoped key instead of a globally colliding filename stem. The
+        // source bytes and fingerprint do not change, so invalidate cached v2
+        // rows to make same-named files in different sessions survive (#1198).
+        ClientId::OpenCode => 3,
         _ => 1,
     }
 }
@@ -3361,11 +3365,95 @@ mod tests {
     }
 
     #[test]
-    fn test_opencode_session_v2_metadata_parser_version_invalidates_v1_entries() {
-        // A database holding both `session` and `session_v2` does not change on
-        // disk when the parser starts preferring the newer table, so the
-        // fingerprint keeps matching and only this bump forces the reparse.
-        assert_eq!(parser_version(ClientId::OpenCode), 2);
+    fn test_opencode_path_identity_parser_version_invalidates_v2_entries() {
+        // An id-less JSON file does not change on disk when its fallback key
+        // becomes path-scoped, so only this bump retires the colliding v2 key.
+        assert_eq!(parser_version(ClientId::OpenCode), 3);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn opencode_v2_shards_reparse_idless_json_with_path_identity() {
+        let temp_home = TempDir::new().unwrap();
+        let _cache_env = sandbox_cache_env(temp_home.path());
+        let source_root = TempDir::new().unwrap();
+        let source = source_root.path().join("session-a/shared-name.json");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            &source,
+            br#"{"sessionID":"session-a","role":"assistant","modelID":"m","providerID":"p","tokens":{"input":10,"output":20,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1700000000000}}"#,
+        )
+        .unwrap();
+
+        let current_identity = CacheIdentity::for_client(ClientId::OpenCode);
+        assert_eq!(current_identity.parser_version, 3);
+        let stale_identity = CacheIdentity {
+            namespace: current_identity.namespace,
+            parser_version: 2,
+        };
+        let fingerprint = SourceFingerprint::from_path(&source).unwrap();
+        let mut stale_message = UnifiedMessage::new(
+            current_identity.namespace,
+            "m",
+            "p",
+            "session-a",
+            1_700_000_000_000,
+            crate::TokenBreakdown {
+                input: 10,
+                output: 20,
+                cache_read: 0,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+        stale_message.dedup_key = Some("shared-name".to_string());
+        let stale_entry = CachedSourceEntry::new(
+            stale_identity,
+            &source,
+            fingerprint.clone(),
+            vec![stale_message],
+            Vec::new(),
+            None,
+        );
+        let stale_path = cache_shard_path(current_identity, &source);
+        ensure_cache_dir(stale_path.parent().unwrap()).unwrap();
+        write_shard_with_limit(
+            &stale_path,
+            stale_identity,
+            &[stale_entry],
+            MAX_CACHE_SHARD_BYTES,
+        )
+        .unwrap();
+
+        let mut cache = SourceMessageCache::load();
+        assert!(
+            cache.get(current_identity, &source).is_none(),
+            "the globally colliding v2 fallback must not survive the parser bump"
+        );
+
+        let rebuilt = crate::sessions::opencode::parse_opencode_file(&source)
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(rebuilt.len(), 1);
+        assert!(rebuilt[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("legacy-json-path:")));
+        cache.insert(CachedSourceEntry::new(
+            current_identity,
+            &source,
+            fingerprint,
+            rebuilt.clone(),
+            Vec::new(),
+            None,
+        ));
+        cache.save_if_dirty();
+
+        let warm = SourceMessageCache::load();
+        let cached = warm.get(current_identity, &source).unwrap();
+        assert_eq!(cached.parser_version, 3);
+        assert_eq!(cached.messages, rebuilt);
     }
 
     #[test]
